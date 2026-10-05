@@ -11,6 +11,7 @@ use rustc_hir::def_id::DefId;
 use rustc_interface::interface::Compiler;
 use rustc_middle::mir::TerminatorKind;
 use rustc_middle::mir::mono::MonoItem;
+use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::{self, EarlyBinder, Instance, InstanceKind, TyCtxt, TypingEnv};
 use rustc_span::{Span, Symbol};
 use serde::Serialize;
@@ -53,6 +54,7 @@ struct Report {
     roots: Vec<String>,
     checked_instances: usize,
     findings: Vec<Finding>,
+    coverage_gaps: Vec<Finding>,
     allocation_sites: Vec<Finding>,
 }
 
@@ -150,20 +152,95 @@ impl Callbacks for Checker {
         let mut candidates: Vec<_> = candidate_set.into_iter().collect();
         candidates.sort_by_key(ToString::to_string);
         let mut pointer_candidates: HashMap<ty::Ty<'tcx>, Vec<Instance<'tcx>>> = HashMap::new();
+        let mut exported_functions = HashMap::new();
+        let mut trait_receivers: HashMap<DefId, HashSet<ty::GenericArgsRef<'tcx>>> = HashMap::new();
         for candidate in &candidates {
             if matches!(
                 tcx.def_kind(candidate.def_id()),
                 rustc_hir::def::DefKind::Fn | rustc_hir::def::DefKind::AssocFn
             ) {
-                let function_ty = candidate.ty(tcx, typing_env);
-                if matches!(function_ty.kind(), ty::FnDef(..)) {
-                    let signature =
-                        tcx.normalize_erasing_regions(typing_env, function_ty.fn_sig(tcx));
-                    let pointer_ty = ty::Ty::new_fn_ptr(tcx, signature);
-                    pointer_candidates
-                        .entry(pointer_ty)
-                        .or_default()
-                        .push(*candidate);
+                exported_functions.insert(tcx.symbol_name(*candidate).name.to_owned(), *candidate);
+                if let Some(item) = tcx.opt_associated_item(candidate.def_id()) {
+                    if let Some(trait_item) = item.trait_item_def_id() {
+                        if let Some(implementation) = item.impl_container(tcx) {
+                            let receiver = tcx
+                                .impl_trait_ref(implementation)
+                                .instantiate(tcx, candidate.args);
+                            let receiver = tcx.normalize_erasing_regions(typing_env, receiver);
+                            trait_receivers
+                                .entry(trait_item)
+                                .or_default()
+                                .insert(receiver.args);
+                        }
+                    } else if let Some(trait_id) = item.trait_container(tcx) {
+                        trait_receivers
+                            .entry(candidate.def_id())
+                            .or_default()
+                            .insert(
+                                tcx.mk_args_from_iter(
+                                    candidate
+                                        .args
+                                        .iter()
+                                        .take(tcx.generics_of(trait_id).count()),
+                                ),
+                            );
+                    }
+                }
+            }
+            if matches!(
+                candidate.def,
+                InstanceKind::Virtual(..) | InstanceKind::Intrinsic(_)
+            ) || (matches!(candidate.def, InstanceKind::Item(def) if !tcx.is_mir_available(def))
+                && !matches!(
+                    tcx.def_kind(candidate.def_id()),
+                    rustc_hir::def::DefKind::Ctor(..)
+                ))
+            {
+                continue;
+            }
+            let body = tcx.instance_mir(candidate.def);
+            for block in body.basic_blocks.iter() {
+                for statement in &block.statements {
+                    if let rustc_middle::mir::StatementKind::Assign(assignment) = &statement.kind {
+                        if let rustc_middle::mir::Rvalue::Cast(
+                            rustc_middle::mir::CastKind::PointerCoercion(coercion, _),
+                            operand,
+                            destination,
+                        ) = &assignment.1
+                        {
+                            let source = candidate.instantiate_mir_and_normalize_erasing_regions(
+                                tcx,
+                                typing_env,
+                                EarlyBinder::bind(operand.ty(body, tcx)),
+                            );
+                            let destination = candidate
+                                .instantiate_mir_and_normalize_erasing_regions(
+                                    tcx,
+                                    typing_env,
+                                    EarlyBinder::bind(*destination),
+                                );
+                            let target = match (coercion, source.kind()) {
+                                (PointerCoercion::ReifyFnPointer(_), ty::FnDef(def, args)) => {
+                                    Instance::resolve_for_fn_ptr(tcx, typing_env, *def, args)
+                                }
+                                (PointerCoercion::ClosureFnPointer(_), ty::Closure(def, args)) => {
+                                    Some(Instance::resolve_closure(
+                                        tcx,
+                                        *def,
+                                        args,
+                                        ty::ClosureKind::FnOnce,
+                                    ))
+                                }
+                                _ => None,
+                            };
+                            if let Some(target) = target {
+                                let targets = pointer_candidates.entry(destination).or_default();
+                                if !targets.contains(&target) {
+                                    targets.push(target);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -184,14 +261,23 @@ impl Callbacks for Checker {
                     continue;
                 }
                 InstanceKind::Virtual(def, _) => {
-                    for candidate in &candidates {
-                        if tcx
-                            .opt_associated_item(candidate.def_id())
-                            .and_then(|item| item.trait_item_def_id())
-                            == Some(def)
+                    for receiver in trait_receivers.get(&def).into_iter().flatten() {
+                        if receiver[1..] != instance.args[1..receiver.len()] {
+                            continue;
+                        }
+                        let args = tcx.mk_args_from_iter(instance.args.iter().enumerate().map(
+                            |(index, arg)| {
+                                if index == 0 { receiver[0] } else { arg }
+                            },
+                        ));
+                        if let Ok(Some(candidate)) =
+                            Instance::try_resolve(tcx, typing_env, def, args)
                         {
+                            if matches!(candidate.def, InstanceKind::Virtual(..)) {
+                                continue;
+                            }
                             edges.push(Edge {
-                                target: Some(*candidate),
+                                target: Some(candidate),
                                 span: tcx.def_span(candidate.def_id()),
                                 kind: "virtual candidate",
                                 detail: String::new(),
@@ -202,10 +288,33 @@ impl Callbacks for Checker {
                         target: None,
                         span: tcx.def_span(def),
                         kind: "unknown",
-                        detail: format!("dynamic dispatch requires a contract: {instance}"),
+                        detail: format!("dynamic dispatch target is not exact: {instance}"),
                     });
                 }
-                InstanceKind::Item(def) if !tcx.is_mir_available(def) => {
+                InstanceKind::Item(def) if tcx.is_foreign_item(def) => {
+                    let symbol = tcx.symbol_name(instance).name;
+                    if symbol.starts_with("llvm.") {
+                        graph.insert(instance, edges);
+                        continue;
+                    }
+                    let target = exported_functions.get(symbol).copied();
+                    edges.push(Edge {
+                        target,
+                        span: tcx.def_span(def),
+                        kind: if target.is_some() {
+                            "linked Rust function"
+                        } else {
+                            "external"
+                        },
+                        detail: format!(
+                            "external symbol has no Rust body in this compilation: {symbol}"
+                        ),
+                    });
+                }
+                InstanceKind::Item(def)
+                    if !tcx.is_mir_available(def)
+                        && !matches!(tcx.def_kind(def), rustc_hir::def::DefKind::Ctor(..)) =>
+                {
                     edges.push(Edge {
                         target: None,
                         span: tcx.def_span(def),
@@ -258,7 +367,7 @@ impl Callbacks for Checker {
                                         target: None,
                                         span,
                                         kind: "unknown",
-                                        detail: format!("function pointer requires a contract: {callee_ty}; {} candidate targets", pointer_candidates.get(&callee_ty).map_or(0, Vec::len)),
+                                        detail: format!("function pointer target is not exact: {callee_ty}; {} address-taken targets", pointer_candidates.get(&callee_ty).map_or(0, Vec::len)),
                                     });
                                 }
                             }
@@ -276,12 +385,6 @@ impl Callbacks for Checker {
                                     detail: String::new(),
                                 });
                             }
-                            TerminatorKind::InlineAsm { .. } => edges.push(Edge {
-                                target: None,
-                                span,
-                                kind: "unknown",
-                                detail: "assembly requires an irq::trusted boundary".into(),
-                            }),
                             _ => {}
                         }
                     }
@@ -328,6 +431,7 @@ impl Callbacks for Checker {
         let mut allocation_sites = Vec::new();
         let mut reported_sites = HashSet::new();
         let mut findings = Vec::new();
+        let mut coverage_gaps = Vec::new();
         let mut diagnostics = Vec::new();
         for root in &roots {
             let mut parents: HashMap<Instance<'tcx>, (Instance<'tcx>, Edge<'tcx>)> = HashMap::new();
@@ -380,7 +484,15 @@ impl Callbacks for Checker {
                             });
                         }
                     } else if reported_unknown.insert((edge.span, edge.detail.clone())) {
-                        leaves.push(("unknown", edge.detail.clone(), edge.span));
+                        leaves.push((
+                            if edge.kind == "external" {
+                                "external"
+                            } else {
+                                "unresolved"
+                            },
+                            edge.detail.clone(),
+                            edge.span,
+                        ));
                     }
                 }
                 for (category, reason, span) in leaves {
@@ -395,16 +507,25 @@ impl Callbacks for Checker {
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
-                    diagnostics.push((
-                        category,
-                        span,
-                        format!("interrupt {category}: {reason}\n{trace}"),
-                    ));
-                    findings.push(Finding {
+                    let finding = Finding {
                         category,
                         reason,
                         path,
-                    });
+                    };
+                    if category == "forbidden" {
+                        let candidate = finding
+                            .path
+                            .iter()
+                            .any(|step| step.operation.ends_with("candidate"));
+                        diagnostics.push((
+                            candidate,
+                            span,
+                            format!("interrupt {category}: {}\n{trace}", finding.reason),
+                        ));
+                        findings.push(finding);
+                    } else {
+                        coverage_gaps.push(finding);
+                    }
                 }
             }
         }
@@ -415,6 +536,7 @@ impl Callbacks for Checker {
             roots: roots.iter().map(ToString::to_string).collect(),
             checked_instances: graph.len(),
             findings,
+            coverage_gaps,
             allocation_sites,
         };
         if let Some(directory) = std::env::var_os("IRQ_CHECK_REPORT_DIR") {
@@ -430,17 +552,22 @@ impl Callbacks for Checker {
                     .err(format!("cannot write interrupt report: {error}"));
             }
         }
-        diagnostics.sort_by_key(|(category, _, _)| *category);
-        for (_, span, message) in &diagnostics {
-            tcx.dcx().span_err(*span, message.clone());
+        diagnostics.sort_by_key(|(candidate, _, _)| *candidate);
+        for (candidate, span, message) in &diagnostics {
+            if *candidate {
+                tcx.dcx().span_warn(*span, message.clone());
+            } else {
+                tcx.dcx().span_err(*span, message.clone());
+            }
         }
         eprintln!(
-            "irq-check: {} handlers, {} instances, {} findings",
+            "irq-check: {} handlers, {} instances, {} forbidden findings, {} coverage gaps (report only)",
             roots.len(),
             graph.len(),
-            diagnostics.len()
+            diagnostics.len(),
+            report.coverage_gaps.len()
         );
-        if diagnostics.is_empty() {
+        if diagnostics.iter().all(|(candidate, _, _)| *candidate) {
             Compilation::Continue
         } else {
             Compilation::Stop
