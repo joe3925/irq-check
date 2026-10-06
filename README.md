@@ -14,13 +14,18 @@ Add the Cargo bin directory to `PATH`. The rustOS `xtask` uses the installed che
 ## Mark functions
 
 ```rust
-#[cfg_attr(irq_check, irq::handler)]
+#[cfg_attr(irq_check, irq::context)]
 fn interrupt_handler() {}
 
 #[cfg_attr(irq_check, irq::forbidden)]
 fn heap_operation() {}
+
+trait Device {
+    #[cfg_attr(irq_check, irq::context)]
+    fn service(&self);
+}
 ```
 
-The check starts at each handler. It rejects call paths that reach a forbidden function. Helpers need no mark.
+Mark actual callback functions that can run in interrupt context, not function-pointer fields. A marked trait method checks its concrete implementations. Mark the trait itself to check all its methods. Helpers need no mark. This convention does not restrict which functions a pointer can store.
 
 Use `#[cfg_attr(irq_check, irq::trusted)]` only on a function whose full call path you have checked. This mark stops analysis at that function.

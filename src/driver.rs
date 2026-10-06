@@ -1,6 +1,7 @@
 #![feature(rustc_private)]
 
 extern crate rustc_driver;
+extern crate rustc_errors;
 extern crate rustc_hir;
 extern crate rustc_interface;
 extern crate rustc_middle;
@@ -11,7 +12,6 @@ use rustc_hir::def_id::DefId;
 use rustc_interface::interface::Compiler;
 use rustc_middle::mir::TerminatorKind;
 use rustc_middle::mir::mono::MonoItem;
-use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::{self, EarlyBinder, Instance, InstanceKind, TyCtxt, TypingEnv};
 use rustc_span::{Span, Symbol};
 use serde::Serialize;
@@ -41,6 +41,7 @@ struct Step {
 
 #[derive(Serialize)]
 struct Finding {
+    severity: &'static str,
     category: &'static str,
     reason: String,
     path: Vec<Step>,
@@ -51,14 +52,48 @@ struct Report {
     checker_version: &'static str,
     rustc_commit: &'static str,
     crate_name: String,
-    roots: Vec<String>,
-    checked_instances: usize,
     findings: Vec<Finding>,
-    coverage_gaps: Vec<Finding>,
-    allocation_sites: Vec<Finding>,
+}
+
+struct InterruptDiagnostic {
+    primary: Span,
+    context: Span,
+    message: String,
+    label: String,
+    chain: String,
+    report_path: Option<PathBuf>,
+}
+
+fn emit_interrupt<G: rustc_errors::EmissionGuarantee>(
+    mut diagnostic: rustc_errors::Diag<'_, G>,
+    finding: &InterruptDiagnostic,
+) {
+    diagnostic.span_label(finding.primary, finding.label.clone());
+    if finding.context != finding.primary {
+        diagnostic.span_note(finding.context, "interrupt context starts here");
+    }
+    diagnostic.note(format!("call path:\n{}", finding.chain));
+    diagnostic.note("this check follows possible branches; it does not prove initialization state or reference counts");
+    if let Some(path) = &finding.report_path {
+        diagnostic.note(format!(
+            "full call path and concrete types: {}",
+            path.display()
+        ));
+    } else {
+        diagnostic.help("set IRQ_CHECK_REPORT_DIR to save the full call paths and concrete types");
+    }
+    diagnostic.emit();
 }
 
 fn marked(tcx: TyCtxt<'_>, def: DefId, name: &str) -> bool {
+    if def.as_local().is_some_and(|local| {
+        matches!(
+            tcx.hir_crate(()).owner(tcx, local),
+            rustc_hir::MaybeOwner::Phantom
+        )
+    }) {
+        return false;
+    }
     tcx.get_attrs_by_path(def, &[Symbol::intern("irq"), Symbol::intern(name)])
         .next()
         .is_some()
@@ -69,17 +104,20 @@ fn forbidden(tcx: TyCtxt<'_>, instance: Instance<'_>) -> Option<String> {
     if marked(tcx, instance.def_id(), "forbidden") {
         return Some(format!("{path} is marked irq::forbidden"));
     }
-    if [
-        "__rust_alloc",
-        "__rust_alloc_zeroed",
-        "__rust_realloc",
-        "__rust_dealloc",
-    ]
-    .iter()
-    .any(|name| {
-        tcx.opt_item_name(instance.def_id())
-            .is_some_and(|item| item.as_str() == *name)
-    }) {
+    if tcx.crate_name(instance.def_id().krate).as_str() == "alloc"
+        && tcx.is_foreign_item(instance.def_id())
+        && [
+            "__rust_alloc",
+            "__rust_alloc_zeroed",
+            "__rust_realloc",
+            "__rust_dealloc",
+        ]
+        .iter()
+        .any(|name| {
+            tcx.opt_item_name(instance.def_id())
+                .is_some_and(|item| item.as_str() == *name)
+        })
+    {
         return Some(format!("allocator entry {path}"));
     }
     None
@@ -87,6 +125,17 @@ fn forbidden(tcx: TyCtxt<'_>, instance: Instance<'_>) -> Option<String> {
 
 fn location(tcx: TyCtxt<'_>, span: Span) -> String {
     tcx.sess.source_map().span_to_diagnostic_string(span)
+}
+
+fn context_method(tcx: TyCtxt<'_>, def: DefId) -> bool {
+    marked(tcx, def, "context")
+        || tcx.opt_associated_item(def).is_some_and(|item| {
+            item.trait_item_def_id().is_some_and(|method| {
+                marked(tcx, method, "context") || marked(tcx, tcx.parent(method), "context")
+            }) || item
+                .trait_container(tcx)
+                .is_some_and(|trait_id| marked(tcx, trait_id, "context"))
+        })
 }
 
 fn trace<'tcx>(
@@ -107,7 +156,7 @@ fn trace<'tcx>(
     path.push(Step {
         function: root.to_string(),
         location: location(tcx, tcx.def_span(root.def_id())),
-        operation: "handler".into(),
+        operation: "interrupt context".into(),
     });
     path.reverse();
     path
@@ -115,25 +164,41 @@ fn trace<'tcx>(
 
 impl Callbacks for Checker {
     fn after_analysis<'tcx>(&mut self, _: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
+        let mut invalid_labels = false;
+        for local in tcx.iter_local_def_id() {
+            if marked(tcx, local.to_def_id(), "context")
+                && !matches!(
+                    tcx.def_kind(local),
+                    rustc_hir::def::DefKind::Fn
+                        | rustc_hir::def::DefKind::AssocFn
+                        | rustc_hir::def::DefKind::Trait
+                )
+            {
+                tcx.dcx().span_err(tcx.def_span(local), "irq::context is allowed only on functions, trait methods, and traits; mark the callback function, not its field");
+                invalid_labels = true;
+            }
+        }
+        if invalid_labels {
+            return Compilation::Stop;
+        }
         let mut roots = Vec::new();
         for local in tcx.hir_body_owners() {
-            if marked(tcx, local.to_def_id(), "handler") {
-                if tcx.generics_of(local).count() != 0 {
-                    tcx.dcx().span_err(
-                        tcx.def_span(local),
-                        "irq::handler must have no generic parameters",
-                    );
-                } else {
+            if context_method(tcx, local.to_def_id()) {
+                if tcx.generics_of(local).count() == 0 {
                     roots.push(Instance::mono(tcx, local.to_def_id()));
                 }
             }
         }
-        if roots.is_empty() {
+        if roots.is_empty()
+            && !tcx
+                .iter_local_def_id()
+                .any(|local| context_method(tcx, local.to_def_id()))
+        {
             if std::env::var("IRQ_CHECK_REQUIRED_CRATE").ok().as_deref()
                 == Some(tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE).as_str())
             {
                 tcx.dcx()
-                    .err("The required crate has no irq::handler entry points.");
+                    .err("The required crate has no irq::context labels.");
                 return Compilation::Stop;
             }
             return Compilation::Continue;
@@ -141,108 +206,41 @@ impl Callbacks for Checker {
         roots.sort_by_key(|instance| instance.to_string());
         let typing_env = TypingEnv::fully_monomorphized();
         let partitions = tcx.collect_and_partition_mono_items(());
-        let mut candidate_set = HashSet::new();
+        let mut instances = HashSet::new();
         for cgu in partitions.codegen_units {
             for item in cgu.items().keys() {
                 if let MonoItem::Fn(instance) = item {
-                    candidate_set.insert(*instance);
+                    instances.insert(*instance);
                 }
             }
         }
-        let mut candidates: Vec<_> = candidate_set.into_iter().collect();
-        candidates.sort_by_key(ToString::to_string);
-        let mut pointer_candidates: HashMap<ty::Ty<'tcx>, Vec<Instance<'tcx>>> = HashMap::new();
+        let mut instances: Vec<_> = instances.into_iter().collect();
+        instances.sort_by_key(ToString::to_string);
         let mut exported_functions = HashMap::new();
-        let mut trait_receivers: HashMap<DefId, HashSet<ty::GenericArgsRef<'tcx>>> = HashMap::new();
-        for candidate in &candidates {
+        for instance in &instances {
+            if context_method(tcx, instance.def_id())
+                && !matches!(instance.def, InstanceKind::Virtual(..))
+            {
+                roots.push(*instance);
+            }
             if matches!(
-                tcx.def_kind(candidate.def_id()),
+                tcx.def_kind(instance.def_id()),
                 rustc_hir::def::DefKind::Fn | rustc_hir::def::DefKind::AssocFn
             ) {
-                exported_functions.insert(tcx.symbol_name(*candidate).name.to_owned(), *candidate);
-                if let Some(item) = tcx.opt_associated_item(candidate.def_id()) {
-                    if let Some(trait_item) = item.trait_item_def_id() {
-                        if let Some(implementation) = item.impl_container(tcx) {
-                            let receiver = tcx
-                                .impl_trait_ref(implementation)
-                                .instantiate(tcx, candidate.args);
-                            let receiver = tcx.normalize_erasing_regions(typing_env, receiver);
-                            trait_receivers
-                                .entry(trait_item)
-                                .or_default()
-                                .insert(receiver.args);
-                        }
-                    } else if let Some(trait_id) = item.trait_container(tcx) {
-                        trait_receivers
-                            .entry(candidate.def_id())
-                            .or_default()
-                            .insert(
-                                tcx.mk_args_from_iter(
-                                    candidate
-                                        .args
-                                        .iter()
-                                        .take(tcx.generics_of(trait_id).count()),
-                                ),
-                            );
-                    }
-                }
+                exported_functions.insert(tcx.symbol_name(*instance).name.to_owned(), *instance);
             }
-            if matches!(
-                candidate.def,
-                InstanceKind::Virtual(..) | InstanceKind::Intrinsic(_)
-            ) || (matches!(candidate.def, InstanceKind::Item(def) if !tcx.is_mir_available(def))
-                && !matches!(
-                    tcx.def_kind(candidate.def_id()),
-                    rustc_hir::def::DefKind::Ctor(..)
-                ))
+        }
+        roots.sort_by_key(ToString::to_string);
+        roots.dedup();
+        if roots.is_empty() {
+            if std::env::var("IRQ_CHECK_REQUIRED_CRATE").ok().as_deref()
+                == Some(tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE).as_str())
             {
-                continue;
+                tcx.dcx()
+                    .err("The required crate has no concrete irq::context functions.");
+                return Compilation::Stop;
             }
-            let body = tcx.instance_mir(candidate.def);
-            for block in body.basic_blocks.iter() {
-                for statement in &block.statements {
-                    if let rustc_middle::mir::StatementKind::Assign(assignment) = &statement.kind {
-                        if let rustc_middle::mir::Rvalue::Cast(
-                            rustc_middle::mir::CastKind::PointerCoercion(coercion, _),
-                            operand,
-                            destination,
-                        ) = &assignment.1
-                        {
-                            let source = candidate.instantiate_mir_and_normalize_erasing_regions(
-                                tcx,
-                                typing_env,
-                                EarlyBinder::bind(operand.ty(body, tcx)),
-                            );
-                            let destination = candidate
-                                .instantiate_mir_and_normalize_erasing_regions(
-                                    tcx,
-                                    typing_env,
-                                    EarlyBinder::bind(*destination),
-                                );
-                            let target = match (coercion, source.kind()) {
-                                (PointerCoercion::ReifyFnPointer(_), ty::FnDef(def, args)) => {
-                                    Instance::resolve_for_fn_ptr(tcx, typing_env, *def, args)
-                                }
-                                (PointerCoercion::ClosureFnPointer(_), ty::Closure(def, args)) => {
-                                    Some(Instance::resolve_closure(
-                                        tcx,
-                                        *def,
-                                        args,
-                                        ty::ClosureKind::FnOnce,
-                                    ))
-                                }
-                                _ => None,
-                            };
-                            if let Some(target) = target {
-                                let targets = pointer_candidates.entry(destination).or_default();
-                                if !targets.contains(&target) {
-                                    targets.push(target);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            return Compilation::Continue;
         }
         let mut graph: HashMap<Instance<'tcx>, Vec<Edge<'tcx>>> = HashMap::new();
         let mut pending: VecDeque<_> = roots.iter().copied().collect();
@@ -261,34 +259,11 @@ impl Callbacks for Checker {
                     continue;
                 }
                 InstanceKind::Virtual(def, _) => {
-                    for receiver in trait_receivers.get(&def).into_iter().flatten() {
-                        if receiver[1..] != instance.args[1..receiver.len()] {
-                            continue;
-                        }
-                        let args = tcx.mk_args_from_iter(instance.args.iter().enumerate().map(
-                            |(index, arg)| {
-                                if index == 0 { receiver[0] } else { arg }
-                            },
-                        ));
-                        if let Ok(Some(candidate)) =
-                            Instance::try_resolve(tcx, typing_env, def, args)
-                        {
-                            if matches!(candidate.def, InstanceKind::Virtual(..)) {
-                                continue;
-                            }
-                            edges.push(Edge {
-                                target: Some(candidate),
-                                span: tcx.def_span(candidate.def_id()),
-                                kind: "virtual candidate",
-                                detail: String::new(),
-                            });
-                        }
-                    }
                     edges.push(Edge {
                         target: None,
                         span: tcx.def_span(def),
                         kind: "unknown",
-                        detail: format!("dynamic dispatch target is not exact: {instance}"),
+                        detail: format!("dynamic dispatch target is unresolved: {instance}"),
                     });
                 }
                 InstanceKind::Item(def) if tcx.is_foreign_item(def) => {
@@ -353,21 +328,13 @@ impl Callbacks for Checker {
                                         detail: format!("cannot resolve {callee_ty}"),
                                     });
                                 } else {
-                                    for candidate in
-                                        pointer_candidates.get(&callee_ty).into_iter().flatten()
-                                    {
-                                        edges.push(Edge {
-                                            target: Some(*candidate),
-                                            span,
-                                            kind: "function pointer candidate",
-                                            detail: String::new(),
-                                        });
-                                    }
                                     edges.push(Edge {
                                         target: None,
                                         span,
                                         kind: "unknown",
-                                        detail: format!("function pointer target is not exact: {callee_ty}; {} address-taken targets", pointer_candidates.get(&callee_ty).map_or(0, Vec::len)),
+                                        detail: format!(
+                                            "function pointer target is unresolved: {callee_ty}"
+                                        ),
                                     });
                                 }
                             }
@@ -399,39 +366,8 @@ impl Callbacks for Checker {
             }
             graph.insert(instance, edges);
         }
-        let mut reverse: HashMap<Instance<'tcx>, Vec<(Instance<'tcx>, Edge<'tcx>)>> =
-            HashMap::new();
-        let mut sink_queue = VecDeque::new();
-        let mut sinks = HashSet::new();
-        let mut toward_sink: HashMap<Instance<'tcx>, (Instance<'tcx>, Edge<'tcx>)> = HashMap::new();
-        let mut ordered: Vec<_> = graph.keys().copied().collect();
-        ordered.sort_by_key(ToString::to_string);
-        for current in ordered {
-            if forbidden(tcx, current).is_some() {
-                sinks.insert(current);
-                sink_queue.push_back(current);
-            }
-            for edge in &graph[&current] {
-                if let Some(target) = edge.target {
-                    reverse
-                        .entry(target)
-                        .or_default()
-                        .push((current, edge.clone()));
-                }
-            }
-        }
-        while let Some(target) = sink_queue.pop_front() {
-            for (current, edge) in reverse.get(&target).into_iter().flatten() {
-                if !sinks.contains(current) && !toward_sink.contains_key(current) {
-                    toward_sink.insert(*current, (target, edge.clone()));
-                    sink_queue.push_back(*current);
-                }
-            }
-        }
-        let mut allocation_sites = Vec::new();
-        let mut reported_sites = HashSet::new();
         let mut findings = Vec::new();
-        let mut coverage_gaps = Vec::new();
+        let mut coverage_warnings = 0usize;
         let mut diagnostics = Vec::new();
         for root in &roots {
             let mut parents: HashMap<Instance<'tcx>, (Instance<'tcx>, Edge<'tcx>)> = HashMap::new();
@@ -439,93 +375,112 @@ impl Callbacks for Checker {
             let mut queue = VecDeque::from([*root]);
             let mut reported_unknown = HashSet::new();
             while let Some(current) = queue.pop_front() {
-                let blocked = forbidden(tcx, current);
-                let mut leaves = Vec::new();
-                if let Some(reason) = blocked {
-                    leaves.push(("forbidden", reason, tcx.def_span(current.def_id())));
-                }
                 for edge in &graph[&current] {
                     if let Some(target) = edge.target {
                         if visited.insert(target) {
                             parents.insert(target, (current, edge.clone()));
                             queue.push_back(target);
                         }
-                        let from_crate = tcx.crate_name(current.def_id().krate);
-                        let into_crate = tcx.crate_name(target.def_id().krate);
-                        if ((!matches!(from_crate.as_str(), "core" | "alloc" | "std")
-                            && into_crate.as_str() == "alloc")
-                            || (current.def_id().is_local()
-                                && matches!(
-                                    edge.kind,
-                                    "function pointer candidate" | "virtual candidate"
-                                )))
-                            && toward_sink.contains_key(&target)
-                            && reported_sites.insert((*root, edge.span, target.def_id()))
-                        {
-                            let mut path = trace(tcx, *root, current, &parents);
-                            path.push(Step {
-                                function: target.to_string(),
-                                location: location(tcx, edge.span),
-                                operation: edge.kind.into(),
-                            });
-                            let mut cursor = target;
-                            while let Some((next, hop)) = toward_sink.get(&cursor) {
-                                path.push(Step {
-                                    function: next.to_string(),
-                                    location: location(tcx, hop.span),
-                                    operation: hop.kind.into(),
-                                });
-                                cursor = *next;
-                            }
-                            allocation_sites.push(Finding {
-                                category: "allocation site",
-                                reason: forbidden(tcx, cursor).unwrap(),
-                                path,
-                            });
-                        }
                     } else if reported_unknown.insert((edge.span, edge.detail.clone())) {
-                        leaves.push((
-                            if edge.kind == "external" {
-                                "external"
+                        coverage_warnings += 1;
+                        let mut path = trace(tcx, *root, current, &parents);
+                        let span = if matches!(current.def, InstanceKind::Virtual(..)) {
+                            parents
+                                .get(&current)
+                                .map_or(edge.span, |(_, call)| call.span)
+                        } else {
+                            edge.span
+                        };
+                        path.push(Step {
+                            function: current.to_string(),
+                            location: location(tcx, span),
+                            operation: if edge.kind == "external" {
+                                "external call"
                             } else {
-                                "unresolved"
-                            },
-                            edge.detail.clone(),
-                            edge.span,
-                        ));
+                                "unresolved call"
+                            }
+                            .into(),
+                        });
+                        findings.push(Finding {
+                            severity: "warning",
+                            category: "coverage gap",
+                            reason: edge.detail.clone(),
+                            path,
+                        });
                     }
                 }
-                for (category, reason, span) in leaves {
+                if let Some(reason) = forbidden(tcx, current) {
                     let path = trace(tcx, *root, current, &parents);
-                    let trace = path
-                        .iter()
-                        .map(|step| {
-                            format!(
-                                "  {} [{}; {}]",
-                                step.function, step.operation, step.location
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
                     let finding = Finding {
-                        category,
+                        severity: "error",
+                        category: "forbidden",
                         reason,
                         path,
                     };
-                    if category == "forbidden" {
-                        let candidate = finding
-                            .path
-                            .iter()
-                            .any(|step| step.operation.ends_with("candidate"));
-                        diagnostics.push((
-                            candidate,
-                            span,
-                            format!("interrupt {category}: {}\n{trace}", finding.reason),
-                        ));
-                        findings.push(finding);
-                    } else {
-                        coverage_gaps.push(finding);
+                    let mut cursor = current;
+                    let mut hops = Vec::new();
+                    while let Some((parent, edge)) = parents.get(&cursor) {
+                        hops.push((*parent, cursor, edge.clone()));
+                        cursor = *parent;
                     }
+                    hops.reverse();
+                    let mut primary = tcx.def_span(root.def_id());
+                    let mut operation = "call";
+                    let mut chain = vec![tcx.def_path_str(root.def_id())];
+                    let mut library_steps = 0;
+                    for (parent, target, edge) in &hops {
+                        if parent.def_id().is_local() {
+                            primary = edge.span.source_callsite();
+                            operation = edge.kind;
+                        }
+                        let crate_name = tcx.crate_name(target.def_id().krate);
+                        if matches!(crate_name.as_str(), "core" | "alloc" | "std")
+                            && *target != current
+                        {
+                            library_steps += 1;
+                            continue;
+                        }
+                        if library_steps != 0 {
+                            chain.push(format!("{library_steps} library or generated-drop steps"));
+                            library_steps = 0;
+                        }
+                        chain.push(tcx.def_path_str(target.def_id()));
+                    }
+                    let action = match tcx
+                        .opt_item_name(current.def_id())
+                        .map(|name| name.as_str().to_owned())
+                        .as_deref()
+                    {
+                        Some("__rust_alloc" | "__rust_alloc_zeroed") => "heap allocation",
+                        Some("__rust_realloc") => "heap reallocation",
+                        Some("__rust_dealloc") => "heap deallocation",
+                        _ => "a forbidden operation",
+                    };
+                    diagnostics.push(InterruptDiagnostic {
+                        primary,
+                        context: tcx.def_span(root.def_id()).source_callsite(),
+                        message: format!("{action} is reachable from interrupt context"),
+                        label: format!("this {operation} can reach {action}"),
+                        chain: chain
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, name)| {
+                                if index == 0 {
+                                    format!("  {name}")
+                                } else {
+                                    format!("  -> {name}")
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                        report_path: std::env::var_os("IRQ_CHECK_REPORT_DIR").map(|directory| {
+                            PathBuf::from(directory).join(format!(
+                                "{}.json",
+                                tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE)
+                            ))
+                        }),
+                    });
+                    findings.push(finding);
                 }
             }
         }
@@ -533,11 +488,7 @@ impl Callbacks for Checker {
             checker_version: env!("CARGO_PKG_VERSION"),
             rustc_commit: COMMIT,
             crate_name: tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE).to_string(),
-            roots: roots.iter().map(ToString::to_string).collect(),
-            checked_instances: graph.len(),
             findings,
-            coverage_gaps,
-            allocation_sites,
         };
         if let Some(directory) = std::env::var_os("IRQ_CHECK_REPORT_DIR") {
             let directory = PathBuf::from(directory);
@@ -552,22 +503,21 @@ impl Callbacks for Checker {
                     .err(format!("cannot write interrupt report: {error}"));
             }
         }
-        diagnostics.sort_by_key(|(candidate, _, _)| *candidate);
-        for (candidate, span, message) in &diagnostics {
-            if *candidate {
-                tcx.dcx().span_warn(*span, message.clone());
-            } else {
-                tcx.dcx().span_err(*span, message.clone());
-            }
+        for finding in &diagnostics {
+            emit_interrupt(
+                tcx.dcx()
+                    .struct_span_err(finding.primary, finding.message.clone()),
+                finding,
+            );
         }
         eprintln!(
-            "irq-check: {} handlers, {} instances, {} forbidden findings, {} coverage gaps (report only)",
+            "irq-check: {} interrupt contexts, {} instances, {} errors, {} warnings (see report)",
             roots.len(),
             graph.len(),
             diagnostics.len(),
-            report.coverage_gaps.len()
+            coverage_warnings
         );
-        if diagnostics.iter().all(|(candidate, _, _)| *candidate) {
+        if diagnostics.is_empty() {
             Compilation::Continue
         } else {
             Compilation::Stop
