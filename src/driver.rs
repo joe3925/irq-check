@@ -28,7 +28,7 @@ struct Checker;
 
 #[derive(Clone)]
 struct Edge<'tcx> {
-    target: Option<Instance<'tcx>>,
+    target: Option<analysis::Node<'tcx>>,
     span: Span,
     kind: &'static str,
     detail: String,
@@ -166,34 +166,33 @@ impl Callbacks for Checker {
                 "interrupt call analysis did not reach a complete result",
             );
             diagnostic.note("the call-target or memory analysis limit was reached; no partial result is accepted");
+            diagnostic.note(analysis.limit_detail.clone());
             diagnostic.emit();
             return Compilation::Stop;
         }
         let mut reported = HashSet::new();
         let mut errors = 0;
-        roots.extend(analysis.graph.keys().copied().filter(|instance| {
-            trust.checks(instance.def_id())
-                && context_method(tcx, instance.def_id())
-                && !matches!(instance.def, InstanceKind::Virtual(..))
-        }));
-        roots.sort_by_key(ToString::to_string);
-        roots.dedup();
-        if roots.is_empty() && required {
+        if analysis.roots.is_empty() && required {
             tcx.dcx()
                 .err("the required crate has no concrete irq::context functions");
             return Compilation::Stop;
         }
-        for root in roots {
-            let mut parents: HashMap<Instance<'tcx>, (Instance<'tcx>, Edge<'tcx>)> = HashMap::new();
+        let mut root_nodes: Vec<_> = analysis.roots.values().copied().collect();
+        root_nodes.sort_by_key(|node| (node.instance.to_string(), node.context));
+        for root in root_nodes {
+            let mut parents: HashMap<analysis::Node<'tcx>, (analysis::Node<'tcx>, Edge<'tcx>)> =
+                HashMap::new();
             let mut visited = HashSet::from([root]);
             let mut queue = VecDeque::from([root]);
             while let Some(current) = queue.pop_front() {
                 let mut failures = Vec::new();
-                if let Some(reason) = forbidden(tcx, current) {
+                if let Some(reason) = forbidden(tcx, current.instance) {
                     failures.push((
                         parents
                             .get(&current)
-                            .map_or(tcx.def_span(current.def_id()), |(_, edge)| edge.span),
+                            .map_or(tcx.def_span(current.instance.def_id()), |(_, edge)| {
+                                edge.span
+                            }),
                         reason,
                         false,
                         "call",
@@ -221,17 +220,17 @@ impl Callbacks for Checker {
                     }
                     hops.reverse();
                     let mut primary = span.source_callsite();
-                    if primary.is_dummy() || !current.def_id().is_local() {
+                    if primary.is_dummy() || !current.instance.def_id().is_local() {
                         for (parent, _, edge) in &hops {
-                            if parent.def_id().is_local() {
+                            if parent.instance.def_id().is_local() {
                                 primary = edge.span.source_callsite();
                             }
                         }
                     }
-                    let mut chain = vec![tcx.def_path_str(root.def_id())];
+                    let mut chain = vec![tcx.def_path_str(root.instance.def_id())];
                     let mut library_steps = 0;
                     for (_, target, _) in hops {
-                        let name = tcx.crate_name(target.def_id().krate);
+                        let name = tcx.crate_name(target.instance.def_id().krate);
                         if matches!(name.as_str(), "core" | "alloc" | "std") && target != current {
                             library_steps += 1;
                         } else {
@@ -239,7 +238,7 @@ impl Callbacks for Checker {
                                 chain.push(format!("{library_steps} library or drop steps"));
                                 library_steps = 0;
                             }
-                            chain.push(tcx.def_path_str(target.def_id()));
+                            chain.push(tcx.def_path_str(target.instance.def_id()));
                         }
                     }
                     let message = if unknown {
@@ -257,7 +256,7 @@ impl Callbacks for Checker {
                         },
                     );
                     diagnostic.span_note(
-                        tcx.def_span(root.def_id()).source_callsite(),
+                        tcx.def_span(root.instance.def_id()).source_callsite(),
                         "interrupt context starts here",
                     );
                     if span != primary && !span.is_dummy() {

@@ -13,10 +13,11 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum Base<'tcx> {
-    Local(Instance<'tcx>, usize),
-    Heap(Instance<'tcx>, usize),
+    Local(Instance<'tcx>, usize, usize),
+    Heap(Instance<'tcx>, usize, usize),
     Static(DefId),
     Allocation(AllocId, u64),
+    Unknown(Ty<'tcx>),
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -36,6 +37,12 @@ enum Fact<'tcx> {
 
 type Tree<'tcx> = HashMap<Vec<u32>, HashSet<Fact<'tcx>>>;
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct Node<'tcx> {
+    pub instance: Instance<'tcx>,
+    pub context: usize,
+}
+
 pub struct Analysis<'tcx> {
     tcx: TyCtxt<'tcx>,
     memory: HashMap<Base<'tcx>, Tree<'tcx>>,
@@ -44,12 +51,18 @@ pub struct Analysis<'tcx> {
     loaded: HashSet<(AllocId, u64, Ty<'tcx>)>,
     statics: HashSet<DefId>,
     revision: usize,
-    readers: HashMap<Base<'tcx>, HashSet<Instance<'tcx>>>,
-    pending: VecDeque<Instance<'tcx>>,
-    queued: HashSet<Instance<'tcx>>,
-    active: Option<Instance<'tcx>>,
-    pub graph: HashMap<Instance<'tcx>, Vec<Edge<'tcx>>>,
+    readers: HashMap<Base<'tcx>, HashSet<Node<'tcx>>>,
+    pending: VecDeque<Node<'tcx>>,
+    queued: HashSet<Node<'tcx>>,
+    active: Option<Node<'tcx>>,
+    local_context: usize,
+    contextual: bool,
+    contexts: HashMap<Instance<'tcx>, Vec<Vec<Tree<'tcx>>>>,
+    parents: HashMap<Node<'tcx>, Node<'tcx>>,
+    pub graph: HashMap<Node<'tcx>, Vec<Edge<'tcx>>>,
+    pub roots: HashMap<Instance<'tcx>, Node<'tcx>>,
     pub incomplete: bool,
+    pub limit_detail: String,
 }
 
 impl<'tcx> Analysis<'tcx> {
@@ -71,8 +84,14 @@ impl<'tcx> Analysis<'tcx> {
             pending: VecDeque::new(),
             queued: HashSet::new(),
             active: None,
+            local_context: 0,
+            contextual: false,
+            contexts: HashMap::new(),
+            parents: HashMap::new(),
             graph: HashMap::new(),
+            roots: HashMap::new(),
             incomplete: false,
+            limit_detail: String::new(),
         };
         let mut functions: HashSet<_> = instances
             .iter()
@@ -93,32 +112,95 @@ impl<'tcx> Analysis<'tcx> {
         let mut ordered: Vec<_> = functions.iter().copied().collect();
         ordered.sort_by_key(ToString::to_string);
         for instance in ordered {
-            analysis.schedule(instance);
+            analysis.schedule(Node {
+                instance,
+                context: 0,
+            });
         }
         let mut scans = 0;
-        while let Some(instance) = analysis.pending.pop_front() {
-            analysis.queued.remove(&instance);
-            analysis.active = Some(instance);
+        let mut seeded_revision = usize::MAX;
+        loop {
+            if analysis.pending.is_empty() && seeded_revision != analysis.revision {
+                analysis.contextual = true;
+                analysis.active = None;
+                let mut entries: Vec<_> = analysis
+                    .graph
+                    .keys()
+                    .map(|node| node.instance)
+                    .filter(|instance| {
+                        !matches!(instance.def, InstanceKind::Virtual(..))
+                            && (roots.contains(instance)
+                                || trust.checks(instance.def_id())
+                                    && crate::context_method(tcx, instance.def_id()))
+                    })
+                    .collect();
+                entries.sort_by_key(ToString::to_string);
+                entries.dedup();
+                for instance in entries {
+                    let arguments: Vec<_> = if !tcx.is_foreign_item(instance.def_id())
+                        && !matches!(
+                            instance.def,
+                            InstanceKind::Virtual(..) | InstanceKind::Intrinsic(..)
+                        )
+                        && (tcx.is_mir_available(instance.def_id())
+                            || !matches!(instance.def, InstanceKind::Item(..)))
+                    {
+                        (1..=tcx.instance_mir(instance.def).arg_count)
+                            .map(|local| {
+                                analysis
+                                    .memory
+                                    .get(&Base::Local(instance, 0, local))
+                                    .cloned()
+                                    .unwrap_or_default()
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    let node = analysis.context(instance, arguments.clone());
+                    analysis.roots.insert(instance, node);
+                    for (index, values) in arguments.iter().enumerate() {
+                        analysis.write(
+                            &Address {
+                                base: Base::Local(instance, node.context, index + 1),
+                                fields: Vec::new(),
+                                pointee: None,
+                            },
+                            values,
+                        );
+                    }
+                }
+                seeded_revision = analysis.revision;
+            }
+            let Some(node) = analysis.pending.pop_front() else {
+                break;
+            };
+            let instance = node.instance;
+            analysis.queued.remove(&node);
+            analysis.active = Some(node);
+            analysis.local_context = node.context;
             scans += 1;
             let mut edges = Vec::new();
             if forbidden(tcx, instance).is_some()
                 || !trust.checks(instance.def_id())
                 || known_intrinsic(tcx, instance)
             {
-                analysis.graph.insert(instance, edges);
+                analysis.graph.insert(node, edges);
                 continue;
             }
             if matches!(
                 instance.def,
                 InstanceKind::Intrinsic(_) | InstanceKind::DropGlue(_, None)
             ) {
-                analysis.graph.insert(instance, edges);
+                analysis.graph.insert(node, edges);
                 continue;
             }
             if tcx.is_foreign_item(instance.def_id()) {
                 let symbol = tcx.symbol_name(instance).name;
                 edges.push(Edge {
-                    target: exported.get(symbol).copied(),
+                    target: exported
+                        .get(symbol)
+                        .map(|instance| analysis.context(*instance, Vec::new())),
                     span: tcx.def_span(instance.def_id()),
                     kind: "external call",
                     detail: format!("external symbol has no Rust body: {symbol}"),
@@ -169,11 +251,11 @@ impl<'tcx> Analysis<'tcx> {
                                             Fact::Reference(address)
                                         })
                                         .collect();
-                                    if let Some(index) =
-                                        place.projection.iter().position(|projection| {
-                                            matches!(projection, ProjectionElem::Deref)
-                                        })
-                                    {
+                                    let referent = analysis.ty(instance, place.ty(body, tcx).ty);
+                                    for (index, projection) in place.projection.iter().enumerate() {
+                                        if !matches!(projection, ProjectionElem::Deref) {
+                                            continue;
+                                        }
                                         let pointer = Place {
                                             local: place.local,
                                             projection: tcx
@@ -184,7 +266,11 @@ impl<'tcx> Analysis<'tcx> {
                                             .values()
                                             .flatten()
                                         {
-                                            if matches!(fact, Fact::Concrete(_) | Fact::Unknown) {
+                                            if matches!(fact, Fact::Unknown)
+                                                || matches!(referent.kind(), ty::Dynamic(..))
+                                                    && index + 1 == place.projection.len()
+                                                    && matches!(fact, Fact::Concrete(_))
+                                            {
                                                 values.insert(fact.clone());
                                             }
                                         }
@@ -256,9 +342,15 @@ impl<'tcx> Analysis<'tcx> {
                                                     } else {
                                                         Vec::new()
                                                     };
-                                                    tree.entry(path)
-                                                        .or_default()
-                                                        .insert(Fact::Concrete(source));
+                                                    let values = tree.entry(path).or_default();
+                                                    if values.remove(&Fact::Unknown) {
+                                                        values.insert(Fact::Reference(Address {
+                                                            base: Base::Unknown(source),
+                                                            fields: Vec::new(),
+                                                            pointee: Some(source),
+                                                        }));
+                                                    }
+                                                    values.insert(Fact::Concrete(source));
                                                 }
                                             }
                                         }
@@ -529,6 +621,7 @@ impl<'tcx> Analysis<'tcx> {
                             let callee_ty = analysis.ty(instance, func.ty(body, tcx));
                             let mut targets = HashSet::new();
                             let mut unknown = false;
+                            let mut virtual_call = false;
                             if let ty::FnDef(def, generic_args) = *callee_ty.kind() {
                                 let resolved = Instance::try_resolve(
                                     tcx,
@@ -542,6 +635,7 @@ impl<'tcx> Analysis<'tcx> {
                                     if forbidden(tcx, target).is_some() {
                                         targets.insert(target);
                                     } else if matches!(target.def, InstanceKind::Virtual(..)) {
+                                        virtual_call = true;
                                         if let Some(receiver) = args.first() {
                                             let values =
                                                 analysis.operand(instance, body, &receiver.node);
@@ -639,6 +733,89 @@ impl<'tcx> Analysis<'tcx> {
                                     )
                                     || !tcx.is_mir_available(target.def_id())
                                         && matches!(target.def, InstanceKind::Item(..));
+                                let mut arguments: Vec<_> = args
+                                    .iter()
+                                    .map(|argument| {
+                                        let ty = analysis.ty(instance, argument.node.ty(body, tcx));
+                                        let values =
+                                            analysis.operand(instance, body, &argument.node);
+                                        (ty, values)
+                                    })
+                                    .collect();
+                                if virtual_call && !opaque && !arguments.is_empty() {
+                                    let target_body = tcx.instance_mir(target.def);
+                                    if target_body.arg_count != 0 {
+                                        let parameter_ty = analysis.ty(
+                                            target,
+                                            target_body.local_decls[mir::Local::from_usize(1)].ty,
+                                        );
+                                        if let (Some((path, source)), Some((_, concrete))) = (
+                                            analysis.pointer_layout(arguments[0].0),
+                                            analysis.pointer_layout(parameter_ty),
+                                        ) {
+                                            if matches!(source.kind(), ty::Dynamic(..))
+                                                && !matches!(concrete.kind(), ty::Dynamic(..))
+                                            {
+                                                let values =
+                                                    arguments[0].1.entry(path).or_default();
+                                                let unknown_data = values.remove(&Fact::Unknown);
+                                                values.retain(|fact| match fact {
+                                                    Fact::Concrete(ty) => *ty == concrete,
+                                                    Fact::Reference(address) => {
+                                                        address.pointee.is_none_or(|ty| {
+                                                            ty == concrete
+                                                                || matches!(
+                                                                    ty.kind(),
+                                                                    ty::Dynamic(..)
+                                                                )
+                                                        })
+                                                    }
+                                                    _ => true,
+                                                });
+                                                if unknown_data
+                                                    || !values.iter().any(|fact| {
+                                                        matches!(fact, Fact::Reference(_))
+                                                    })
+                                                {
+                                                    values.insert(Fact::Reference(Address {
+                                                        base: Base::Unknown(concrete),
+                                                        fields: Vec::new(),
+                                                        pointee: Some(concrete),
+                                                    }));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                let storage = destination.and_then(|destination| {
+                                    let result_ty =
+                                        analysis.ty(instance, destination.ty(body, tcx).ty);
+                                    analysis.storage_call(
+                                        instance, block, target, &arguments, result_ty,
+                                    )
+                                });
+                                let mut inputs = Vec::new();
+                                if !opaque && storage.is_none() && node.context != 0 {
+                                    for (ty, values) in &arguments {
+                                        let relevant = analysis.tracks(*ty, &mut HashSet::new())
+                                            || values.values().flatten().any(|fact| match fact {
+                                                Fact::Function(_) | Fact::Concrete(_) => true,
+                                                Fact::Reference(address) => {
+                                                    matches!(address.base, Base::Heap(..))
+                                                        || address.pointee.is_some_and(|ty| {
+                                                            analysis.tracks(ty, &mut HashSet::new())
+                                                        })
+                                                }
+                                                Fact::Unknown => false,
+                                            });
+                                        inputs.push(if relevant {
+                                            values.clone()
+                                        } else {
+                                            Tree::new()
+                                        });
+                                    }
+                                }
+                                let target_node = analysis.context(target, inputs);
                                 if tcx.is_foreign_item(target.def_id())
                                     && trust.checks(target.def_id())
                                     && forbidden(tcx, target).is_none()
@@ -669,32 +846,13 @@ impl<'tcx> Analysis<'tcx> {
                                     });
                                 } else {
                                     edges.push(Edge {
-                                        target: Some(target),
+                                        target: Some(target_node),
                                         span,
                                         kind: if linked { "linked Rust call" } else { "call" },
                                         detail: String::new(),
                                         trusted: false,
                                     });
-                                    if functions.insert(target) {
-                                        analysis.schedule(target);
-                                    }
                                 }
-                                let storage = destination.and_then(|destination| {
-                                    let arguments: Vec<_> = args
-                                        .iter()
-                                        .map(|argument| {
-                                            (
-                                                analysis.ty(instance, argument.node.ty(body, tcx)),
-                                                analysis.operand(instance, body, &argument.node),
-                                            )
-                                        })
-                                        .collect();
-                                    let result_ty =
-                                        analysis.ty(instance, destination.ty(body, tcx).ty);
-                                    analysis.storage_call(
-                                        instance, block, target, &arguments, result_ty,
-                                    )
-                                });
                                 if let (Some(destination), Some(values)) = (destination, &storage) {
                                     analysis.write_place(instance, body, destination, values);
                                 }
@@ -764,10 +922,44 @@ impl<'tcx> Analysis<'tcx> {
                                 } else {
                                     None
                                 };
-                                for (index, argument) in
-                                    args.iter().enumerate().take(target_body.arg_count)
-                                {
-                                    let values = analysis.operand(instance, body, &argument.node);
+                                for index in 0..args.len().min(target_body.arg_count) {
+                                    let mut values = arguments[index].1.clone();
+                                    let parameter_ty = analysis.ty(
+                                        target,
+                                        target_body.local_decls[mir::Local::from_usize(index + 1)]
+                                            .ty,
+                                    );
+                                    if matches!(callee_ty.kind(), ty::FnPtr(..))
+                                        && arguments[index].0 != parameter_ty
+                                    {
+                                        if let (
+                                            Some((source_path, source)),
+                                            Some((destination_path, destination)),
+                                        ) = (
+                                            analysis.pointer_layout(arguments[index].0),
+                                            analysis.pointer_layout(parameter_ty),
+                                        ) {
+                                            let mut facts = HashSet::new();
+                                            for (path, values) in &values {
+                                                if *path == source_path {
+                                                    facts.extend(values.iter().cloned());
+                                                } else if source_path.starts_with(path)
+                                                    && values.contains(&Fact::Unknown)
+                                                {
+                                                    facts.insert(Fact::Unknown);
+                                                }
+                                            }
+                                            values = HashMap::from([(
+                                                destination_path,
+                                                analysis.cast_pointer(facts, source, destination),
+                                            )]);
+                                        } else {
+                                            values
+                                                .entry(Vec::new())
+                                                .or_default()
+                                                .insert(Fact::Unknown);
+                                        }
+                                    }
                                     if index + 1 == args.len() {
                                         if let Some(fields) = untuple {
                                             for field in 0..fields.len() {
@@ -789,6 +981,7 @@ impl<'tcx> Analysis<'tcx> {
                                                             .insert(Fact::Unknown);
                                                     }
                                                 }
+                                                analysis.local_context = target_node.context;
                                                 analysis.write_place(
                                                     target,
                                                     target_body,
@@ -797,21 +990,24 @@ impl<'tcx> Analysis<'tcx> {
                                                     )),
                                                     &projected,
                                                 );
+                                                analysis.local_context = node.context;
                                             }
                                             continue;
                                         }
                                     }
+                                    analysis.local_context = target_node.context;
                                     analysis.write_place(
                                         target,
                                         target_body,
                                         Place::from(mir::Local::from_usize(index + 1)),
                                         &values,
                                     );
+                                    analysis.local_context = node.context;
                                 }
                                 if let Some(destination) = destination.filter(|_| storage.is_none())
                                 {
                                     let result = analysis.read(&Address {
-                                        base: Base::Local(target, 0),
+                                        base: Base::Local(target, target_node.context, 0),
                                         fields: Vec::new(),
                                         pointee: None,
                                     });
@@ -835,28 +1031,35 @@ impl<'tcx> Analysis<'tcx> {
                         TerminatorKind::Drop { place, .. } => {
                             let ty = analysis.ty(instance, place.ty(body, tcx).ty);
                             let target = Instance::resolve_drop_in_place(tcx, ty);
+                            let values = if !matches!(target.def, InstanceKind::DropGlue(_, None))
+                                && analysis.tracks(ty, &mut HashSet::new())
+                            {
+                                HashMap::from([(
+                                    Vec::new(),
+                                    analysis
+                                        .places(instance, body, *place)
+                                        .into_iter()
+                                        .map(Fact::Reference)
+                                        .collect(),
+                                )])
+                            } else {
+                                Tree::new()
+                            };
+                            let target_node = analysis.context(target, vec![values.clone()]);
                             edges.push(Edge {
-                                target: Some(target),
+                                target: Some(target_node),
                                 span,
                                 kind: "drop",
                                 detail: String::new(),
                                 trusted: false,
                             });
-                            if functions.insert(target) {
-                                analysis.schedule(target);
-                            }
-                            let values: HashSet<_> = analysis
-                                .places(instance, body, *place)
-                                .into_iter()
-                                .map(Fact::Reference)
-                                .collect();
                             analysis.write(
                                 &Address {
-                                    base: Base::Local(target, 1),
+                                    base: Base::Local(target, target_node.context, 1),
                                     fields: Vec::new(),
                                     pointee: None,
                                 },
-                                &HashMap::from([(Vec::new(), values)]),
+                                &values,
                             );
                         }
                         TerminatorKind::InlineAsm { operands, .. } => {
@@ -894,7 +1097,7 @@ impl<'tcx> Analysis<'tcx> {
             }
             for edge in &edges {
                 if let Some(target) = edge.target {
-                    if functions.insert(target) {
+                    if !analysis.graph.contains_key(&target) {
                         analysis.schedule(target);
                     }
                 }
@@ -903,7 +1106,8 @@ impl<'tcx> Analysis<'tcx> {
                 (
                     edge.span.lo(),
                     edge.detail.clone(),
-                    edge.target.map(|target| target.to_string()),
+                    edge.target
+                        .map(|target| (target.instance.to_string(), target.context)),
                 )
             });
             edges.dedup_by(|left, right| {
@@ -911,9 +1115,15 @@ impl<'tcx> Analysis<'tcx> {
                     && left.span == right.span
                     && left.detail == right.detail
             });
-            analysis.graph.insert(instance, edges);
-            if scans > 500_000 || functions.len() > 100_000 || analysis.revision > 10_000_000 {
+            analysis.graph.insert(node, edges);
+            if scans > 1_000_000 || analysis.graph.len() > 200_000 || analysis.revision > 10_000_000
+            {
                 analysis.incomplete = true;
+                analysis.limit_detail = format!(
+                    "analyzed {scans} function states, retained {} calling states, and added {} memory facts",
+                    analysis.graph.len(),
+                    analysis.revision
+                );
                 break;
             }
         }
@@ -1044,7 +1254,7 @@ impl<'tcx> Analysis<'tcx> {
                 return Some(Tree::new());
             }
             let address = Address {
-                base: Base::Heap(caller, block.as_usize()),
+                base: Base::Heap(caller, self.local_context, block.as_usize()),
                 fields: Vec::new(),
                 pointee: result_ty.builtin_deref(true),
             };
@@ -1332,6 +1542,7 @@ impl<'tcx> Analysis<'tcx> {
             if let Fact::Reference(mut address) = fact {
                 if source != destination
                     && destination != self.tcx.types.u8
+                    && destination != self.tcx.types.unit
                     && address.pointee != Some(destination)
                 {
                     if let Some(path) = self.inner_path(source, destination, 0).or_else(|| {
@@ -1362,6 +1573,9 @@ impl<'tcx> Analysis<'tcx> {
                 .insert(active);
         }
         let mut tree = Tree::new();
+        if matches!(address.base, Base::Unknown(_)) {
+            tree.entry(Vec::new()).or_default().insert(Fact::Unknown);
+        }
         let Some(memory) = self.memory.get(&address.base) else {
             return tree;
         };
@@ -1432,10 +1646,51 @@ impl<'tcx> Analysis<'tcx> {
         }
     }
 
-    fn schedule(&mut self, instance: Instance<'tcx>) {
-        if self.queued.insert(instance) {
-            self.pending.push_back(instance);
+    fn schedule(&mut self, node: Node<'tcx>) {
+        if self.queued.insert(node) {
+            self.pending.push_back(node);
         }
+    }
+
+    fn context(&mut self, instance: Instance<'tcx>, arguments: Vec<Tree<'tcx>>) -> Node<'tcx> {
+        if !self.contextual || self.active.is_some_and(|node| node.context == 0) {
+            let node = Node {
+                instance,
+                context: 0,
+            };
+            if !self.graph.contains_key(&node) {
+                self.schedule(node);
+            }
+            return node;
+        }
+        let mut ancestor = self.active;
+        while let Some(node) = ancestor {
+            if node.instance == instance {
+                return node;
+            }
+            ancestor = self.parents.get(&node).copied();
+        }
+        let contexts = self.contexts.entry(instance).or_default();
+        let context = if let Some(index) = contexts.iter().position(|input| *input == arguments) {
+            index + 1
+        } else {
+            contexts.push(arguments);
+            if let Some(parent) = self.active {
+                self.parents.insert(
+                    Node {
+                        instance,
+                        context: contexts.len(),
+                    },
+                    parent,
+                );
+            }
+            contexts.len()
+        };
+        let node = Node { instance, context };
+        if !self.graph.contains_key(&node) {
+            self.schedule(node);
+        }
+        node
     }
 
     fn tracks(&mut self, ty: Ty<'tcx>, visiting: &mut HashSet<Ty<'tcx>>) -> bool {
@@ -1530,7 +1785,7 @@ impl<'tcx> Analysis<'tcx> {
         place: Place<'tcx>,
     ) -> Vec<Address<'tcx>> {
         let mut addresses = vec![Address {
-            base: Base::Local(instance, place.local.as_usize()),
+            base: Base::Local(instance, self.local_context, place.local.as_usize()),
             fields: Vec::new(),
             pointee: None,
         }];
