@@ -1,33 +1,41 @@
 #![feature(rustc_private)]
 
 extern crate rustc_abi;
+extern crate rustc_ast;
+extern crate rustc_codegen_ssa;
+extern crate rustc_data_structures;
 extern crate rustc_driver;
 extern crate rustc_errors;
 extern crate rustc_hir;
 extern crate rustc_interface;
 extern crate rustc_middle;
+extern crate rustc_mir_dataflow;
 extern crate rustc_span;
+extern crate rustc_symbol_mangling;
 
 mod analysis;
+mod pointer;
 mod policy;
 mod trust;
 
 use rustc_driver::{Callbacks, Compilation};
 use rustc_hir::def_id::DefId;
 use rustc_interface::interface::Compiler;
-use rustc_middle::mir::mono::MonoItem;
+use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
+use rustc_middle::mono::MonoItem;
 use rustc_middle::ty::{Instance, InstanceKind, TyCtxt};
 use rustc_span::{Span, Symbol};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::process::Command;
 
-const TOOLCHAIN: &str = "nightly-2026-04-07";
-const COMMIT: &str = "bcded331651b60a0383b3ff51db4f24c4495ac53";
+const TOOLCHAIN: &str = env!("IRQ_CHECK_BUILD_RELEASE");
+const COMMIT: &str = env!("IRQ_CHECK_BUILD_COMMIT");
 
 struct Checker;
 
 #[derive(Clone)]
 struct Edge<'tcx> {
+    site: Option<usize>,
     target: Option<analysis::Node<'tcx>>,
     span: Span,
     kind: &'static str,
@@ -36,14 +44,6 @@ struct Edge<'tcx> {
 }
 
 fn marked(tcx: TyCtxt<'_>, def: DefId, name: &str) -> bool {
-    if def.as_local().is_some_and(|local| {
-        matches!(
-            tcx.hir_crate(()).owner(tcx, local),
-            rustc_hir::MaybeOwner::Phantom
-        )
-    }) {
-        return false;
-    }
     tcx.get_attrs_by_path(def, &[Symbol::intern("irq"), Symbol::intern(name)])
         .next()
         .is_some()
@@ -63,20 +63,12 @@ fn forbidden(tcx: TyCtxt<'_>, instance: Instance<'_>) -> Option<String> {
     {
         return Some(format!("{path} implements a method marked irq::forbidden"));
     }
-    if tcx.crate_name(instance.def_id().krate).as_str() == "alloc"
-        && tcx.is_foreign_item(instance.def_id())
-        && [
-            "__rust_alloc",
-            "__rust_alloc_zeroed",
-            "__rust_realloc",
-            "__rust_dealloc",
-        ]
-        .iter()
-        .any(|name| {
-            tcx.opt_item_name(instance.def_id())
-                .is_some_and(|item| item.as_str() == *name)
-        })
-    {
+    if tcx.codegen_fn_attrs(instance.def_id()).flags.intersects(
+        CodegenFnAttrFlags::ALLOCATOR
+            | CodegenFnAttrFlags::ALLOCATOR_ZEROED
+            | CodegenFnAttrFlags::REALLOCATOR
+            | CodegenFnAttrFlags::DEALLOCATOR,
+    ) {
         return Some(format!("allocator entry {path}"));
     }
     None
@@ -155,7 +147,92 @@ impl Callbacks for Checker {
         }
         roots.sort_by_key(ToString::to_string);
         roots.dedup();
+        if std::env::var_os("IRQ_CHECK_STATS").is_some() {
+            let mut checked: Vec<_> = trust
+                .checked
+                .iter()
+                .map(|krate| tcx.crate_name(*krate).to_string())
+                .collect();
+            checked.sort();
+            eprintln!(
+                "irq-check: compiler={COMMIT} target={} selected_crates={} initial_roots={}",
+                tcx.sess.opts.target_triple,
+                checked.join(","),
+                roots.len()
+            );
+            for root in &roots {
+                eprintln!("irq-check: initial IRQ root: {root}");
+            }
+        }
         let analysis = analysis::Analysis::build(tcx, &trust, &instances, &roots);
+        if let Some(directory) = std::env::var_os("IRQ_CHECK_DUMP_DIR") {
+            let directory = std::path::PathBuf::from(directory);
+            let graph = serde_json::json!({
+                "compiler": COMMIT,
+                "target": tcx.sess.opts.target_triple.to_string(),
+                "roots": analysis.roots.values().map(|node| serde_json::json!({
+                    "instance": node.instance.to_string(), "context": node.context
+                })).collect::<Vec<_>>(),
+                "checked_crates": trust.checked.iter().map(|krate| tcx.crate_name(*krate).to_string()).collect::<Vec<_>>(),
+                "incomplete": analysis.incomplete,
+                "detail": analysis.limit_detail,
+                "precision_loss": analysis.precision_loss
+            });
+            let result = std::fs::create_dir_all(&directory).and_then(|_| {
+                use std::io::Write;
+                let file = std::fs::File::create(
+                    directory.join(format!(
+                        "{}.json",
+                        tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE)
+                    )),
+                )?;
+                let mut writer = std::io::BufWriter::new(file);
+                let mut header = serde_json::to_vec(&graph).map_err(std::io::Error::other)?;
+                header.pop();
+                writer.write_all(&header)?;
+                writer.write_all(b",\"sites\":[")?;
+                let mut first = true;
+                for (id, site) in analysis.sites.iter().enumerate() {
+                    if analysis.free_sites.contains(&id) {
+                        continue;
+                    }
+                    if !first {
+                        writer.write_all(b",")?;
+                    }
+                    first = false;
+                    writer.write_all(&serde_json::to_vec(&serde_json::json!({
+                        "id": id, "caller": site.caller.instance.to_string(), "context": site.caller.context,
+                        "location": format!("{:?}", site.location), "state_id": site.state,
+                        "source_scope": format!("{:?}", site.scope), "normal": format!("{:?}", site.normal),
+                        "unwind": format!("{:?}", site.unwind), "state": analysis.site_state(id)
+                    })).map_err(std::io::Error::other)?)?;
+                }
+                writer.write_all(b"],\"edges\":[")?;
+                first = true;
+                for (caller, edges) in &analysis.graph {
+                    for edge in edges {
+                        if !first {
+                            writer.write_all(b",")?;
+                        }
+                        first = false;
+                        writer.write_all(&serde_json::to_vec(&serde_json::json!({
+                            "caller": caller.instance.to_string(), "caller_context": caller.context,
+                            "callee": edge.target.map(|node| node.instance.to_string()),
+                            "callee_context": edge.target.map(|node| node.context),
+                            "span": format!("{:?}", edge.span), "kind": edge.kind,
+                            "detail": edge.detail, "trusted": edge.trusted, "site": edge.site
+                        })).map_err(std::io::Error::other)?)?;
+                    }
+                }
+                writer.write_all(b"]}")?;
+                writer.flush()
+            });
+            if let Err(error) = result {
+                tcx.dcx()
+                    .err(format!("cannot write the analysis evidence: {error}"));
+                return Compilation::Stop;
+            }
+        }
         if analysis.incomplete {
             let mut diagnostic = tcx.dcx().struct_span_err(
                 roots
@@ -165,7 +242,8 @@ impl Callbacks for Checker {
                     }),
                 "interrupt call analysis did not reach a complete result",
             );
-            diagnostic.note("the call-target or memory analysis limit was reached; no partial result is accepted");
+            diagnostic
+                .note("required analysis coverage is incomplete; no partial result is accepted");
             diagnostic.note(analysis.limit_detail.clone());
             diagnostic.emit();
             return Compilation::Stop;
@@ -196,6 +274,7 @@ impl Callbacks for Checker {
                         reason,
                         false,
                         "call",
+                        parents.get(&current).and_then(|(_, edge)| edge.site),
                     ));
                 }
                 for edge in analysis.graph.get(&current).into_iter().flatten() {
@@ -205,10 +284,10 @@ impl Callbacks for Checker {
                             queue.push_back(target);
                         }
                     } else if !edge.trusted {
-                        failures.push((edge.span, edge.detail.clone(), true, edge.kind));
+                        failures.push((edge.span, edge.detail.clone(), true, edge.kind, edge.site));
                     }
                 }
-                for (span, reason, unknown, operation) in failures {
+                for (span, reason, unknown, operation, site) in failures {
                     if !reported.insert((span, reason.clone())) {
                         continue;
                     }
@@ -228,23 +307,14 @@ impl Callbacks for Checker {
                         }
                     }
                     let mut chain = vec![tcx.def_path_str(root.instance.def_id())];
-                    let mut library_steps = 0;
                     for (_, target, _) in hops {
-                        let name = tcx.crate_name(target.instance.def_id().krate);
-                        if matches!(name.as_str(), "core" | "alloc" | "std") && target != current {
-                            library_steps += 1;
-                        } else {
-                            if library_steps != 0 {
-                                chain.push(format!("{library_steps} library or drop steps"));
-                                library_steps = 0;
-                            }
-                            chain.push(tcx.def_path_str(target.instance.def_id()));
-                        }
+                        chain.push(format!("{} [context {}]", target.instance, target.context));
                     }
                     let message = if unknown {
                         "interrupt call path cannot be fully checked".to_string()
                     } else {
-                        "forbidden operation is reachable from interrupt context".to_string()
+                        "forbidden operation is possibly reachable from interrupt context"
+                            .to_string()
                     };
                     let mut diagnostic = tcx.dcx().struct_span_err(primary, message);
                     diagnostic.span_label(
@@ -270,6 +340,23 @@ impl Callbacks for Checker {
                         );
                     }
                     diagnostic.note(reason);
+                    if let Some(id) = site {
+                        let site = &analysis.sites[id];
+                        diagnostic.note(format!(
+                            "analysis site {id}: {} [context {}], {:?}, state {}, scope {:?}",
+                            site.caller.instance,
+                            site.caller.context,
+                            site.location,
+                            site.state,
+                            site.scope
+                        ));
+                        if std::env::var_os("IRQ_CHECK_EXPLAIN").is_some() {
+                            diagnostic.note(format!(
+                                "argument and storage state:\n{}",
+                                analysis.site_state(id)
+                            ));
+                        }
+                    }
                     diagnostic.note(format!(
                         "call path:\n{}",
                         chain
@@ -302,6 +389,35 @@ impl Callbacks for Checker {
 
 fn main() -> std::process::ExitCode {
     let mut args: Vec<String> = std::env::args().collect();
+    if args.get(1).is_some_and(|arg| arg == "--build-identity") {
+        print!(
+            "{}",
+            include_str!(concat!(env!("OUT_DIR"), "/driver-identity.txt"))
+        );
+        return std::process::ExitCode::SUCCESS;
+    }
+    if args
+        .get(1)
+        .is_some_and(|argument| argument == "--irq-check-arguments")
+    {
+        let arguments = args
+            .get(2)
+            .ok_or_else(|| "missing driver argument file".to_owned())
+            .and_then(|path| std::fs::read(path).map_err(|error| error.to_string()))
+            .and_then(|bytes| {
+                serde_json::from_slice::<Vec<String>>(&bytes).map_err(|error| error.to_string())
+            });
+        match arguments {
+            Ok(arguments) => {
+                args.truncate(1);
+                args.extend(arguments);
+            }
+            Err(error) => {
+                eprintln!("error: cannot read driver arguments: {error}");
+                return std::process::ExitCode::from(2);
+            }
+        }
+    }
     if args.get(1).is_some_and(|arg| arg == "--version") {
         println!(
             "irq-check {} {TOOLCHAIN} {COMMIT} {}",
@@ -319,9 +435,12 @@ fn main() -> std::process::ExitCode {
         .arg("-Vv")
         .output()
         .expect("cannot run rustc");
-    if !version.status.success() || !String::from_utf8_lossy(&version.stdout).contains(COMMIT) {
+    if !version.status.success()
+        || String::from_utf8_lossy(&version.stdout).trim()
+            != include_str!(concat!(env!("OUT_DIR"), "/compiler-identity.txt")).trim()
+    {
         eprintln!(
-            "error: irq-check requires {TOOLCHAIN} ({COMMIT})\nhelp: select that toolchain and rebuild dependencies"
+            "error: irq-check was built with {TOOLCHAIN} ({COMMIT})\nhelp: rebuild and install both checker binaries with the selected nightly"
         );
         std::process::exit(2);
     }
@@ -333,6 +452,17 @@ fn main() -> std::process::ExitCode {
         "--sysroot".into(),
         String::from_utf8(sysroot.stdout).unwrap().trim().into(),
     ]);
+    let workers = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    args.extend([
+        "-Zunstable-options".into(),
+        format!("--jobs={workers}"),
+        format!("--jobs-frontend={workers}"),
+    ]);
+    if std::env::var_os("IRQ_CHECK_STATS").is_some() {
+        eprintln!("irq-check: worker-limit={workers} hardware-parallelism");
+    }
     args.extend([
         "-Zalways-encode-mir".into(),
         "-Zmir-opt-level=0".into(),

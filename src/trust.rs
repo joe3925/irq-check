@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 pub struct Trust {
     pub checked: HashSet<CrateNum>,
-    pub scopes: HashMap<u64, HashMap<String, ScopeMarks>>,
+    pub scopes: HashMap<u64, HashMap<u64, ScopeMarks>>,
     pub contexts: Vec<DefId>,
     pub root: bool,
     pub invalid: bool,
@@ -173,7 +173,7 @@ impl Trust {
                         if attribute
                             .path_matches(&[Symbol::intern("irq"), Symbol::intern("context")])
                             && !matches!(tcx.hir_node(id), Node::Item(item)
-                            if matches!(item.kind, rustc_hir::ItemKind::Fn { .. } | rustc_hir::ItemKind::Trait(..)))
+                            if matches!(item.kind, rustc_hir::ItemKind::Fn { .. } | rustc_hir::ItemKind::Trait { .. }))
                             && !matches!(tcx.hir_node(id), Node::ImplItem(item)
                             if matches!(item.kind, rustc_hir::ImplItemKind::Fn(..)))
                             && !matches!(tcx.hir_node(id), Node::TraitItem(item)
@@ -183,6 +183,23 @@ impl Trust {
                             attribute.span(),
                             "irq::context is allowed only on functions, trait methods, and traits",
                         );
+                            invalid = true;
+                        }
+                        if attribute
+                            .path_matches(&[Symbol::intern("irq"), Symbol::intern("forbidden")])
+                            && !matches!(tcx.hir_node(id), Node::Item(item)
+                                if matches!(item.kind, rustc_hir::ItemKind::Fn { .. }))
+                            && !matches!(tcx.hir_node(id), Node::ImplItem(item)
+                                if matches!(item.kind, rustc_hir::ImplItemKind::Fn(..)))
+                            && !matches!(tcx.hir_node(id), Node::TraitItem(item)
+                                if matches!(item.kind, rustc_hir::TraitItemKind::Fn(..)))
+                            && !matches!(tcx.hir_node(id), Node::ForeignItem(item)
+                                if matches!(item.kind, rustc_hir::ForeignItemKind::Fn(..)))
+                        {
+                            tcx.dcx().span_err(
+                                attribute.span(),
+                                "irq::forbidden is allowed only on functions and trait methods",
+                            );
                             invalid = true;
                         }
                     }
@@ -238,7 +255,7 @@ impl Trust {
                 }
                 if !allowed.trusted.is_empty() || !allowed.unreachable.is_empty() {
                     local_scopes.insert(
-                        format!("{:?}", tcx.def_path_hash(owner.to_def_id())),
+                        tcx.def_path_hash(owner.to_def_id()).local_hash().as_u64(),
                         allowed,
                     );
                 }
@@ -287,10 +304,19 @@ impl Trust {
                 invalid,
             };
         }
-        let directories: Vec<PathBuf> = std::env::var("IRQ_CHECK_CACHE_DIRS")
+        let mut directories: Vec<PathBuf> = std::env::var("IRQ_CHECK_CACHE_DIRS")
             .ok()
             .and_then(|value| serde_json::from_str(&value).ok())
             .unwrap_or_default();
+        for crate_num in tcx.crates(()).iter().copied() {
+            for path in tcx.used_crate_source(crate_num).paths() {
+                if let Some(parent) = path.parent() {
+                    directories.push(parent.to_path_buf());
+                }
+            }
+        }
+        directories.sort();
+        directories.dedup();
         let mut contexts = Vec::new();
         let mut loaded = HashSet::new();
         for directory in directories {
@@ -375,7 +401,7 @@ impl Trust {
                 && !macros_only
                 && !sysroot
             {
-                tcx.dcx().err(format!("interrupt check metadata is missing for {}; rebuild this dependency with irq-check", tcx.crate_name(crate_num)));
+                tcx.dcx().err(format!("interrupt check metadata is missing for {}; rebuild this dependency with irq-check; crate identity {}; compiler sources: {:?}", tcx.crate_name(crate_num), tcx.stable_crate_id(crate_num).as_u64(), source.paths().collect::<Vec<_>>()));
                 invalid = true;
             }
         }
@@ -403,7 +429,9 @@ impl Trust {
         }
         self.scopes
             .get(&tcx.stable_crate_id(instance.def_id().krate).as_u64())
-            .and_then(|bodies| bodies.get(&format!("{:?}", tcx.def_path_hash(instance.def_id()))))
+            .and_then(|bodies| {
+                bodies.get(&tcx.def_path_hash(instance.def_id()).local_hash().as_u64())
+            })
             .is_some_and(|scopes| {
                 if unreachable {
                     &scopes.unreachable

@@ -1,0 +1,16 @@
+[
+  {
+    "label": "Attach to irq-check-driver",
+    "adapter": "CodeLLDB",
+    "request": "attach",
+    "targetCreateCommands": [
+      "script lldb.debugger.CreateTarget('')"
+    ],
+    "processCreateCommands": [
+      "process attach --name irq-check-driver.exe"
+    ],
+    "postRunCommands": [
+      "target symbols add --shlib irq-check-driver.exe \"$ZED_WORKTREE_ROOT/target/release/irq_check_driver.pdb\""
+    ]
+  }
+]

@@ -1,0 +1,14 @@
+[workspace]
+members = ["formatting", "mixed-dyn", "correlated-dyn", "erased-records", "pointer-alias"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(irq_check)'] }
+
+[profile.release]
+panic = "abort"

@@ -1,0 +1,68 @@
+irq-check
+Copyright (c) 2026 Boden
+
+irq-check is licensed under the GNU General Public License, version 3 only.
+See LICENSE for the full terms.
+
+src/pointer.rs contains an adapter for Rupta DiffPTData and an adapted ContextCache.
+Copyright (c) 2024 Wei Li.
+Source: https://github.com/rustanlys/rupta
+Revision: b19f187e9cbe37b5afb1103d88b663253e1f0a03
+Original file: src/pts_set/pt_data.rs
+Original file: src/mir/context.rs
+The upstream code is under GNU GPL version 3. See LICENSE.
+The storage adapter interns storage and fact identities. It uses the ported
+DiffPTData and HybridPointsToSet from vendor/rupta.
+The context cache interns shared keys for call contexts and diagnostic states.
+
+vendor/rupta contains the Rupta library source from the same revision.
+Copyright (c) 2024 Wei Li. GNU GPL version 3. See LICENSE.
+The port excludes the standalone launchers, compiler selection, memory monitor,
+and upstream tests. Compiler API changes are made for the selected nightly.
+The library port is in progress; production integration is not yet complete.
+Production uses the imported PAG builder, call graph, call-site contexts,
+delta propagator, and points-to sets for broad call discovery. The in-tree
+flow analysis supplies context and state refinement. It feeds resolved calls
+and typed callback and object-reference facts back to the backend. Shared
+storage identities use Rupta address constraints and bidirectional MIR path
+connections. These connections apply to new call contexts. The bridge merges
+discovery contexts; the flow solver keeps precise state and context bindings.
+The context-sensitive backend deduplicates complete argument and return
+bindings separately from call-graph edges. A new binding for an existing edge
+still adds its interprocedural constraints.
+The port keeps generated instance identities and uses
+the selected compiler for ABI checks. Legacy library shortcuts were replaced
+with MIR analysis and narrow compiler-identified intrinsic models. The cast
+constraint that can discard candidates is disabled by default. Raw-pointer
+aggregates have data-pointer flow; unresolved vtable pairing and provenance
+remain explicit coverage gaps. Full shared-memory integration remains open.
+
+vendor/rupta/src/mir/known_names.rs was copied from MIRAI by Rupta.
+Copyright (c) Facebook, Inc. and its affiliates.
+Source: https://github.com/facebookexperimental/MIRAI
+This file keeps its MIT license. The MIT terms below apply to this file too.
+
+Worker buffers use mimalloc through the mimalloc Rust wrapper and libmimalloc-sys.
+These dependencies keep their MIT licenses. They are not relicensed as GPL.
+Source: https://github.com/purpleprotocol/mimalloc_rust
+Source: https://github.com/microsoft/mimalloc
+Copyright 2019 Octavian Oncescu.
+Copyright (c) 2018-2025 Microsoft Corporation, Daan Leijen.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

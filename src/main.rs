@@ -23,32 +23,37 @@ fn main() -> ExitCode {
     }
     if args.first().is_some_and(|arg| arg == "--version") {
         println!(
-            "irq-check {} nightly-2026-04-07 bcded331651b60a0383b3ff51db4f24c4495ac53 {}",
+            "irq-check {} {} {} {} {}",
             env!("CARGO_PKG_VERSION"),
+            env!("IRQ_CHECK_BUILD_RELEASE"),
+            env!("IRQ_CHECK_BUILD_COMMIT"),
+            env!("IRQ_CHECK_BUILD_HOST"),
             policy::INTERFACE
         );
         return ExitCode::SUCCESS;
     }
     if args.first().is_some_and(|arg| arg == "--self-check") {
-        match Command::new("rustup")
-            .args(["which", "--toolchain", "nightly-2026-04-07", "rustc"])
-            .output()
-        {
-            Ok(output) if output.status.success() => {
-                args = vec![
-                    String::from_utf8_lossy(&output.stdout).trim().into(),
-                    "--version".into(),
-                ];
-            }
-            _ => {
-                eprintln!(
-                    "error: install nightly-2026-04-07 with rustc-dev, rust-src, and llvm-tools-preview"
-                );
-                return ExitCode::from(2);
-            }
-        }
+        args = vec![
+            env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()),
+            "--version".into(),
+        ];
     }
     let rustc = args.first().cloned().unwrap_or_else(|| "rustc".into());
+    let identity = match Command::new(&rustc).arg("-vV").output() {
+        Ok(output) if output.status.success() => output,
+        _ => {
+            eprintln!("error: cannot read the selected compiler identity");
+            return ExitCode::from(2);
+        }
+    };
+    let built = include_str!(concat!(env!("OUT_DIR"), "/compiler-identity.txt"));
+    if String::from_utf8_lossy(&identity.stdout).trim() != built.trim() {
+        eprintln!(
+            "error: the selected compiler does not match the irq-check build compiler\nbuilt with:\n{built}selected:\n{}\nhelp: rebuild and install both checker binaries with the selected nightly: cargo install --locked --force --path <checker-checkout> --bins",
+            String::from_utf8_lossy(&identity.stdout)
+        );
+        return ExitCode::from(2);
+    }
     let output = match Command::new(&rustc).args(["--print", "sysroot"]).output() {
         Ok(output) if output.status.success() => output,
         _ => {
@@ -64,12 +69,32 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let driver_identity = include_bytes!(concat!(env!("OUT_DIR"), "/driver-identity.txt"));
+    match std::fs::read(&executable) {
+        Ok(bytes)
+            if bytes
+                .windows(driver_identity.len())
+                .any(|identity| identity == driver_identity) => {}
+        Ok(_) => {
+            eprintln!(
+                "error: the driver file does not match the launcher build compiler; no driver was loaded\nhelp: install both binaries with the selected nightly: cargo install --locked --force --path <checker-checkout> --bins"
+            );
+            return ExitCode::from(2);
+        }
+        Err(error) => {
+            eprintln!("error: cannot read {}: {error}", executable.display());
+            return ExitCode::from(2);
+        }
+    }
     let mut paths = vec![sysroot.join("bin"), sysroot.join("lib")];
     if let Some(path) = env::var_os("PATH") {
         paths.extend(env::split_paths(&path));
     }
     let mut command = Command::new(executable);
     command.env("PATH", env::join_paths(paths).unwrap());
+    for variable in ["CARGO_MAKEFLAGS", "MAKEFLAGS", "MFLAGS"] {
+        command.env_remove(variable);
+    }
     for variable in ["LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"] {
         let mut paths = vec![sysroot.join("lib")];
         if let Some(path) = env::var_os(variable) {
@@ -78,8 +103,29 @@ fn main() -> ExitCode {
         command.env(variable, env::join_paths(paths).unwrap());
     }
     if self_check {
-        return match command.arg("--version").status() {
-            Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
+        return match command.arg("--version").output() {
+            Ok(output) if output.status.success() => {
+                let expected = format!(
+                    "irq-check {} {} {} {}",
+                    env!("CARGO_PKG_VERSION"),
+                    env!("IRQ_CHECK_BUILD_RELEASE"),
+                    env!("IRQ_CHECK_BUILD_COMMIT"),
+                    policy::INTERFACE
+                );
+                if String::from_utf8_lossy(&output.stdout).trim() != expected {
+                    eprintln!(
+                        "error: the launcher and driver identities do not match; install both binaries from the same build"
+                    );
+                    ExitCode::from(2)
+                } else {
+                    println!("{expected}");
+                    ExitCode::SUCCESS
+                }
+            }
+            Ok(output) => {
+                eprint!("{}", String::from_utf8_lossy(&output.stderr));
+                ExitCode::from(output.status.code().unwrap_or(1) as u8)
+            }
             Err(error) => {
                 eprintln!("error: cannot load the interrupt checker driver: {error}");
                 ExitCode::from(2)
@@ -237,7 +283,22 @@ fn main() -> ExitCode {
         "IRQ_CHECK_CACHE_DIRS",
         serde_json::to_string(&cache_directories).unwrap(),
     );
-    command.args(&analysis);
+    let argument_file = output_directory
+        .as_ref()
+        .map(|directory| directory.join(format!("irq-check-args-{}.json", std::process::id())));
+    if let Some(path) = &argument_file {
+        let arguments: Vec<_> = analysis
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        if let Err(error) = std::fs::write(path, serde_json::to_vec(&arguments).unwrap()) {
+            eprintln!("error: cannot write driver arguments: {error}");
+            return ExitCode::from(2);
+        }
+        command.arg("--irq-check-arguments").arg(path);
+    } else {
+        command.args(&analysis);
+    }
     match command.status() {
         Ok(status) if !status.success() || passthrough => {
             ExitCode::from(status.code().unwrap_or(1) as u8)

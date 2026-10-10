@@ -268,6 +268,8 @@ pub fn launch(args: &[OsString]) -> Result<ExitCode, String> {
         policy::hash((
             policy::INTERFACE,
             &policy,
+            std::env::var_os("IRQ_CHECK_REQUIRED_CRATE"),
+            std::env::var_os("IRQ_CHECK_ANALYSIS_ID"),
             std::fs::read(&executable).map_err(|error| error.to_string())?,
             std::fs::read(driver).map_err(|error| error.to_string())?
         ))

@@ -32,7 +32,7 @@ pub struct CrateData {
     pub checked: bool,
     pub metadata: PathBuf,
     pub metadata_hash: u64,
-    pub scopes: HashMap<String, ScopeMarks>,
+    pub scopes: HashMap<u64, ScopeMarks>,
     pub contexts: Vec<u32>,
 }
 

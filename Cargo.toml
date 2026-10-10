@@ -2,7 +2,7 @@
 name = "irq-check"
 version = "0.1.2"
 edition = "2024"
-license = "MIT"
+license = "GPL-3.0-only"
 description = "Check interrupt call paths in Rust MIR"
 
 [[bin]]
@@ -14,9 +14,16 @@ name = "irq-check-driver"
 path = "src/driver.rs"
 
 [dependencies]
+irq-check-rupta = { path = "vendor/rupta" }
+mimalloc = "0.1.52"
+allocator-api2 = "0.2"
+hashbrown = "0.17"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
 toml = "0.9"
 
 [profile.release]
-debug = false
+debug = "line-tables-only"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
