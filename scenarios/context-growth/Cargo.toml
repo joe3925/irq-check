@@ -1,0 +1,17 @@
+[package]
+name = "context-growth"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+context-growth-boundary = { path = "../context-growth-boundary" }
+
+[features]
+negative = []
+chain-8 = []
+chain-16 = ["chain-8"]
+chain-64 = ["chain-16"]
+
+[lints]
+workspace = true

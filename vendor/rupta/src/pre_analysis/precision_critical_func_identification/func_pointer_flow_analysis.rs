@@ -49,7 +49,7 @@ pub enum PFGEdgeEnum {
 #[derive(Clone, Debug)]
 pub struct FuncPFG {
     pub(crate) graph: Graph<DFGNode, PFGEdge>,
-    edges: HashSet<(NodeIndex<DefaultIx>, NodeIndex<DefaultIx>)>,
+    edges: HashSet<(NodeIndex<DefaultIx>, NodeIndex<DefaultIx>, PFGEdgeEnum)>,
     pub func_id: FuncId,
     // whether there is any argument-to-return flow (precision critical)
     pub has_arg_to_return_flow: bool, 
@@ -98,7 +98,7 @@ impl FuncPFG {
     pub fn add_edge(&mut self, src: Rc<Path>, dst: Rc<Path>, kind: PFGEdgeEnum) -> bool {
         let src_index = self.get_or_insert_node(src);
         let dst_index = self.get_or_insert_node(dst);
-        if self.edges.insert((src_index, dst_index)) {
+        if self.edges.insert((src_index, dst_index, kind.clone())) {
             self.graph.add_edge(src_index, dst_index, PFGEdge { kind: kind.clone() });
             return true;
         }
@@ -127,6 +127,7 @@ impl FuncPFG {
         // self.print_graph();
         self.has_arg_to_return_flow = false;
         self.cs_callsites.clear();
+        self.param_with_flow.clear();
        
         let param_nodes: Vec<NodeIndex> = self
             .graph
@@ -338,7 +339,8 @@ impl<'a, 'rta, 'tcx, 'compilation> FuncPointerFlowAnalysis<'a, 'rta, 'tcx, 'comp
 
     fn visit_assign(&mut self, lplace: &mir::Place<'tcx>, rvalue: &mir::Rvalue<'tcx>) {
         match rvalue {
-            mir::Rvalue::Use(operand, _) | mir::Rvalue::Repeat(operand, _) => {
+            mir::Rvalue::Use(operand, _) | mir::Rvalue::Repeat(operand, _)
+            | mir::Rvalue::WrapUnsafeBinder(operand, _) => {
                 self.visit_use(lplace, operand);
             }
             mir::Rvalue::Ref(_, _, place) | mir::Rvalue::RawPtr(_, place) => {
@@ -355,7 +357,7 @@ impl<'a, 'rta, 'tcx, 'compilation> FuncPointerFlowAnalysis<'a, 'rta, 'tcx, 'comp
             mir::Rvalue::BinaryOp(_, deref!((loperand, _roperand))) => {
                 self.visit_use(lplace, loperand);
             }
-            mir::Rvalue::CopyForDeref(place) => {
+            mir::Rvalue::CopyForDeref(place) | mir::Rvalue::Reborrow(_, _, place) => {
                 self.add_ref_pfg_edge(lplace, place);
             }
             _ => {
@@ -417,6 +419,9 @@ impl<'a, 'rta, 'tcx, 'compilation> FuncPointerFlowAnalysis<'a, 'rta, 'tcx, 'comp
                 call_source: _,
                 fn_span: _,
             } => self.visit_call(func, args, destination, location),
+            mir::TerminatorKind::TailCall { func, args, .. } => {
+                self.visit_call(func, args, &mir::Place::from(mir::RETURN_PLACE), location);
+            }
             mir::TerminatorKind::InlineAsm { 
                 template: _,
                 operands: _,

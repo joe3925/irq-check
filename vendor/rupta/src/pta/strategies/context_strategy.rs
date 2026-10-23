@@ -344,10 +344,7 @@ impl RCEUSCallSiteSensitive {
             // callsite_location ⇒ 𝑓 ∉ CTXFuncs — this callsite is the flow entry.
             callsite.into()
         } else {
-            // The first element of the caller context is always the flow-entry
-            // callsite from RCEUS; the unwrap is safe because any caller reaching
-            // here has a non-empty context.
-            caller_ctx_elem.first().unwrap().clone()
+            caller_ctx_elem.first().cloned().unwrap_or_else(|| callsite.into())
         };
 
         let mut new_callee_ctx_elem = vec![flow_entry];

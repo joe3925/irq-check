@@ -107,6 +107,9 @@ impl<'a, 'rta, 'tcx, 'compilation> BodyVisitor<'a, 'rta, 'tcx, 'compilation> {
 
     fn visit_assign(&mut self, _place: &mir::Place<'tcx>, rvalue: &mir::Rvalue<'tcx>) {
         match rvalue {
+            mir::Rvalue::ThreadLocalRef(def_id) => {
+                self.encountered_statics.insert(*def_id);
+            }
             mir::Rvalue::Cast(cast_kind, operand, ty) => {
                 let specialized_ty = self.substs_specializer.specialize_generic_argument_type(
                     *ty
@@ -186,6 +189,38 @@ impl<'a, 'rta, 'tcx, 'compilation> BodyVisitor<'a, 'rta, 'tcx, 'compilation> {
                 call_source: _,
                 fn_span: _,
             } => self.visit_call(func, args, destination, location),
+            mir::TerminatorKind::TailCall { func, args, .. } => {
+                self.visit_call(func, args, &mir::Place::from(mir::RETURN_PLACE), location);
+            }
+            mir::TerminatorKind::Assert { msg, .. } => {
+                let lang_item = match &**msg {
+                    mir::AssertKind::BoundsCheck { .. } => LangItem::PanicBoundsCheck,
+                    mir::AssertKind::MisalignedPointerDereference { .. } => {
+                        LangItem::PanicMisalignedPointerDereference
+                    }
+                    mir::AssertKind::NullPointerDereference => LangItem::PanicNullPointerDereference,
+                    mir::AssertKind::NullReferenceConstructed => LangItem::PanicNullReferenceConstructed,
+                    mir::AssertKind::InvalidEnumConstruction(_) => LangItem::PanicInvalidEnumConstruction,
+                    other => other.panic_function(),
+                };
+                if let Some(def) = self.tcx().lang_items().get(lang_item) {
+                    let target = rustc_middle::ty::Instance::mono(self.tcx(), def);
+                    let callee = self.acx().get_instance_id(target);
+                    let callsite = BaseCallSite::new(self.func_id, location);
+                    self.rta.add_static_callsite(callsite);
+                    self.rta.add_call_edge(callsite, callee);
+                }
+            }
+            mir::TerminatorKind::Drop { place, .. } => {
+                let dropped_ty = self.substs_specializer.specialize_generic_argument_type(
+                    place.ty(self.mir, self.tcx()).ty,
+                );
+                let target = rustc_middle::ty::Instance::resolve_drop_glue(self.tcx(), dropped_ty);
+                let callee = self.acx().get_instance_id(target);
+                let callsite = BaseCallSite::new(self.func_id, location);
+                self.rta.add_static_callsite(callsite);
+                self.rta.add_call_edge(callsite, callee);
+            }
             mir::TerminatorKind::InlineAsm { 
                 template: _,
                 operands: _,
@@ -357,7 +392,7 @@ let callee_substs = &self.tcx().instantiate_bound_regions_with_erased(*callee_su
             }
 
             // Visit the implementation if its mir is available
-            let has_mir = self.tcx().is_mir_available(resolved_def_id);
+            let has_mir = crate::util::type_util::has_instance_mir(self.tcx(), instance.def);
             if !has_mir {
                 // ops::function::Fn*::call* for FnDef, FnPtr, Dynamic... types are unavailable
                 // Try to inline the indirect call for these types

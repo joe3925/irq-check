@@ -1,0 +1,29 @@
+[package]
+name = "contract-checks"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+external = { package = "contract-dependency", path = "../contract-dependency" }
+
+[features]
+unmarked = []
+trusted = []
+trusted-condition = []
+direct-condition = []
+direct-condition-forbidden = []
+local-asm = []
+repeated = []
+effects = []
+returned = []
+uncertain = []
+forbidden = []
+early-forbidden = []
+escape = []
+invalid-block = []
+invalid-function = []
+invalid-argument = []
+
+[lints]
+workspace = true

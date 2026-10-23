@@ -57,7 +57,6 @@ impl CSPath {
 /// Different kinds of `Path` used in our analysis.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum PathEnum {
-    SharedStorage(usize),
     /// Locals [arg_count+1..] are the local variables and compiler temporaries.
     LocalVariable {
         func_id: FuncId,
@@ -129,7 +128,6 @@ pub enum PathEnum {
 impl Debug for PathEnum {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         match self {
-            PathEnum::SharedStorage(id) => write!(f, "shared_storage_{id}"),
             PathEnum::LocalVariable { func_id, ordinal } => {
                 f.write_fmt(format_args!("{:?}::local_{}", func_id, ordinal))
             }
@@ -635,7 +633,6 @@ impl PAGPath for Rc<Path> {
             PathEnum::QualifiedPath { base, .. } 
             | PathEnum::OffsetPath { base, .. } => base.get_containing_func(),
             PathEnum::Constant
-            | PathEnum::SharedStorage(_)
             | PathEnum::StaticVariable { .. } 
             | PathEnum::PromotedConstant { .. } 
             | PathEnum::Function(..) 

@@ -11,7 +11,7 @@ use std::time::Duration;
 use itertools::Itertools;
 use rustc_middle::ty::TyCtxt;
 use super::*;
-use super::strategies::context_strategy::{ContextStrategy, KObjectSensitive};
+use super::strategies::context_strategy::{ContextStrategy, KObjectSensitive, RCEUSCallSiteSensitive};
 use super::strategies::stack_filtering::StackFilter;
 use super::propagator::propagator::Propagator;
 use super::PointerAnalysis;
@@ -29,6 +29,8 @@ use crate::util::{self, chunked_queue, results_dumper};
 
 pub type CallSiteSensitivePTA<'tcx, 'compilation> =
     ContextSensitivePTA<'tcx, 'compilation, KCallSiteSensitive>;
+pub type RceusPTA<'tcx, 'compilation> =
+    ContextSensitivePTA<'tcx, 'compilation, RCEUSCallSiteSensitive>;
 /// The object-sensitive pointer analysis for Rust has not been throughly evaluated so far.
 pub type ObjectSensitivePTA<'tcx, 'compilation> =
     ContextSensitivePTA<'tcx, 'compilation, KObjectSensitive>;
@@ -36,14 +38,12 @@ pub type ObjectSensitivePTA<'tcx, 'compilation> =
 pub struct ContextSensitivePTA<'tcx, 'compilation, S: ContextStrategy> {
     pub call_sites: HashMap<BaseCallSite, HashSet<Rc<CSCallSite>>>,
     pub call_bindings: HashSet<(Rc<CSCallSite>, CSFuncId)>,
-    pub refined_targets: HashMap<BaseCallSite, HashSet<FuncId>>,
-    pub refined_storage_views: HashMap<Option<FuncId>, HashSet<(Rc<Path>, Rc<Path>)>>,
     /// The analysis context
     pub acx: AnalysisContext<'tcx, 'compilation>,
     /// Points-to data
     pub(crate) pt_data: DiffPTDataTy,
     /// Pointer Assignment Graph
-    pub(crate) pag: PAG<Rc<CSPath>>,
+    pub pag: PAG<Rc<CSPath>>,
     /// Call graph
     pub call_graph: CSCallGraph,
 
@@ -61,7 +61,7 @@ pub struct ContextSensitivePTA<'tcx, 'compilation, S: ContextStrategy> {
     // as initial constraints in propagator
     pub(crate) inter_proc_edges_queue: chunked_queue::ChunkedQueue<EdgeId>,
 
-    assoc_calls: AssocCallGroup<NodeId, CSFuncId, Rc<CSPath>>,
+    pub assoc_calls: AssocCallGroup<NodeId, CSFuncId, Rc<CSPath>>,
 
     ctx_strategy: S,
 
@@ -88,8 +88,6 @@ impl<'tcx, 'compilation, S: ContextStrategy> ContextSensitivePTA<'tcx, 'compilat
         ContextSensitivePTA {
             call_sites: HashMap::new(),
             call_bindings: HashSet::new(),
-            refined_targets: HashMap::new(),
-            refined_storage_views: HashMap::new(),
             acx,
             pt_data: DiffPTDataTy::new(),
             pag,
@@ -128,6 +126,7 @@ impl<'tcx, 'compilation, S: ContextStrategy> ContextSensitivePTA<'tcx, 'compilat
     /// Process statements in reachable functions.
     fn process_reach_funcs(&mut self) {
         while let Some(func) = self.rf_iter.next() {
+            if !crate::limits::checkpoint() { return; }
             if !self.processed_funcs.contains(&func) {
                 let func_ref = self.acx.get_function_reference(func.func_id);
                 info!(
@@ -138,21 +137,7 @@ impl<'tcx, 'compilation, S: ContextStrategy> ContextSensitivePTA<'tcx, 'compilat
                 );
                 if self.pag.build_func_pag(&mut self.acx, func.func_id) {
                     self.add_fpag_edges(func);
-                    let views: Vec<_> = self.refined_storage_views.get(&Some(func.func_id))
-                        .into_iter().flatten().cloned().collect();
-                    for (path, object) in views {
-                        self.add_refined_storage_view(&path, func.cid, &object);
-                    }
                     self.process_calls_in_fpag(func);
-                    let calls: Vec<_> = self.refined_targets.iter()
-                        .filter(|(site, _)| site.func == func.func_id)
-                        .flat_map(|(site, targets)| self.call_sites.get(site).into_iter().flatten()
-                            .filter(|call| call.func == func)
-                            .flat_map(|call| targets.iter().map(move |target| (call.clone(), *target))))
-                        .collect();
-                    for (call, target) in calls {
-                        self.process_new_call(&call, &target);
-                    }
                 } else {
                     self.processed_funcs.insert(func);
                 }
@@ -170,6 +155,7 @@ impl<'tcx, 'compilation, S: ContextStrategy> ContextSensitivePTA<'tcx, 'compilat
         let fpag = unsafe { &*(self.pag.func_pags.get(&func.func_id).unwrap() as *const FuncPAG) };
         let edges_iter = fpag.internal_edges_iter();
         for (src, dst, kind) in edges_iter {
+            if !crate::limits::checkpoint() { return; }
             let cs_src = self.mk_cs_path(src, func.cid);
             let cs_dst = self.mk_cs_path(dst, func.cid);
             if let Some(edge_id) = self.pag.add_edge(&cs_src, &cs_dst, kind.clone()) {
@@ -305,27 +291,6 @@ impl<'tcx, 'compilation, S: ContextStrategy> ContextSensitivePTA<'tcx, 'compilat
         self.ctx_strategy.new_static_call_context(callsite, *callee)
     }
 
-    // Add new call edges to pag
-    pub fn add_refined_address(&mut self, source: &Rc<Path>, destination: &Rc<Path>) -> bool {
-        let context = self.get_empty_context_id();
-        let source = CSPath::new_cs_path(context, source.clone());
-        let destination = CSPath::new_cs_path(context, destination.clone());
-        self.pag.add_addr_edge(&source, &destination).is_some()
-    }
-
-    pub fn add_refined_storage_view(&mut self, path: &Rc<Path>, context: ContextId, object: &Rc<Path>) {
-        let local = CSPath::new_cs_path(context, path.clone());
-        let shared = CSPath::new_cs_path(self.get_empty_context_id(), object.clone());
-        for (source, destination) in [(&local, &shared), (&shared, &local)] {
-            if let Some(edge) = self.pag.add_direct_edge(source, destination) {
-                self.inter_proc_edges_queue.push(edge);
-                if let Some(owner) = local.get_containing_func() {
-                    self.add_page_edge_func(edge, owner);
-                }
-            }
-        }
-    }
-
     pub fn process_new_calls(&mut self, new_calls: &Vec<(Rc<CSCallSite>, FuncId)>) {
         for (callsite, callee_id) in new_calls {
             self.process_new_call(callsite, callee_id);
@@ -377,7 +342,6 @@ impl<'tcx, 'compilation, S: ContextStrategy> ContextSensitivePTA<'tcx, 'compilat
                 CSPath::new_cs_path(cid, path.clone())
             }
             PathEnum::Constant
-            | PathEnum::SharedStorage(_)
             | PathEnum::StaticVariable { .. }
             | PathEnum::PromotedConstant { .. }
             | PathEnum::Function(..)
@@ -429,6 +393,8 @@ impl<'tcx, 'compilation, S: ContextStrategy> PointerAnalysis<'tcx, 'compilation>
     for ContextSensitivePTA<'tcx, 'compilation, S>
 {
     fn pre_analysis(&mut self) {
+        crate::limits::begin_analysis();
+        if !crate::limits::checkpoint() { return; }
         let stack_filtering = self.acx.analysis_options.stack_filtering;
         let rceus = self.acx.analysis_options.rceus;
         if !stack_filtering && !rceus {
@@ -465,6 +431,7 @@ impl<'tcx, 'compilation, S: ContextStrategy> PointerAnalysis<'tcx, 'compilation>
 
     /// Initialize the analysis.
     fn initialize(&mut self) {
+        if !crate::limits::checkpoint() { return; }
         // add the entry point to the call graph
         let empty_context_id = self.get_empty_context_id();
         for root in self.acx.discovery_roots.clone() {
@@ -481,6 +448,7 @@ impl<'tcx, 'compilation, S: ContextStrategy> PointerAnalysis<'tcx, 'compilation>
     fn propagate(&mut self) {
         // Solve until no new call relationship is found.
         loop {
+            if !crate::limits::checkpoint() { return; }
             let mut new_calls: Vec<(Rc<CSCallSite>, FuncId)> = Vec::new();
             let mut new_call_instances: Vec<(Rc<CSCallSite>, Rc<CSPath>, FuncId)> = Vec::new();
             let mut propagator = Propagator::new(

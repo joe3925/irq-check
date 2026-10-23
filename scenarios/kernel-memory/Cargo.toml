@@ -1,0 +1,17 @@
+[package]
+name = "kernel-memory"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+context-growth-boundary = { path = "../context-growth-boundary" }
+
+[features]
+default = ["escape", "formatting", "dispatch"]
+escape = []
+formatting = []
+dispatch = []
+
+[lints]
+workspace = true

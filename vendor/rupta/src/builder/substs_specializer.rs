@@ -49,10 +49,12 @@ impl<'tcx> SubstsSpecializer<'tcx> {
 
     pub fn specialize_generic_argument_type(&self, ty: Ty<'tcx>) -> Ty<'tcx> {
         let value = EarlyBinder::bind(self.tcx, ty).instantiate(self.tcx, self.generic_args);
-        if value.skip_norm_wip().has_non_region_param() || value.skip_norm_wip().has_escaping_bound_vars() {
+        let mut value = if value.skip_norm_wip().has_non_region_param() || value.skip_norm_wip().has_escaping_bound_vars() {
             self.tcx.erase_and_anonymize_regions(value.skip_norm_wip())
         } else {
             self.tcx.normalize_erasing_regions(TypingEnv::fully_monomorphized(), value)
-        }
+        };
+        while let rustc_middle::ty::Pat(base, _) = *value.kind() { value = base; }
+        value
     }
 }

@@ -3,7 +3,6 @@ use std::io::{BufWriter, Write};
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, Duration};
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 use rustc_hir::def::DefKind;
 
@@ -167,7 +166,7 @@ impl FunctionReachabilityAnalysis {
         let relation_matrix = Arc::new(Mutex::new(vec![T::new_empty(); node_count]));
         
         let graph = &call_graph.graph;
-        (0..node_count).into_par_iter().for_each(|node_index| {
+        (0..node_count).for_each(|node_index| {
             let mut reachable_funcs = T::with_capacity(node_count);
             let mut worklist = VecDeque::new();
             for neighbor in graph.neighbors(NodeId::new(node_index)) {

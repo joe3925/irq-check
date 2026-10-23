@@ -3,12 +3,13 @@ use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::PathBuf;
 
-pub const INTERFACE: &str = "strict-blocks-2";
+pub const INTERFACE: &str = "strict-blocks-4";
 
 #[derive(Clone, Default, Deserialize, Serialize)]
 pub struct ScopeMarks {
     pub trusted: Vec<usize>,
     pub unreachable: Vec<usize>,
+    pub allow_incomplete: Vec<usize>,
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]

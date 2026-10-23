@@ -396,7 +396,6 @@ fn path_func_id(value: &PathEnum) -> Option<FuncId> {
         | PathEnum::Auxiliary { func_id, .. } 
         | PathEnum::HeapObj { func_id, .. } => Some(*func_id),
         PathEnum::Constant
-        | PathEnum::SharedStorage(_)
         | PathEnum::StaticVariable { .. } 
         | PathEnum::PromotedConstant { .. } => {
             None

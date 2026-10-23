@@ -36,14 +36,34 @@ impl<'r, 'a, 'tcx, 'compilation> PrecCritFnIdent<'r, 'a, 'tcx, 'compilation> {
 
         let funcs: Vec<FuncId> = self.rta.call_graph.func_nodes.keys().copied().collect();
         for func_id in funcs {
+            if !crate::limits::checkpoint() { return; }
             if self.rta.specially_handled_functions.contains(&func_id) {
                 continue;
             }
-            let def_id = self.rta.acx.get_function_reference(func_id).def_id;
-            if !self.rta.acx.tcx.is_mir_available(def_id) {
+            let reference = self.rta.acx.get_function_reference(func_id);
+            let def_id = reference.def_id;
+            if matches!(reference.kind, rustc_middle::ty::InstanceKind::Intrinsic(_)) {
+                let specializer = crate::builder::substs_specializer::SubstsSpecializer::new(
+                    self.rta.acx.tcx, reference.generic_args.clone());
+                let signature = self.rta.acx.tcx.fn_sig(def_id)
+                    .instantiate(self.rta.acx.tcx, specializer.generic_args).skip_binder();
+                let has_pointer = |ty: rustc_middle::ty::Ty<'tcx>| ty.is_any_ptr()
+                    || !crate::util::type_util::get_pointer_projections(self.rta.acx.tcx, ty).is_empty();
+                if has_pointer(signature.output()) && signature.inputs().iter().copied().any(has_pointer) {
+                    if let Some(&node_id) = self.rta.call_graph.func_nodes.get(&func_id) {
+                        self.worklist.push_front(node_id);
+                    }
+                }
+            }
+            if self.rta.acx.tcx.is_foreign_item(def_id)
+                || !crate::util::type_util::has_instance_mir(self.rta.acx.tcx, reference.kind)
+            {
                 continue;
             }
-            let mir = self.rta.acx.tcx.optimized_mir(def_id);
+            let mir = match reference.promoted {
+                Some(promoted) => &self.rta.acx.tcx.promoted_mir(def_id)[promoted],
+                None => self.rta.acx.tcx.instance_mir(reference.kind),
+            };
             let pfg = FuncPointerFlowAnalysis::new(self.rta, func_id, mir).calculate_intra_pointer_flow();
             if pfg.has_arg_to_return_flow {
                 if let Some(&node_id) = self.rta.call_graph.func_nodes.get(&func_id) {
@@ -92,6 +112,7 @@ impl<'r, 'a, 'tcx, 'compilation> PrecCritFnIdent<'r, 'a, 'tcx, 'compilation> {
         let mut visited = HashSet::new();
 
         while let Some(node_id) = worklist.pop_front() {
+            if !crate::limits::checkpoint() { return; }
             let node = match call_graph.graph.node_weight(node_id) {
                 Some(n) => n,
                 None => continue,

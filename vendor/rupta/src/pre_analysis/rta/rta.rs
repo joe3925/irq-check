@@ -92,6 +92,7 @@ impl<'a, 'tcx, 'compilation> RapidTypeAnalysis<'a, 'tcx, 'compilation> {
 
     fn iteratively_process_reachable_functions(&mut self) {
         while self.process_reachable_functions() {
+            if !crate::limits::checkpoint() { return; }
             self.solve_trait_upcasting();
             self.solve_dyn_callsites();
             self.solve_dyn_fntrait_callsites();
@@ -103,6 +104,7 @@ impl<'a, 'tcx, 'compilation> RapidTypeAnalysis<'a, 'tcx, 'compilation> {
     fn process_reachable_functions(&mut self) -> bool {
         let mut has_new_functions = false;
         while let Some(func_id) = self.rf_iter.next() {
+            if !crate::limits::checkpoint() { return false; }
             has_new_functions = true;
             if !self.visited_functions.contains(&func_id) {
                 let func_ref = self.acx.get_function_reference(func_id);
@@ -113,14 +115,22 @@ impl<'a, 'tcx, 'compilation> RapidTypeAnalysis<'a, 'tcx, 'compilation> {
                     continue;
                 }
 
-                if !self.tcx().is_mir_available(def_id) {
+                if self.tcx().is_foreign_item(def_id)
+                    || matches!(func_ref.kind, rustc_middle::ty::InstanceKind::Intrinsic(_)
+                        | rustc_middle::ty::InstanceKind::LlvmIntrinsic(_)
+                        | rustc_middle::ty::InstanceKind::Virtual(..))
+                    || !crate::util::type_util::has_instance_mir(self.tcx(), func_ref.kind)
+                {
                     warn!("Unavailable mir for def_id: {:?}", def_id);
                     self.visited_functions.insert(func_id);
                     continue;
                 }
                 
-                self.promote_constants(def_id, generic_args);
-                let mir = self.tcx().optimized_mir(def_id);
+                if matches!(func_ref.kind, rustc_middle::ty::InstanceKind::Item(_))
+                    && !self.tcx().is_constructor(def_id) {
+                    self.promote_constants(def_id, generic_args);
+                }
+                let mir = self.tcx().instance_mir(func_ref.kind);
 
                 let mut bv = BodyVisitor::new(self, func_id, mir);
                 bv.visit_body();
@@ -136,6 +146,7 @@ impl<'a, 'tcx, 'compilation> RapidTypeAnalysis<'a, 'tcx, 'compilation> {
         // However, considering that trait upcasting is rarely used in programs, it will not cause efficiency problems.
         let mut changed = true;
         while changed {
+            if !crate::limits::checkpoint() { return; }
             changed = false;
             for (src_dyn_ty, tgt_dyn_ty_set) in &self.trait_upcasting_relations {
                 if let Some(src_concrete_types) = self.dynamic_to_possible_concrete_types.get_mut(src_dyn_ty) {

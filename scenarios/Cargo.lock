@@ -3,6 +3,43 @@
 version = 4
 
 [[package]]
+name = "batch-frontier"
+version = "0.1.0"
+
+[[package]]
+name = "context-growth"
+version = "0.1.0"
+dependencies = [
+ "context-growth-boundary",
+]
+
+[[package]]
+name = "context-growth-boundary"
+version = "0.1.0"
+
+[[package]]
+name = "context-retirement"
+version = "0.1.0"
+
+[[package]]
+name = "contract-checks"
+version = "0.1.0"
+dependencies = [
+ "contract-dependency",
+]
+
+[[package]]
+name = "contract-dependency"
+version = "0.1.0"
+dependencies = [
+ "contract-leaf",
+]
+
+[[package]]
+name = "contract-leaf"
+version = "0.1.0"
+
+[[package]]
 name = "correlated-dyn"
 version = "0.1.0"
 
@@ -15,9 +52,58 @@ name = "formatting"
 version = "0.1.0"
 
 [[package]]
+name = "heap-context"
+version = "0.1.0"
+
+[[package]]
+name = "heap-read-chain"
+version = "0.1.0"
+
+[[package]]
+name = "kernel-memory"
+version = "0.1.0"
+dependencies = [
+ "context-growth-boundary",
+]
+
+[[package]]
+name = "leaf-reads"
+version = "0.1.0"
+
+[[package]]
+name = "memory-growth"
+version = "0.1.0"
+dependencies = [
+ "context-growth-boundary",
+]
+
+[[package]]
+name = "memory-growth-roots"
+version = "0.1.0"
+dependencies = [
+ "context-growth-boundary",
+]
+
+[[package]]
 name = "mixed-dyn"
 version = "0.1.0"
 
 [[package]]
 name = "pointer-alias"
+version = "0.1.0"
+
+[[package]]
+name = "read-chain"
+version = "0.1.0"
+
+[[package]]
+name = "recursive-bindings"
+version = "0.1.0"
+
+[[package]]
+name = "return-widening"
+version = "0.1.0"
+
+[[package]]
+name = "writer-growth"
 version = "0.1.0"

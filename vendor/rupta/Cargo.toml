@@ -11,5 +11,7 @@ petgraph = "0.6"
 itertools = "0.12"
 log = "0.4"
 lazy_static = "1"
-rayon = "1"
 humantime = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_ProcessStatus", "Win32_System_Threading"] }

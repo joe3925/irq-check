@@ -593,7 +593,7 @@ impl<P: PAGPath> PAG<P> {
             return false;
         }
         if matches!(reference.kind, rustc_middle::ty::InstanceKind::Item(_))
-            && !acx.tcx.is_mir_available(def_id)
+            && !crate::util::type_util::has_instance_mir(acx.tcx, reference.kind)
         {
             acx.coverage_gaps
                 .insert((func_id, None, "MIR body is unavailable".into()));
@@ -603,7 +603,7 @@ impl<P: PAGPath> PAG<P> {
 
         let gen_args = &acx.get_function_reference(func_id).generic_args;
         // Build function pags for promoted functions
-        if matches!(reference.kind, rustc_middle::ty::InstanceKind::Item(_)) {
+        if matches!(reference.kind, rustc_middle::ty::InstanceKind::Item(_)) && !acx.tcx.is_constructor(def_id) {
             if let Some(promoted_funcs) = self.promote_constants(acx, def_id, gen_args) {
                 self.promoted_funcs_map.insert(func_id, promoted_funcs);
             }
@@ -708,17 +708,67 @@ where
         // add arg --> param edges.
         for (i, arg) in callsite.args.iter().enumerate() {
             // The source path can be a constant, we did not cache the type information for constants.
-            let arg_type = arg.try_eval_path_type(acx);
             let param = PAGPath::new_parameter(callee, i + 1);
-            added_edges.extend(self.add_new_direct_edges(acx, arg, &param, arg_type));
+            added_edges.extend(self.add_call_value_edges(acx, arg, &param, callsite));
         }
 
         // add ret --> dst edge
         let ret = PAGPath::new_return_value(callee);
-        let ret_type = callsite.destination.try_eval_path_type(acx);
-        let new_edges = self.add_new_direct_edges(acx, &ret, &callsite.destination, ret_type);
+        let new_edges = self.add_call_value_edges(acx, &ret, &callsite.destination, callsite);
         added_edges.extend(new_edges);
 
         added_edges
+    }
+
+    fn add_call_value_edges<'tcx>(
+        &mut self,
+        acx: &mut AnalysisContext<'tcx, '_>,
+        source: &P,
+        destination: &P,
+        callsite: &CallSiteS<P::FuncTy, P>,
+    ) -> Vec<PAGEdgeId> {
+        let source_ty = source.try_eval_path_type(acx);
+        let destination_ty = destination.try_eval_path_type(acx);
+        if crate::util::type_util::equal_types(acx.tcx, source_ty, destination_ty) {
+            return self.add_new_direct_edges(acx, source, destination, source_ty);
+        }
+        let source_fields = source.clone().flatten_fields(acx);
+        let destination_fields = destination.clone().flatten_fields(acx);
+        let mut added = Vec::new();
+        for (offset, target, target_ty) in destination_fields {
+            if !target_ty.is_any_ptr() {
+                if !acx.get_pointer_projections(target_ty).is_empty() {
+                    acx.coverage_gaps.insert((callsite.func.into(), Some(callsite.location),
+                        "call value has an unmatched aggregate pointer field".into()));
+                    acx.unmodeled_paths.insert(std::rc::Rc::new(crate::mir::path::Path {
+                        value: target.value().clone(),
+                    }));
+                }
+                continue;
+            }
+            let mut matched = false;
+            for (source_offset, origin, origin_ty) in &source_fields {
+                if *source_offset != offset || !origin_ty.is_any_ptr() {
+                    continue;
+                }
+                matched = true;
+                origin.set_path_rustc_type(acx, *origin_ty);
+                target.set_path_rustc_type(acx, target_ty);
+                let edge = if crate::util::type_util::equivalent_ptr_types(acx.tcx, *origin_ty, target_ty) {
+                    self.add_direct_edge(origin, &target)
+                } else {
+                    self.add_cast_edge(origin, &target)
+                };
+                added.extend(edge);
+            }
+            if !matched && !source_ty.is_never() {
+                acx.coverage_gaps.insert((callsite.func.into(), Some(callsite.location),
+                    "call value has an unmatched pointer field".into()));
+                acx.unmodeled_paths.insert(std::rc::Rc::new(crate::mir::path::Path {
+                    value: target.value().clone(),
+                }));
+            }
+        }
+        added
     }
 }

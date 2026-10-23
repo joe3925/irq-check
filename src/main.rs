@@ -1,5 +1,6 @@
 mod cargo;
 mod policy;
+mod limits;
 
 use std::env;
 use std::path::PathBuf;

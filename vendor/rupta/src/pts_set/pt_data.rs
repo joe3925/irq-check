@@ -8,7 +8,7 @@ use std::fmt;
 use std::hash::Hash;
 use std::marker::PhantomData;
 
-use super::points_to::PointsToSet;
+use super::points_to::{HybridPointsToSet, PointsToSet};
 use crate::util::bit_vec::Idx;
 
 /// Basic points-to data structure.
@@ -78,13 +78,13 @@ where
     /// Adds element to the points-to set associated with var.
     pub fn add_pts(&mut self, var: K, elem: D) -> bool {
         self.rev_pts_map.entry(elem).or_default().insert(var);
-        self.pts_map.entry(var).or_insert(DS::new()).insert(elem)
+        self.pts_map.entry(var).or_insert_with(DS::new).insert(elem)
     }
 
     /// Performs pts(dst_var) = pts(dst_var) U pts(src_var).
     pub fn union_pts(&mut self, dst_var: K, src_var: K) -> bool {
         if self.get_pts(src_var).is_some() {
-            let dst_ds = unsafe { &mut *(self.pts_map.entry(dst_var).or_insert(DS::new()) as *mut DS) };
+            let dst_ds = unsafe { &mut *(self.pts_map.entry(dst_var).or_insert_with(DS::new) as *mut DS) };
             let src_ds = unsafe { &*(self.pts_map.get(&src_var).unwrap() as *const DS) };
             self.add_rev_pts(src_ds, dst_var);
             dst_ds.union(src_ds)
@@ -96,7 +96,7 @@ where
     /// Performs pts(dst_var) = pts(dst_var) U src_dataset.
     pub fn union_pts_to(&mut self, dst_var: K, src_ds: &DS) -> bool {
         self.add_rev_pts(src_ds, dst_var);
-        let dst_ds = self.pts_map.entry(dst_var).or_insert(DS::new());
+        let dst_ds = self.pts_map.entry(dst_var).or_insert_with(DS::new);
         dst_ds.union(src_ds)
     }
 
@@ -152,6 +152,13 @@ pub struct DiffPTData<K, D, DS> {
     marker: PhantomData<D>,
 }
 
+impl<K, D> DiffPTData<K, D, HybridPointsToSet<D>> {
+    pub fn storage_bytes(&self) -> usize {
+        self.diff_pts_map.values().map(HybridPointsToSet::storage_bytes).sum::<usize>()
+            + self.propa_pts_map.values().map(HybridPointsToSet::storage_bytes).sum::<usize>()
+    }
+}
+
 impl<K, D, DS> fmt::Debug for DiffPTData<K, D, DS> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         "DiffPTData".fmt(f)
@@ -188,7 +195,7 @@ where
                 return false;
             }
         }
-        let diff = self.diff_pts_map.entry(var).or_insert(DS::new());
+        let diff = self.diff_pts_map.entry(var).or_insert_with(DS::new);
         diff.insert(elem)
     }
 
@@ -226,8 +233,8 @@ where
     /// Performs diff_pts(dst_var) = diff_pts(dst_var) U (src_ds - propa_pts(dst_var)).
     #[inline]
     pub fn union_pts_to(&mut self, dst_var: K, src_ds: &DS) -> bool {
-        let diff = self.diff_pts_map.entry(dst_var).or_insert(DS::new());
-        let propa = self.propa_pts_map.entry(dst_var).or_insert(DS::new());
+        let diff = self.diff_pts_map.entry(dst_var).or_insert_with(DS::new);
+        let propa = self.propa_pts_map.entry(dst_var).or_insert_with(DS::new);
         let mut new = src_ds.clone();
         new.subtract(propa);
         diff.union(&new)
@@ -236,8 +243,8 @@ where
     /// Removes element from the points-to set of var.
     #[inline]
     pub fn remove_pts_elem(&mut self, var: K, elem: D) -> bool {
-        let diff = self.diff_pts_map.entry(var).or_insert(DS::new());
-        let propa = self.propa_pts_map.entry(var).or_insert(DS::new());
+        let diff = self.diff_pts_map.entry(var).or_insert_with(DS::new);
+        let propa = self.propa_pts_map.entry(var).or_insert_with(DS::new);
         diff.remove(elem) | propa.remove(elem)
     }
 
@@ -272,7 +279,7 @@ where
         }
 
         let diff = self.diff_pts_map.get_mut(&var).unwrap();
-        let propa = self.propa_pts_map.entry(var).or_insert(DS::new());
+        let propa = self.propa_pts_map.entry(var).or_insert_with(DS::new);
         propa.union(diff);
         diff.clear();
     }

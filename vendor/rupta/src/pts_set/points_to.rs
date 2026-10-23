@@ -36,6 +36,15 @@ pub struct HybridPointsToSet<T> {
     points_to: HybridSet<T>,
 }
 
+impl<T> HybridPointsToSet<T> {
+    pub fn storage_bytes(&self) -> usize {
+        match &self.points_to {
+            HybridSet::SmallSet(values) => values.capacity() * std::mem::size_of::<T>(),
+            HybridSet::LargeSet(values) => values.words.capacity() * std::mem::size_of::<u64>(),
+        }
+    }
+}
+
 impl<T: Idx> fmt::Debug for HybridPointsToSet<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.points_to.fmt(f)
@@ -127,7 +136,7 @@ impl<T: Idx> fmt::Debug for HybridSet<T> {
 
 impl<T: Idx> HybridSet<T> {
     pub fn new() -> Self {
-        HybridSet::SmallSet(Vec::with_capacity(SMALL_SET_CAPACITY))
+        HybridSet::SmallSet(Vec::new())
     }
 
     /// Clear all elements.
@@ -135,7 +144,7 @@ impl<T: Idx> HybridSet<T> {
         match self {
             HybridSet::SmallSet(small) => small.clear(),
             HybridSet::LargeSet(_) => {
-                *self = HybridSet::SmallSet(Vec::with_capacity(SMALL_SET_CAPACITY));
+                *self = HybridSet::SmallSet(Vec::new());
             }
         }
     }

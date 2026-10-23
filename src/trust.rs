@@ -16,9 +16,17 @@ pub struct Trust {
     pub invalid: bool,
 }
 
+#[derive(Clone, Copy)]
+pub enum ScopeMark {
+    Trusted,
+    Unreachable,
+    AllowIncomplete,
+}
+
 #[derive(Default)]
 struct ErrorPath {
     targets: HashSet<HirId>,
+    forbidden_breaks: HashSet<HirId>,
     exits: Vec<Span>,
 }
 
@@ -34,6 +42,13 @@ impl<'hir> Visitor<'hir> for ErrorPath {
         }
         match expression.kind {
             ExprKind::Ret(_) => self.exits.push(expression.span),
+            ExprKind::Break(destination, _)
+                if destination
+                    .target_id
+                    .is_ok_and(|target| self.forbidden_breaks.contains(&target)) =>
+            {
+                self.exits.push(expression.span);
+            }
             ExprKind::Break(destination, _) | ExprKind::Continue(destination)
                 if !destination
                     .target_id
@@ -94,12 +109,16 @@ impl Trust {
                     for attribute in *attributes {
                         let unreachable = attribute
                             .path_matches(&[Symbol::intern("irq"), Symbol::intern("unreachable")]);
-                        if unreachable
+                        let allow_incomplete = attribute
+                            .path_matches(&[Symbol::intern("irq"), Symbol::intern("allow_incomplete")]);
+                        if unreachable || allow_incomplete
                             || attribute
                                 .path_matches(&[Symbol::intern("irq"), Symbol::intern("trusted")])
                         {
                             let name = if unreachable {
                                 "unreachable"
+                            } else if allow_incomplete {
+                                "allow_incomplete"
                             } else {
                                 "trusted"
                             };
@@ -121,6 +140,36 @@ impl Trust {
                                 matches!(expression.kind, ExprKind::Block(block, _)
                                     if block.rules == BlockCheckMode::UnsafeBlock(UnsafeSource::UserProvided))
                             });
+                            let nonreturning = !unreachable || expression.is_some_and(|expression| {
+                                let mut pending = vec![expression];
+                                while let Some(expression) = pending.pop() {
+                                    if tcx.typeck(id.owner.def_id).expr_ty(expression).is_never() { continue; }
+                                    match expression.kind {
+                                        ExprKind::Block(block, _) => {
+                                            let mut exits = ErrorPath::default();
+                                            exits.visit_block(block);
+                                            if !exits.exits.is_empty() { return false; }
+                                            let tail = block.expr.or_else(|| block.stmts.last().and_then(|statement| match statement.kind {
+                                                rustc_hir::StmtKind::Expr(expression) | rustc_hir::StmtKind::Semi(expression) => Some(expression),
+                                                _ => None,
+                                            }));
+                                            let Some(tail) = tail else { return false };
+                                            pending.push(tail);
+                                        }
+                                        ExprKind::Loop(block, _, rustc_hir::LoopSource::Loop, _) => {
+                                            let mut exits = ErrorPath::default();
+                                            exits.targets.extend([expression.hir_id, block.hir_id]);
+                                            exits.forbidden_breaks.extend([expression.hir_id, block.hir_id]);
+                                            exits.visit_block(block);
+                                            if !exits.exits.is_empty() { return false; }
+                                        }
+                                        ExprKind::If(_, yes, Some(no)) => { pending.push(yes); pending.push(no); }
+                                        ExprKind::DropTemps(value) => pending.push(value),
+                                        _ => return false,
+                                    }
+                                }
+                                true
+                            });
                             if !valid_argument || !valid_block {
                                 let mut diagnostic = tcx.dcx().struct_span_err(
                                     attribute.span(),
@@ -134,11 +183,7 @@ impl Trust {
                                 diagnostic.note("functions, safe blocks, and marks without (unsafe) are not accepted");
                                 diagnostic.emit();
                                 invalid = true;
-                            } else if unreachable
-                                && !tcx
-                                    .typeck(id.owner.def_id)
-                                    .expr_ty(expression.unwrap())
-                                    .is_never()
+                            } else if !nonreturning
                             {
                                 let mut diagnostic = tcx.dcx().struct_span_err(
                                     attribute.span(),
@@ -165,7 +210,7 @@ impl Trust {
                                         continue;
                                     }
                                 }
-                                let mark = if unreachable { 2 } else { 1 };
+                                let mark = if unreachable { 2 } else if allow_incomplete { 4 } else { 1 };
                                 *blocks.entry(id).or_default() |= mark;
                                 *blocks.entry(expression.unwrap().hir_id).or_default() |= mark;
                             }
@@ -252,8 +297,11 @@ impl Trust {
                     if marks & 2 != 0 {
                         allowed.unreachable.push(scope.as_usize());
                     }
+                    if marks & 4 != 0 {
+                        allowed.allow_incomplete.push(scope.as_usize());
+                    }
                 }
-                if !allowed.trusted.is_empty() || !allowed.unreachable.is_empty() {
+                if !allowed.trusted.is_empty() || !allowed.unreachable.is_empty() || !allowed.allow_incomplete.is_empty() {
                     local_scopes.insert(
                         tcx.def_path_hash(owner.to_def_id()).local_hash().as_u64(),
                         allowed,
@@ -420,7 +468,7 @@ impl Trust {
         instance: Instance<'_>,
         body: &Body<'_>,
         scope: SourceScope,
-        unreachable: bool,
+        mark: ScopeMark,
     ) -> bool {
         if !matches!(instance.def, InstanceKind::Item(_))
             || body.source_scopes[scope].inlined.is_some()
@@ -433,10 +481,10 @@ impl Trust {
                 bodies.get(&tcx.def_path_hash(instance.def_id()).local_hash().as_u64())
             })
             .is_some_and(|scopes| {
-                if unreachable {
-                    &scopes.unreachable
-                } else {
-                    &scopes.trusted
+                match mark {
+                    ScopeMark::Trusted => &scopes.trusted,
+                    ScopeMark::Unreachable => &scopes.unreachable,
+                    ScopeMark::AllowIncomplete => &scopes.allow_incomplete,
                 }
                 .contains(&scope.as_usize())
             })

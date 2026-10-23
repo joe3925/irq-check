@@ -1,0 +1,17 @@
+[package]
+name = "memory-growth-roots"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+context-growth-boundary = { path = "../context-growth-boundary" }
+
+[features]
+roots-2 = []
+roots-4 = ["roots-2"]
+roots-8 = ["roots-4"]
+roots-17 = ["roots-8"]
+
+[lints]
+workspace = true

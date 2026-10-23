@@ -155,6 +155,20 @@ pub fn launch(args: &[OsString]) -> Result<ExitCode, String> {
         ));
     }
     let graph: Value = serde_json::from_slice(&output.stdout).map_err(|error| error.to_string())?;
+    let workspace_manifest = Path::new(graph["workspace_root"].as_str()
+        .ok_or("Cargo metadata has no workspace root")?).join("Cargo.toml");
+    let workspace_contents = std::fs::read_to_string(&workspace_manifest).map_err(|error| error.to_string())?;
+    let workspace_contents: toml::Value = toml::from_str(&workspace_contents).map_err(|error| error.to_string())?;
+    if let Some(dependencies) = workspace_contents.get("workspace")
+        .and_then(|workspace| workspace.get("dependencies")).and_then(toml::Value::as_table)
+    {
+        for (name, dependency) in dependencies {
+            if let Some(flag) = dependency.get("irq-check") {
+                return Err(format!("{}: remove workspace.dependencies.{name}.irq-check ({flag}); runtime dependencies are checked by default",
+                    workspace_manifest.display()));
+            }
+        }
+    }
     let packages: HashMap<_, _> = graph["packages"]
         .as_array()
         .ok_or("Cargo metadata has no packages")?
@@ -206,6 +220,19 @@ pub fn launch(args: &[OsString]) -> Result<ExitCode, String> {
         let manifest = std::fs::canonicalize(manifest).map_err(|error| error.to_string())?;
         let contents = std::fs::read_to_string(&manifest).map_err(|error| error.to_string())?;
         let contents: toml::Value = toml::from_str(&contents).map_err(|error| error.to_string())?;
+        for table in std::iter::once(&contents).chain(contents.get("target")
+            .and_then(toml::Value::as_table).into_iter().flat_map(|targets| targets.values()))
+        {
+            for section in ["dependencies", "build-dependencies", "dev-dependencies"] {
+                if let Some(dependencies) = table.get(section).and_then(toml::Value::as_table) {
+                    for (name, dependency) in dependencies {
+                        if let Some(flag) = dependency.get("irq-check") {
+                            return Err(format!("{id}: remove {section}.{name}.irq-check ({flag}); runtime dependencies are checked by default"));
+                        }
+                    }
+                }
+            }
+        }
         policy.packages.push(Package {
             id: id.into(),
             manifest,
@@ -214,9 +241,6 @@ pub fn launch(args: &[OsString]) -> Result<ExitCode, String> {
             continue;
         };
         for dependency in dependencies {
-            let alias = dependency["name"]
-                .as_str()
-                .ok_or("dependency has no name")?;
             let target_id = dependency["pkg"]
                 .as_str()
                 .ok_or("dependency has no resolved package")?;
@@ -227,33 +251,10 @@ pub fn launch(args: &[OsString]) -> Result<ExitCode, String> {
                 if !kind["kind"].is_null() {
                     continue;
                 }
-                let table = if let Some(target) = kind["target"].as_str() {
-                    contents
-                        .get("target")
-                        .and_then(|targets| targets.get(target))
-                } else {
-                    Some(&contents)
-                };
-                let flag = table
-                    .and_then(|table| table.get("dependencies"))
-                    .and_then(toml::Value::as_table)
-                    .and_then(|table| {
-                        table
-                            .iter()
-                            .find(|(name, _)| name.replace('-', "_") == alias)
-                    })
-                    .and_then(|(_, dependency)| dependency.get("irq-check"));
-                if let Some(flag) = flag {
-                    match flag.as_bool() {
-                        Some(true) => pending.push_back(target_id),
-                        Some(false) => {}
-                        None => {
-                            return Err(format!(
-                                "{id}: dependencies.{alias}.irq-check must be true or false"
-                            ));
-                        }
-                    }
-                }
+                let host_only = packages.get(target_id).and_then(|package| package["targets"].as_array())
+                    .is_some_and(|targets| targets.iter().any(|target| target["kind"].as_array()
+                        .is_some_and(|kinds| kinds.iter().any(|kind| kind.as_str() == Some("proc-macro")))));
+                if !host_only { pending.push_back(target_id); }
             }
         }
     }
@@ -270,6 +271,7 @@ pub fn launch(args: &[OsString]) -> Result<ExitCode, String> {
             &policy,
             std::env::var_os("IRQ_CHECK_REQUIRED_CRATE"),
             std::env::var_os("IRQ_CHECK_ANALYSIS_ID"),
+            crate::limits::configuration()?,
             std::fs::read(&executable).map_err(|error| error.to_string())?,
             std::fs::read(driver).map_err(|error| error.to_string())?
         ))
@@ -295,19 +297,6 @@ pub fn launch(args: &[OsString]) -> Result<ExitCode, String> {
         let mut stderr_output = std::io::stderr().lock();
         for line in BufReader::new(stderr).split(b'\n') {
             let line = line?;
-            let plain = String::from_utf8_lossy(&line);
-            if plain
-                .split_once("unused manifest key:")
-                .is_some_and(|(_, key)| {
-                    key.split('\u{1b}')
-                        .next()
-                        .unwrap_or(key)
-                        .trim_end()
-                        .ends_with(".irq-check")
-                })
-            {
-                continue;
-            }
             stderr_output.write_all(&line)?;
             stderr_output.write_all(b"\n")?;
             stderr_output.flush()?;

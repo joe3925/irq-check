@@ -1,0 +1,12 @@
+[package]
+name = "writer-growth"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[features]
+large = []
+negative = []
+
+[lints]
+workspace = true

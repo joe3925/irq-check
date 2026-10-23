@@ -23,6 +23,78 @@ use crate::mir::analysis_context::AnalysisContext;
 use crate::mir::function::{FuncId, GenericArgE};
 use crate::mir::path::{Path, PathEnum, PathSelector, ProjectionElems};
 
+pub fn has_instance_mir(tcx: TyCtxt<'_>, instance: rustc_middle::ty::InstanceKind<'_>) -> bool {
+    match instance {
+        rustc_middle::ty::InstanceKind::Intrinsic(_)
+        | rustc_middle::ty::InstanceKind::LlvmIntrinsic(_)
+        | rustc_middle::ty::InstanceKind::Virtual(..) => false,
+        rustc_middle::ty::InstanceKind::Item(def) => tcx.is_mir_available(def) || tcx.is_constructor(def),
+        rustc_middle::ty::InstanceKind::Shim(_) => true,
+    }
+}
+
+pub fn constant_successors<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &mir::Body<'tcx>,
+    block: mir::BasicBlock,
+    args: GenericArgsRef<'tcx>,
+) -> Vec<mir::BasicBlock> {
+    let data = &body.basic_blocks[block];
+    let terminator = data.terminator();
+    match &terminator.kind {
+        mir::TerminatorKind::FalseEdge { real_target, .. }
+        | mir::TerminatorKind::FalseUnwind { real_target, .. } => vec![*real_target],
+        mir::TerminatorKind::SwitchInt { discr, targets } => {
+            let constant = match discr {
+                mir::Operand::Constant(_) | mir::Operand::RuntimeChecks(_) => Some(discr),
+                mir::Operand::Copy(place) | mir::Operand::Move(place) if place.projection.is_empty() => {
+                    let mut constant = None;
+                    for statement in data.statements.iter().rev() {
+                        match &statement.kind {
+                            mir::StatementKind::Assign(assignment) => {
+                                if assignment.0.is_indirect() { break; }
+                                if assignment.0.local == place.local {
+                                    if assignment.0.projection.is_empty()
+                                        && let mir::Rvalue::Use(value, _) = &assignment.1
+                                        && matches!(value, mir::Operand::Constant(_) | mir::Operand::RuntimeChecks(_)) {
+                                        constant = Some(value);
+                                    }
+                                    break;
+                                }
+                            }
+                            mir::StatementKind::StorageLive(local) | mir::StatementKind::StorageDead(local)
+                                if *local == place.local => { break; }
+                            mir::StatementKind::SetDiscriminant { place: written, .. }
+                                if written.is_indirect() || written.local == place.local => { break; }
+                            mir::StatementKind::Intrinsic(_) => break,
+                            _ => {}
+                        }
+                    }
+                    constant
+                }
+                _ => None,
+            };
+            let value = constant.and_then(|constant| {
+                let constant = match constant {
+                    mir::Operand::RuntimeChecks(check) => return Some(check.value(tcx.sess) as u128),
+                    mir::Operand::Constant(constant) => constant,
+                    _ => return None,
+                };
+                let constant = tcx.instantiate_and_normalize_erasing_regions(
+                    args, TypingEnv::fully_monomorphized(),
+                    rustc_middle::ty::EarlyBinder::bind(tcx, constant.const_),
+                );
+                match constant.eval(tcx, TypingEnv::fully_monomorphized(), body.span) {
+                    Ok(mir::ConstValue::Scalar(rustc_middle::mir::interpret::Scalar::Int(bits))) => Some(bits.to_bits(bits.size())),
+                    _ => None,
+                }
+            });
+            value.map_or_else(|| terminator.successors().collect(), |value| vec![targets.target_for_value(value)])
+        }
+        _ => terminator.successors().collect(),
+    }
+}
+
 pub fn call_abi_compatible<'tcx>(
     tcx: TyCtxt<'tcx>,
     signature: PolyFnSig<'tcx>,
@@ -450,21 +522,20 @@ impl<'tcx> PathCastCache<'tcx> {
                 PathSelector::Field(f) => {
                     // If this path is a field of a struct and the field's offset is 0,
                     // remove this field to get the base path
-                    let struct_ty = if let Some(ty) = acx.get_path_rustc_type(&path) {
+                    let parent = Path::truncate_projection_elems(&path, projection.len() - 1);
+                    let struct_ty = if let Some(ty) = acx.get_path_rustc_type(&parent) {
                         ty
                     } else {
-                        let ty = try_eval_path_type(acx, &path).unwrap();
-                        acx.set_path_rustc_type(path.clone(), ty);
+                        let Some(ty) = try_eval_path_type(acx, &parent) else { return path };
+                        acx.set_path_rustc_type(parent.clone(), ty);
                         ty
                     };
-                    if acx.get_field_byte_offset(struct_ty, &vec![PathSelector::Field(*f)]) == 0 {
-                        Self::get_regularized_path(
-                            acx, 
-                            Path::truncate_projection_elems(
-                                &path,
-                                projection.len() - 1
-                            )
-                        )
+                    let downcast = matches!(&parent.value, PathEnum::QualifiedPath { projection, .. }
+                        if matches!(projection.last(), Some(PathSelector::Downcast(_))));
+                    if !downcast && layout_of(acx.tcx, rustc_middle::ty::TypingEnv::fully_monomorphized(), struct_ty)
+                        .is_ok_and(|layout| *f < layout.fields.count() && layout.fields.offset(*f).bytes() == 0)
+                    {
+                        Self::get_regularized_path(acx, parent)
                     } else {
                         path
                     }
@@ -517,11 +588,12 @@ pub fn get_element_type<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Ty<'tcx> {
 }
 
 /// Returns the type of the field with the given ordinal.
+#[track_caller]
 pub fn get_field_type<'tcx>(tcx: TyCtxt<'tcx>, base_ty: Ty<'tcx>, ordinal: usize) -> Ty<'tcx> {
     if let TyKind::Adt(def, args) = base_ty.kind() {
         if def.is_union() || def.is_struct() {
             let variant = def.variants().iter().next().expect("at least one variant");
-            assert!(ordinal < variant.fields.len());
+            assert!(ordinal < variant.fields.len(), "field {ordinal} is outside {base_ty} with {} fields", variant.fields.len());
             let field = &variant.fields[FieldIdx::from_usize(ordinal)];
             let ft = field_ty(tcx, field, args);
             return ft;
@@ -530,13 +602,13 @@ pub fn get_field_type<'tcx>(tcx: TyCtxt<'tcx>, base_ty: Ty<'tcx>, ordinal: usize
             return tcx.types.never;
         }
     } else if let TyKind::Tuple(tuple_types) = base_ty.kind() {
-        assert!(ordinal < tuple_types.len());
+        assert!(ordinal < tuple_types.len(), "field {ordinal} is outside {base_ty} with {} fields", tuple_types.len());
         let ft = tuple_types[ordinal];
         return ft;
     } else if base_ty.is_closure() || base_ty.is_coroutine() {
         let closure_field_types = closure_field_types(base_ty);
         debug!("Closure/Coroutine field types: {:?}", closure_field_types);
-        assert!(ordinal < closure_field_types.len());
+        assert!(ordinal < closure_field_types.len(), "field {ordinal} is outside {base_ty} with {} fields", closure_field_types.len());
         return closure_field_types[ordinal];
     } else {
         warn!("Getting the field type for an unexpected type {:?} ", base_ty);
@@ -872,9 +944,19 @@ pub fn projections_and_types<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Vec<(Proj
 }
 
 /// Returns all the projections of pointer type fields contained in the given type
-pub fn get_pointer_projections<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Vec<(ProjectionElems, Ty<'tcx>)> {
+pub fn get_pointer_projections<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: Ty<'tcx>,
+) -> Vec<(ProjectionElems, Ty<'tcx>)> {
     let mut ptr_projs = Vec::new();
     match ty.kind() {
+        TyKind::Pat(base, _) => {
+            if base.is_any_ptr() {
+                ptr_projs.push((Vec::new(), *base));
+            } else {
+                ptr_projs.extend(get_pointer_projections(tcx, *base));
+            }
+        }
         TyKind::Adt(adt_def, args) if adt_def.is_struct() || adt_def.is_union() => {
             // If this adt is a struct or union, there will be a single variant containing all the fields.
             let variant = adt_def.variants().iter().next().expect("at least one variant");
@@ -1034,23 +1116,26 @@ fn flatten_fields_recursively<'tcx>(
     match path_ty.kind() {
         TyKind::Adt(adt_def, args) => {
             if adt_def.is_enum() {
-                // Todo: we currently do not flatten a enum type variable
-                flattened_fields.push((base_offset, path, path_ty));
+                let Ok(layout) = layout_of(tcx, param_env, path_ty) else {
+                    flattened_fields.push((base_offset, path, path_ty));
+                    return;
+                };
+                let cx = rustc_middle::ty::layout::LayoutCx::new(tcx, param_env);
+                for (variant, definition) in adt_def.variants().iter_enumerated() {
+                    let layout = layout.for_variant(&cx, variant);
+                    let base = Path::new_downcast(path.clone(), variant.as_usize());
+                    for (field, definition) in definition.fields.iter_enumerated() {
+                        let ty = field_ty(tcx, definition, args);
+                        let offset = base_offset + layout.fields.offset(field.as_usize()).bytes_usize();
+                        flatten_fields_recursively(tcx, param_env,
+                            Path::new_field(base.clone(), field.as_usize()), ty, offset, flattened_fields);
+                    }
+                }
                 return;
             }
             if adt_def.is_union() {
-                // Todo
-                // We currently only push the first non-zero-sized field into the flattened_fields now.
-                // This solution is sound for most of the cases, especially for handling transparent union.
                 let variant = adt_def.variants().iter().next().expect("at least one variant");
-                let non_zst_field = variant.fields.iter().enumerate().find(|(_i, field)| {
-                    let field_ty = tcx.type_of(field.did).skip_binder();
-                    let is_zst = tcx
-                        .layout_of(param_env.as_query_input(field_ty))
-                        .map_or(false, |layout| layout.is_zst());
-                    !is_zst
-                });
-                if let Some((i, field)) = non_zst_field {
+                for (i, field) in variant.fields.iter().enumerate() {
                     let field_path = Path::new_union_field(path.clone(), i);
                     let field_ty = field_ty(tcx, field, args);
                     flatten_fields_recursively(
@@ -1072,10 +1157,12 @@ fn flatten_fields_recursively<'tcx>(
                     let variant = adt_def.variants().iter().next().expect("at least one variant");
                     if let rustc_abi::FieldsShape::Arbitrary {
                         offsets,
-                        in_memory_order,
+                        in_memory_order: _,
                     } = layout.fields()
                     {
-                        for index in in_memory_order {
+                        let mut fields: Vec<_> = offsets.iter_enumerated().collect();
+                        fields.sort_unstable_by_key(|(index, offset)| (offset.bytes(), index.index()));
+                        for (index, _) in fields {
                             let index = index.index();
                             let field = &variant.fields[FieldIdx::from_usize(index)];
                             let field_path = Path::new_field(path.clone(), index);
@@ -1120,10 +1207,12 @@ fn flatten_fields_recursively<'tcx>(
                 let layout = layout.layout;
                 if let rustc_abi::FieldsShape::Arbitrary {
                     offsets,
-                    in_memory_order,
+                    in_memory_order: _,
                 } = layout.fields()
                 {
-                    for index in in_memory_order {
+                    let mut fields: Vec<_> = offsets.iter_enumerated().collect();
+                    fields.sort_unstable_by_key(|(index, offset)| (offset.bytes(), index.index()));
+                    for (index, _) in fields {
                         let index = index.index();
                         let field_path = Path::new_field(path.clone(), index);
                         let field_ty = types[index];
@@ -1214,11 +1303,13 @@ fn find_fields_at_start_location<'tcx>(
                     let layout = layout.layout;
                     if let rustc_abi::FieldsShape::Arbitrary {
                         offsets,
-                        in_memory_order,
+                        in_memory_order: _,
                     } = layout.fields()
                     {
                         // There may be multiple fields at start memeory location as a field can be zero sized.
-                        for index in in_memory_order {
+                        let mut fields: Vec<_> = offsets.iter_enumerated().collect();
+                        fields.sort_unstable_by_key(|(index, offset)| (offset.bytes(), index.index()));
+                        for (index, _) in fields {
                             let index = index.index();
                             let offset = offsets[FieldIdx::from_usize(index)].bytes_usize();
                             if offset == 0 {
@@ -1258,11 +1349,13 @@ fn find_fields_at_start_location<'tcx>(
                 let layout = layout.layout;
                 if let rustc_abi::FieldsShape::Arbitrary {
                     offsets,
-                    in_memory_order,
+                    in_memory_order: _,
                 } = layout.fields()
                 {
                     // There may be multiple fields at start memeory location as a field can be zero sized.
-                    for index in in_memory_order {
+                    let mut fields: Vec<_> = offsets.iter_enumerated().collect();
+                    fields.sort_unstable_by_key(|(index, offset)| (offset.bytes(), index.index()));
+                    for (index, _) in fields {
                         let index = index.index();
                         let offset = offsets[FieldIdx::from_usize(index)].bytes_usize();
                         if offset == 0 {
@@ -1361,11 +1454,7 @@ pub fn eval_local_decl_type<'tcx>(
     let substs_specializer =
         SubstsSpecializer::new(acx.tcx, reference.generic_args.clone());
     if reference.promoted.is_none()
-        && (matches!(reference.kind, rustc_middle::ty::InstanceKind::Intrinsic(_)
-            | rustc_middle::ty::InstanceKind::LlvmIntrinsic(_)
-            | rustc_middle::ty::InstanceKind::Virtual(..))
-            || matches!(reference.kind, rustc_middle::ty::InstanceKind::Item(_))
-                && !acx.tcx.is_mir_available(reference.def_id))
+        && !has_instance_mir(acx.tcx, reference.kind)
     {
         if matches!(acx.tcx.def_kind(reference.def_id), rustc_hir::def::DefKind::Fn | rustc_hir::def::DefKind::AssocFn) {
             let signature = acx.tcx.fn_sig(reference.def_id).skip_binder();
@@ -1399,7 +1488,6 @@ pub fn try_eval_path_type<'tcx>(acx: &mut AnalysisContext<'tcx, '_>, path: &Rc<P
         PathEnum::Auxiliary { .. }
         | PathEnum::PromotedConstant { .. }
         | PathEnum::Function(..)
-        | PathEnum::SharedStorage(..)
         | PathEnum::Type(..)
         | PathEnum::PromotedArgumentV1Array
         | PathEnum::PromotedStrRefArray => {
@@ -1433,6 +1521,12 @@ pub fn try_eval_path_type<'tcx>(acx: &mut AnalysisContext<'tcx, '_>, path: &Rc<P
                             | TyKind::Tuple(..)
                             | TyKind::Closure(..)
                             | TyKind::Coroutine(..) => {
+                                if let TyKind::Adt(def, _) = base_ty.kind() {
+                                    if def.is_struct() || def.is_union() {
+                                        assert!(*ordinal < def.non_enum_variant().fields.len(),
+                                            "field {ordinal} is outside {base_ty}; path={path:?}");
+                                    }
+                                }
                                 let ft = get_field_type(acx.tcx, base_ty, *ordinal);
                                 ft
                             }
@@ -1446,7 +1540,7 @@ pub fn try_eval_path_type<'tcx>(acx: &mut AnalysisContext<'tcx, '_>, path: &Rc<P
                             // the type `Str` cannot be indexed
                             TyKind::Array(..) | TyKind::Slice(..) => get_element_type(acx.tcx, base_ty),
                             _ => {
-                                unreachable!();
+                                panic!("index projection on {base_ty}; path={path:?}");
                             }
                         }
                     }

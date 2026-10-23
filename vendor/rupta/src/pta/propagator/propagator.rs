@@ -15,7 +15,7 @@ use rustc_middle::ty::{Ty, TyCtxt, TyKind};
 use crate::builder::call_graph_builder;
 use crate::mir::analysis_context::AnalysisContext;
 use crate::mir::call_site::{AssocCallGroup, CallSiteS};
-use crate::mir::path::{PathEnum, PathSelector};
+use crate::mir::path::{Path, PathEnum, PathSelector};
 use crate::pta::strategies::stack_filtering::{SFReachable, StackFilter};
 use crate::pta::*;
 use crate::pts_set::points_to::PointsToSet;
@@ -112,6 +112,7 @@ where
     pub fn solve_worklist(&mut self) {
         self.init_constraints();
         while !self.worklist.is_empty() {
+            if !crate::limits::checkpoint() { return; }
             let node_id = self.worklist.pop_front().unwrap();
             self.process_node(node_id);
         }
@@ -126,6 +127,7 @@ where
     /// Process address edges.
     fn process_all_addr_edges(&mut self) {
         while let Some(edge_id) = self.addr_edge_iter.next() {
+            if !crate::limits::checkpoint() { return; }
             self.process_addr(edge_id);
         }
     }
@@ -133,7 +135,12 @@ where
     /// Process arg-param edges.
     fn process_all_inter_proc_edges(&mut self) {
         while let Some(edge_id) = self.inter_proc_edge_iter.next() {
-            self.propagate(edge_id, false);
+            if !crate::limits::checkpoint() { return; }
+            if matches!(self.pag.get_edge(edge_id).kind, PAGEdgeEnum::CastPAGEdge) {
+                self.propagate_cast(edge_id, false);
+            } else {
+                self.propagate(edge_id, false);
+            }
         }
     }
 
@@ -437,6 +444,23 @@ where
     /// for accessing an element inside an array or a vector heap block (e.g. `offset` called in
     /// `Vec::push` and when iterating a vec).
     fn process_offset(&mut self, offset_edge: EdgeId) {
+        let (source, destination) = self.pag.graph().edge_endpoints(offset_edge).unwrap();
+        for pointee in &self.get_cloned_pts(source, false) {
+            let path = self.pag.node_path(pointee).remove_cast();
+            let mut value = path.value();
+            let mut field = false;
+            while let PathEnum::QualifiedPath { base, projection } = value {
+                field |= projection.iter().any(|part| matches!(part, PathSelector::Field(_) | PathSelector::UnionField(_) | PathSelector::Downcast(_)));
+                if field && self.acx.get_path_rustc_type(base).is_none_or(|ty|
+                    ty.is_any_ptr() || !type_util::get_pointer_projections(self.tcx(), ty).is_empty()) {
+                    self.acx.offset_risks.insert(Rc::new(crate::mir::path::Path { value: self.pag.node_path(destination).value().clone() }));
+                }
+                value = &base.value;
+            }
+            if matches!(value, PathEnum::OffsetPath { .. }) {
+                self.acx.offset_risks.insert(Rc::new(crate::mir::path::Path { value: self.pag.node_path(destination).value().clone() }));
+            }
+        }
         // We don't check whether src and dst have the same type here, as the propagate function will
         // ignore the value flow if they are not of the same type.
         self.propagate(offset_edge, true);
@@ -776,6 +800,10 @@ where
             let stack_filter_pred = Self::stack_filter_pred(direct_edge);
 
             if !type_util::equivalent_ptr_types(self.tcx(), src_type, dst_type) {
+                if !src_type.is_never() && !dst_type.is_never() {
+                    self.acx.unmodeled_flows.insert(format!("incompatible pointer transfer: {src_path:?} ({src_type:?}) -> {dst_path:?} ({dst_type:?})"));
+                    self.acx.unmodeled_paths.insert(Rc::new(Path { value: dst_path.value().clone() }));
+                }
                 debug!(
                     "Filtering propagating from {:?}({:?}) to {:?}({:?})",
                     src_path, src_type, dst_path, dst_type
@@ -864,7 +892,7 @@ where
         let mut changed = false;
         let (src, dst) = self.pag.graph().edge_endpoints(cast_edge).unwrap();
         let (_src_path, src_ty) = self.node_path_and_ty(src);
-        let (_dst_path, dst_ty) = self.node_path_and_ty(dst);
+        let (dst_path, dst_ty) = self.node_path_and_ty(dst);
         // debug!("Propagating cast from {:?}({:?}) -> {:?}({:?})", src_path, src_ty, dst_path, dst_ty);
         assert!(src_ty.is_any_ptr() && dst_ty.is_any_ptr());
 
@@ -981,6 +1009,9 @@ where
                 let pointee_flattened_fields = pointee_path.flatten_fields(self.acx);
                 let cast_flattened_fields = cast_path.flatten_fields(self.acx);
                 self.cast_between_flattened_fields(pointee_flattened_fields, cast_flattened_fields);
+            } else {
+                self.acx.unmodeled_paths.insert(Rc::new(Path { value: dst_path.value().clone() }));
+                self.acx.unmodeled_flows.insert(format!("unmodeled pointer cast: {pointee_path:?} -> {dst_deref_ty:?}"));
             }
         }
 
@@ -1025,6 +1056,15 @@ where
                     self.add_cast_edge_and_propagate(src_field, tgt_field);
                 }
             } else {
+                if src_type.is_any_ptr() != tgt_type.is_any_ptr() {
+                    let reason = if matches!(src_field.value(), PathEnum::HeapObj { .. }) && *src_type == self.tcx().types.u8
+                        || matches!(tgt_field.value(), PathEnum::HeapObj { .. }) && *tgt_type == self.tcx().types.u8 {
+                        "heap storage has no initial pointer type"
+                    } else { "pointer bytes share non-pointer storage" };
+                    self.acx.unmodeled_flows.insert(format!("{reason}: {src_field:?} ({src_type:?}) -> {tgt_field:?} ({tgt_type:?})"));
+                    self.acx.unmodeled_paths.insert(Rc::new(Path { value: src_field.value().clone() }));
+                    self.acx.unmodeled_paths.insert(Rc::new(Path { value: tgt_field.value().clone() }));
+                }
                 if src_type.is_enum() && src_type == tgt_type {
                     // We do not flatten fields for enum type, therefore if src_type and tgt_type are the same enum types,
                     // we add direct edges between their pointer fields.
@@ -1061,7 +1101,8 @@ where
                 self.add_pts(fnptr, original_id)
             }
             _ => {
-                // warn!("Propagate a non-function item to function pointer!");
+                self.acx.unmodeled_flows.insert(format!("unmodeled function-pointer storage: {original_path:?} ({original_ty:?})"));
+                self.acx.unmodeled_paths.insert(Rc::new(Path { value: self.pag.node_path(fnptr).value().clone() }));
                 false
             }
         }
@@ -1074,6 +1115,8 @@ where
             let cast_path_id = self.pag.get_or_insert_node(&cast_path);
             self.pt_data.add_pts(pointer, cast_path_id)
         } else {
+            self.acx.unmodeled_flows.insert(format!("unmodeled pointer cast: {pointee_path:?} -> {cast_ty:?}"));
+            self.acx.unmodeled_paths.insert(Rc::new(Path { value: self.pag.node_path(pointer).value().clone() }));
             false
         }
     }

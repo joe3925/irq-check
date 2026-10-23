@@ -1,0 +1,11 @@
+[package]
+name = "contract-dependency"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+leaf = { package = "contract-leaf", path = "../contract-leaf" }
+
+[lints]
+workspace = true

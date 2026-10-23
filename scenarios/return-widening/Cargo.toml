@@ -1,0 +1,11 @@
+[package]
+name = "return-widening"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[features]
+negative = []
+
+[lints]
+workspace = true

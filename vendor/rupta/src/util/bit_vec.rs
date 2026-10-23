@@ -61,7 +61,7 @@ impl Idx for u32 {
 /// just be `usize`.
 #[derive(Eq, PartialEq, Hash, Decodable, Encodable)]
 pub struct BitVec<T> {
-    words: Vec<Word>,
+    pub(crate) words: Vec<Word>,
     marker: PhantomData<T>,
 }
 

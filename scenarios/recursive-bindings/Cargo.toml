@@ -1,0 +1,34 @@
+[package]
+name = "recursive-bindings"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[features]
+negative = []
+unbounded = []
+stable-cycle = []
+cut = []
+escaping-cut = ["cut"]
+erased = []
+mutable = []
+formatting = []
+local-callback = ["formatting"]
+registry = []
+registry-predicate = ["registry"]
+global-registry = ["registry"]
+heap-registry = ["global-registry"]
+boot-registry = ["heap-registry"]
+global-update = ["global-registry"]
+scalar-growth = []
+multi-format = ["scalar-growth", "formatting"]
+trace-loop = ["multi-format"]
+buffered-format = ["trace-loop"]
+panic-format = ["formatting"]
+coverage-local = []
+coverage-write = ["coverage-local"]
+coverage-unknown = ["coverage-local"]
+closure-write = ["buffered-format"]
+
+[lints]
+workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "heap-read-chain"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[features]
+negative = []
+large = []
+
+[lints]
+workspace = true

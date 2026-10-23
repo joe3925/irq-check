@@ -145,11 +145,11 @@ pub struct AssocCallGroup<I, F, P> {
     // Pairs of the self pointer and the associated function callsites that can be statically dispatched.
     pub(crate) static_dispatch_instance_calls: HashMap<I, HashSet<(Rc<CallSiteS<F, P>>, FuncId)>>,
     // Pairs of the dynamic trait object and its callsites.
-    pub(crate) dynamic_dispatch_calls: HashMap<I, HashSet<Rc<CallSiteS<F, P>>>>,
+    pub dynamic_dispatch_calls: HashMap<I, HashSet<Rc<CallSiteS<F, P>>>>,
     // Pairs of the dynamic trait object and the callsite of std::ops::Fn|FnOnce|FnMuT calls.
-    pub(crate) dynamic_fntrait_calls: HashMap<I, HashSet<Rc<CallSiteS<F, P>>>>,
+    pub dynamic_fntrait_calls: HashMap<I, HashSet<Rc<CallSiteS<F, P>>>>,
     // Pairs of the function pointer and its callsites.
-    pub(crate) fnptr_calls: HashMap<I, HashSet<Rc<CallSiteS<F, P>>>>,
+    pub fnptr_calls: HashMap<I, HashSet<Rc<CallSiteS<F, P>>>>,
 }
 
 impl<I, F, P> AssocCallGroup<I, F, P> where 
