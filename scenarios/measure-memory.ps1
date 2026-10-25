@@ -126,6 +126,7 @@ try {
                 if ($StopPrivateGiB -gt 0 -and $private -ge $StopPrivateGiB * 1GB) { $reason = 'memory-limit' }
             } finally { $child.Dispose() }
         }
+        if ($stderr.IsFaulted) { [void]$stderr.GetAwaiter().GetResult() }
         if ($TimeoutSeconds -gt 0 -and $watch.Elapsed.TotalSeconds -ge $TimeoutSeconds) { $reason = 'time-limit' }
         if ($reason -ne 'completed' -and !$process.HasExited) {
             & taskkill.exe /PID $process.Id /T /F | Out-Null

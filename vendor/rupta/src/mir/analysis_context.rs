@@ -32,6 +32,7 @@ pub struct AnalysisContext<'tcx, 'compilation> {
     pub coverage_gaps: HashSet<(FuncId, Option<rustc_middle::mir::Location>, String)>,
     pub unmodeled_flows: HashSet<String>,
     pub unmodeled_paths: HashSet<Rc<Path>>,
+    pub value_unknown_paths: HashSet<Rc<Path>>,
     pub no_provenance_paths: HashSet<Rc<Path>>,
     pub offset_risks: HashSet<std::rc::Rc<Path>>,
     pub scalar_writes: HashSet<(Rc<Path>, ProjectionElems)>,
@@ -66,6 +67,7 @@ pub struct AnalysisContext<'tcx, 'compilation> {
 
     /// Cache all the pointer type fields' projections for each type.
     pub ptr_projs_cache: PointerProjectionsCache<'tcx>,
+    pub value_projs_cache: HashMap<Ty<'tcx>, Vec<(ProjectionElems, Ty<'tcx>)>>,
     /// Cache the byte offset for each field of type.
     pub field_byte_offset_cache: FieldByteOffsetCache<'tcx>,
 
@@ -97,6 +99,7 @@ impl<'tcx, 'compilation> AnalysisContext<'tcx, 'compilation> {
             coverage_gaps: HashSet::new(),
             unmodeled_flows: HashSet::new(),
             unmodeled_paths: HashSet::new(),
+            value_unknown_paths: HashSet::new(),
             no_provenance_paths: HashSet::new(),
             offset_risks: HashSet::new(),
             scalar_writes: HashSet::new(),
@@ -113,6 +116,7 @@ impl<'tcx, 'compilation> AnalysisContext<'tcx, 'compilation> {
             path_cast_cache: PathCastCache::new(),
             path_memory_size: HashMap::new(),
             ptr_projs_cache: PointerProjectionsCache::new(),
+            value_projs_cache: HashMap::new(),
             field_byte_offset_cache: FieldByteOffsetCache::new(),
             dyn_callsite_cache: HashMap::new(),
             special_functions: HashSet::new(),
@@ -206,6 +210,11 @@ impl<'tcx, 'compilation> AnalysisContext<'tcx, 'compilation> {
     /// Get the pointer type fields' projections.
     pub fn get_pointer_projections(&mut self, ty: Ty<'tcx>) -> &Vec<(ProjectionElems, Ty<'tcx>)> {
         self.ptr_projs_cache.get_pointer_projections(self.tcx, ty)
+    }
+
+    pub fn get_value_projections(&mut self, ty: Ty<'tcx>) -> &Vec<(ProjectionElems, Ty<'tcx>)> {
+        self.value_projs_cache.entry(ty)
+            .or_insert_with(|| type_util::get_value_projections(self.tcx, ty, true))
     }
 
     /// Get the byte offset of a specific field.

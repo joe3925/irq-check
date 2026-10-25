@@ -13,12 +13,6 @@ pub(super) enum PointerObject<'tcx> {
     Static(rustc_hir::def_id::DefId),
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(super) struct WriteRegion<'tcx> {
-    pub object: PointerObject<'tcx>,
-    pub bytes: Option<(u64, u64)>,
-}
-
 pub(super) struct PointerNode<'tcx> {
     pub object: Option<PointerObject<'tcx>>,
     pub context: Option<usize>,
@@ -45,7 +39,7 @@ pub(super) struct PointerFacts<'tcx> {
     pub safe: HashSet<Instance<'tcx>>,
     pub exclusions: HashSet<Instance<'tcx>>,
     pub pointees: HashMap<(Instance<'tcx>, rustc_middle::mir::Local), HashSet<PointerObject<'tcx>>>,
-    pub writes: HashMap<Instance<'tcx>, HashSet<WriteRegion<'tcx>>>,
+    pub pointee_ranges: HashMap<(Instance<'tcx>, rustc_middle::mir::Local), HashSet<(PointerObject<'tcx>, Option<(u64, u64)>)>>,
 }
 
 pub(super) struct GlobalPointers<'tcx> {
@@ -54,6 +48,7 @@ pub(super) struct GlobalPointers<'tcx> {
     pub candidates: HashMap<(Instance<'tcx>, Location), HashSet<Instance<'tcx>>>,
     pub failure: Option<String>,
     pub binding_independent: HashSet<Instance<'tcx>>,
+    pub diagnostic_independent: HashSet<Instance<'tcx>>,
     pub facts: PointerFacts<'tcx>,
 }
 
@@ -587,7 +582,14 @@ impl<'tcx> GlobalPointers<'tcx> {
                 }
             }
             for path in &backend.acx.unmodeled_paths {
-                if let Some(groups) = path_groups.get(path) {
+                let mut affected = path;
+                while !path_groups.contains_key(affected) {
+                    match &affected.value {
+                        PathEnum::QualifiedPath { base, .. } | PathEnum::OffsetPath { base, .. } => affected = base,
+                        _ => break,
+                    }
+                }
+                if let Some(groups) = path_groups.get(affected) {
                     pending.extend(groups.iter().copied());
                 } else {
                     if std::env::var_os("IRQ_CHECK_TRACE_COVERAGE").is_some() {
@@ -595,6 +597,55 @@ impl<'tcx> GlobalPointers<'tcx> {
                     }
                     unknown_memory = true;
                     unknown_calls = true;
+                }
+            }
+            let mut integer_groups = HashSet::new();
+            let mut function_groups = HashSet::new();
+            for node in backend.pag.graph().node_indices() {
+                if let Some(ty) = backend.acx.get_path_rustc_type(&backend.pag.node_path(node).path) {
+                    let group = node_groups[node.index()];
+                    if irq_check_rupta::util::type_util::is_integer_carrier(tcx, ty) {
+                        integer_groups.insert(group);
+                    } else if ty.is_fn_ptr() {
+                        function_groups.insert(group);
+                    }
+                }
+            }
+            let mut integer_uses = HashMap::<_, Vec<_>>::new();
+            for edge in backend.pag.graph().edge_indices() {
+                if !irq_check_rupta::limits::checkpoint() { break; }
+                if matches!(backend.pag.get_edge(edge).kind, PAGEdgeEnum::DirectPAGEdge) {
+                    let (source, destination) = backend.pag.graph().edge_endpoints(edge).unwrap();
+                    let from = node_groups[source.index()];
+                    let to = node_groups[destination.index()];
+                    if integer_groups.contains(&from)
+                        && (integer_groups.contains(&to) || function_groups.contains(&to))
+                    {
+                        integer_uses.entry(from).or_default().push(to);
+                    }
+                }
+            }
+            for path in &backend.acx.value_unknown_paths {
+                if !irq_check_rupta::limits::checkpoint() { break; }
+                let Some(ty) = backend.acx.get_path_rustc_type(path) else {
+                    if let Some(groups) = path_groups.get(path) {
+                        pending.extend(groups.iter().copied());
+                    }
+                    continue;
+                };
+                if ty.is_any_ptr() {
+                    if let Some(groups) = path_groups.get(path) {
+                        pending.extend(groups.iter().copied());
+                    }
+                    continue;
+                }
+                let projections = backend.acx.value_projs_cache.get(&ty).cloned()
+                    .unwrap_or_else(|| irq_check_rupta::util::type_util::get_value_projections(tcx, ty, true));
+                for (projection, _) in projections {
+                    let field = Path::append_projection(path, &projection);
+                    if let Some(groups) = path_groups.get(&field) {
+                        pending.extend(groups.iter().copied());
+                    }
                 }
             }
             for gap in &backend.acx.coverage_gaps {
@@ -960,6 +1011,17 @@ impl<'tcx> GlobalPointers<'tcx> {
                 if std::mem::replace(&mut unknown[group], true) {
                     continue;
                 }
+                if integer_groups.contains(&(group / 2)) {
+                    for &next in integer_uses.get(&(group / 2)).into_iter().flatten() {
+                        for next in [next * 2, next * 2 + 1] {
+                            if !unknown[next] && !seeds.contains(&next) && origins[next].is_none() {
+                                origins[next] = Some(group);
+                            }
+                            pending.push(next);
+                        }
+                    }
+                    continue;
+                }
                 if std::env::var_os("IRQ_CHECK_TRACE_COVERAGE").is_some()
                     && (!unknown_memory && group % 2 == 0 && write_addresses.contains(&(group / 2))
                         || !unknown_calls
@@ -1089,6 +1151,10 @@ impl<'tcx> GlobalPointers<'tcx> {
             }
             (covered_calls, context_coverage, uncertain_nodes, range_offsets)
         };
+        complete &= !uncertain_nodes.iter().any(|node| {
+            backend.acx.get_path_rustc_type(&backend.pag.node_path(*node).path)
+                .is_some_and(|ty| ty.is_any_ptr())
+        });
         {
             use irq_check_rupta::mir::path::{PathEnum, PathSelector};
             let cx = ty::layout::LayoutCx::new(tcx, ty::TypingEnv::fully_monomorphized());
@@ -1097,6 +1163,11 @@ impl<'tcx> GlobalPointers<'tcx> {
                     break;
                 }
                 let path = &backend.pag.node_path(node).path;
+                if backend.acx.get_path_rustc_type(path).is_some_and(|ty|
+                    irq_check_rupta::util::type_util::is_integer_carrier(tcx, ty))
+                {
+                    continue;
+                }
                 let mut base = path;
                 while let PathEnum::QualifiedPath { base: parent, .. }
                 | PathEnum::OffsetPath { base: parent, .. } = &base.value
@@ -1308,6 +1379,7 @@ impl<'tcx> GlobalPointers<'tcx> {
         let mut visited = HashSet::new();
         let mut callers = HashMap::<_, HashSet<_>>::new();
         let mut binding_dependent = HashSet::new();
+        let mut diagnostic_dependent = HashSet::new();
         while let Some(instance) = pending.pop() {
             if !irq_check_rupta::limits::checkpoint() {
                 break;
@@ -1334,6 +1406,22 @@ impl<'tcx> GlobalPointers<'tcx> {
                     continue;
                 }
             };
+            if index.stops.iter().any(Option::is_some) || !index.assumptions.is_empty()
+                || index.reachable.iter().any(|&block| match &index.body.basic_blocks[block].terminator().kind {
+                    rustc_middle::mir::TerminatorKind::Goto { .. }
+                    | rustc_middle::mir::TerminatorKind::Return
+                    | rustc_middle::mir::TerminatorKind::Unreachable => false,
+                    rustc_middle::mir::TerminatorKind::Call { unwind, .. }
+                    | rustc_middle::mir::TerminatorKind::Drop { unwind, .. } =>
+                        matches!(unwind, rustc_middle::mir::UnwindAction::Cleanup(_)),
+                    rustc_middle::mir::TerminatorKind::TailCall { .. } => false,
+                    rustc_middle::mir::TerminatorKind::InlineAsm { targets, unwind, .. } =>
+                        targets.len() > 1 || matches!(unwind, rustc_middle::mir::UnwindAction::Cleanup(_)),
+                    _ => true,
+                })
+            {
+                diagnostic_dependent.insert(instance);
+            }
             for location in index.calls {
                 use rustc_middle::mir::TerminatorKind;
                 let target = match &index.body.basic_blocks[location.block].terminator().kind {
@@ -1424,6 +1512,15 @@ impl<'tcx> GlobalPointers<'tcx> {
                 }
             }
         }
+        diagnostic_dependent.extend(binding_dependent.iter().copied());
+        let mut changed: Vec<_> = diagnostic_dependent.iter().copied().collect();
+        while let Some(instance) = changed.pop() {
+            if !irq_check_rupta::limits::checkpoint() { break; }
+            for &caller in callers.get(&instance).into_iter().flatten() {
+                if diagnostic_dependent.insert(caller) { changed.push(caller); }
+            }
+        }
+        let diagnostic_independent = visited.difference(&diagnostic_dependent).copied().collect();
         if let Some(reason) = irq_check_rupta::limits::stop_reason() {
             failure = Some(reason.into());
         }
@@ -1492,7 +1589,7 @@ impl<'tcx> GlobalPointers<'tcx> {
             context_bindings: HashMap::new(),
             safe_contexts: HashSet::new(),
             pointees: HashMap::new(),
-            writes: HashMap::new(),
+            pointee_ranges: HashMap::new(),
         };
         let mut summary_solver = super::sparse::Solver::new(tcx, trust, &exported, &summary_facts);
         summary_solver.cache_limit = 16 * 1024 * 1024;
@@ -1953,270 +2050,6 @@ impl<'tcx> GlobalPointers<'tcx> {
                 summary_gaps.len()
             );
         }
-        let mut writes = HashMap::<_, HashSet<_>>::new();
-        {
-            use rustc_middle::mir::{ProjectionElem, StatementKind, TerminatorKind};
-            let mut pending: Vec<_> = visited.iter().copied().collect();
-            let mut unknown = HashSet::new();
-            let mut effect_callers = HashMap::<_, HashSet<_>>::new();
-            while let Some(instance) = pending.pop() {
-                if !irq_check_rupta::limits::checkpoint() {
-                    break;
-                }
-                if writes.contains_key(&instance) {
-                    continue;
-                }
-                let mut effects = HashSet::new();
-                writes.insert(instance, HashSet::new());
-                if crate::known_intrinsic(tcx, instance)
-                    || matches!(
-                        instance.def,
-                        ty::InstanceKind::Shim(ty::ShimKind::DropGlue(_, None))
-                    )
-                {
-                    continue;
-                }
-                if matches!(instance.def, ty::InstanceKind::Intrinsic(_)) {
-                    if super::intrinsic_effect(tcx, instance) != super::IntrinsicEffect::ReadOnly {
-                        unknown.insert(instance);
-                    }
-                    continue;
-                }
-                if tcx.is_foreign_item(instance.def_id())
-                    && let Some(targets) =
-                        candidates
-                            .get(&(instance, Location::START))
-                            .filter(|targets| {
-                                !targets.is_empty()
-                                    && pointer_calls.contains(&(instance, Location::START))
-                            })
-                {
-                    for &target in targets {
-                        effect_callers.entry(target).or_default().insert(instance);
-                        pending.push(target);
-                    }
-                    continue;
-                }
-                if tcx.is_foreign_item(instance.def_id())
-                    || matches!(
-                        instance.def,
-                        ty::InstanceKind::LlvmIntrinsic(_) | ty::InstanceKind::Virtual(..)
-                    )
-                    || !irq_check_rupta::util::type_util::has_instance_mir(tcx, instance.def)
-                {
-                    unknown.insert(instance);
-                    continue;
-                }
-                let Ok(index) = super::query::BodyIndex::build(tcx, trust, instance, false) else {
-                    unknown.insert(instance);
-                    continue;
-                };
-                for definition in index
-                    .definitions
-                    .values()
-                    .chain(index.memory.values())
-                    .flatten()
-                {
-                    let Some(place) = definition.place else {
-                        let data = &index.body.basic_blocks[definition.location.block];
-                        if let Some(statement) =
-                            data.statements.get(definition.location.statement_index)
-                        {
-                            if !matches!(&statement.kind, StatementKind::Intrinsic(value) if matches!(&**value, rustc_middle::mir::NonDivergingIntrinsic::Assume(_)))
-                            {
-                                unknown.insert(instance);
-                            }
-                        }
-                        continue;
-                    };
-                    if !place.is_indirect() {
-                        continue;
-                    } else if matches!(place.projection.first(), Some(ProjectionElem::Deref))
-                        && !place
-                            .projection
-                            .iter()
-                            .skip(1)
-                            .any(|part| matches!(part, ProjectionElem::Deref))
-                    {
-                        if let Some(objects) = pointee_ranges.get(&(instance, place.local)) {
-                            let written = (|| {
-                                let pointer_ty = instance
-                                    .instantiate_mir_and_normalize_erasing_regions(
-                                        tcx,
-                                        ty::TypingEnv::fully_monomorphized(),
-                                        ty::EarlyBinder::bind(
-                                            tcx,
-                                            index.body.local_decls[place.local].ty,
-                                        ),
-                                    );
-                                let mut layout = tcx
-                                    .layout_of(
-                                        ty::TypingEnv::fully_monomorphized()
-                                            .as_query_input(pointer_ty.builtin_deref(true)?),
-                                    )
-                                    .ok()?;
-                                let cx = ty::layout::LayoutCx::new(
-                                    tcx,
-                                    ty::TypingEnv::fully_monomorphized(),
-                                );
-                                let mut offset = 0u64;
-                                for part in place.projection.iter().skip(1) {
-                                    match part {
-                                        ProjectionElem::Field(field, _) => {
-                                            if field.as_usize() >= layout.fields.count() {
-                                                return None;
-                                            }
-                                            offset = offset.checked_add(
-                                                layout.fields.offset(field.as_usize()).bytes(),
-                                            )?;
-                                            layout = layout.field(&cx, field.as_usize());
-                                        }
-                                        ProjectionElem::Downcast(_, variant) => {
-                                            layout = layout.for_variant(&cx, variant);
-                                        }
-                                        _ => return None,
-                                    }
-                                }
-                                Some((offset, layout.size.bytes()))
-                            })();
-                            effects.extend(objects.iter().map(|&(object, range)| {
-                                let bytes = range.and_then(|(start, extent)| {
-                                    let (offset, size) = written?;
-                                    let start = start.checked_add(offset)?;
-                                    let end = start.checked_add(size)?;
-                                    (end <= extent).then_some((start, end))
-                                });
-                                WriteRegion { object, bytes }
-                            }));
-                        } else {
-                            if std::env::var_os("IRQ_CHECK_TRACE_COVERAGE").is_some() {
-                                eprintln!(
-                                    "irq-check: write coverage missing alias {instance} {place:?}"
-                                );
-                            }
-                            unknown.insert(instance);
-                        }
-                    } else {
-                        if std::env::var_os("IRQ_CHECK_TRACE_COVERAGE").is_some() {
-                            eprintln!(
-                                "irq-check: write coverage unsupported place {instance} {place:?}"
-                            );
-                        }
-                        unknown.insert(instance);
-                    }
-                }
-                for location in &index.calls {
-                    if let TerminatorKind::InlineAsm { options, operands, .. } =
-                        &index.body.basic_blocks[location.block].terminator().kind
-                    {
-                        if !options.intersects(rustc_ast::InlineAsmOptions::NOMEM | rustc_ast::InlineAsmOptions::READONLY)
-                            || operands.iter().any(|operand| match operand {
-                                rustc_middle::mir::InlineAsmOperand::Out { place, .. } => place.is_some_and(|place| place.is_indirect()),
-                                rustc_middle::mir::InlineAsmOperand::InOut { out_place, .. } => out_place.is_some_and(|place| place.is_indirect()),
-                                _ => false,
-                            })
-                        { unknown.insert(instance); }
-                        continue;
-                    }
-                    if let TerminatorKind::Assert { unwind, .. } =
-                        &index.body.basic_blocks[location.block].terminator().kind
-                    {
-                        if matches!(
-                            unwind,
-                            rustc_middle::mir::UnwindAction::Unreachable
-                                | rustc_middle::mir::UnwindAction::Terminate(_)
-                        ) {
-                            continue;
-                        }
-                        unknown.insert(instance);
-                        continue;
-                    }
-                    if let Some(targets) =
-                        candidates.get(&(instance, *location)).filter(|targets| {
-                            pointer_calls.contains(&(instance, *location)) && !targets.is_empty()
-                        })
-                    {
-                        for &target in targets {
-                            if matches!(target.def, ty::InstanceKind::Intrinsic(_))
-                                && let super::IntrinsicEffect::Write { arguments, fixed } = super::intrinsic_effect(tcx, target)
-                                && let TerminatorKind::Call { args, .. } | TerminatorKind::TailCall { args, .. } = &index.body.basic_blocks[location.block].terminator().kind
-                            {
-                                let mut covered = true;
-                                for &argument in arguments {
-                                let Some(argument) = args.get(argument) else { covered = false; break; };
-                                let (rustc_middle::mir::Operand::Copy(place) | rustc_middle::mir::Operand::Move(place)) = &argument.node else {
-                                    covered = false; break;
-                                };
-                                let Some(objects) = pointee_ranges.get(&(instance, place.local)).filter(|_| place.projection.is_empty()) else {
-                                    covered = false; break;
-                                };
-                                let pointer_ty = instance.instantiate_mir_and_normalize_erasing_regions(
-                                    tcx, ty::TypingEnv::fully_monomorphized(),
-                                    ty::EarlyBinder::bind(tcx, argument.node.ty(index.body, tcx)),
-                                );
-                                let size = fixed.then(|| pointer_ty.builtin_deref(true).and_then(|ty|
-                                    tcx.layout_of(ty::TypingEnv::fully_monomorphized().as_query_input(ty)).ok()
-                                        .map(|layout| layout.size.bytes()))).flatten();
-                                effects.extend(objects.iter().map(|&(object, range)| {
-                                    let bytes = range.and_then(|(start, extent)| {
-                                        let end = start.checked_add(size?)?;
-                                        (end <= extent).then_some((start, end))
-                                    });
-                                    WriteRegion { object, bytes }
-                                }));
-                                }
-                                if covered { continue; }
-                            }
-                            effect_callers.entry(target).or_default().insert(instance);
-                            pending.push(target);
-                        }
-                    } else {
-                        if std::env::var_os("IRQ_CHECK_TRACE_COVERAGE").is_some() {
-                            eprintln!(
-                                "irq-check: write coverage missing call {instance} at {location:?}"
-                            );
-                        }
-                        unknown.insert(instance);
-                    }
-                }
-                writes.insert(instance, effects);
-            }
-            if std::env::var_os("IRQ_CHECK_TRACE_COVERAGE").is_some() {
-                for instance in &unknown {
-                    eprintln!("irq-check: write coverage incomplete body {instance}");
-                }
-            }
-            let mut pending: std::collections::VecDeque<_> = writes.keys().copied().collect();
-            let mut queued: HashSet<_> = pending.iter().copied().collect();
-            while let Some(target) = pending.pop_front() {
-                if !irq_check_rupta::limits::checkpoint() {
-                    break;
-                }
-                queued.remove(&target);
-                let effects = writes[&target].clone();
-                for &caller in effect_callers.get(&target).into_iter().flatten() {
-                    if unknown.contains(&caller) {
-                        continue;
-                    }
-                    let changed = if unknown.contains(&target) {
-                        unknown.insert(caller)
-                    } else {
-                        let summary = writes.get_mut(&caller).unwrap();
-                        let old_len = summary.len();
-                        summary.extend(effects.iter().copied());
-                        if summary.len() > 16384 {
-                            unknown.insert(caller);
-                            summary.clear();
-                        }
-                        old_len != summary.len() || unknown.contains(&caller)
-                    };
-                    if changed && queued.insert(caller) {
-                        pending.push_back(caller);
-                    }
-                }
-            }
-            writes.retain(|instance, _| !unknown.contains(instance));
-        }
         if let Some(reason) = irq_check_rupta::limits::stop_reason() {
             failure = Some(reason.into());
         }
@@ -2233,14 +2066,14 @@ impl<'tcx> GlobalPointers<'tcx> {
             safe_contexts.clear();
             safe.clear();
             pointees.clear();
-            writes.clear();
+            pointee_ranges.clear();
         }
         if std::env::var_os("IRQ_CHECK_STATS").is_some() {
             eprintln!(
-                "irq-check: pointer coverage complete={complete} call_complete={call_complete} unresolved_sites={unresolved_sites} safe_summaries={} alias_summaries={} write_summaries={}",
+                "irq-check: pointer coverage complete={complete} call_complete={call_complete} unresolved_sites={unresolved_sites} safe_summaries={} alias_summaries={} alias_ranges={}",
                 safe.len(),
                 pointees.len(),
-                writes.len()
+                pointee_ranges.len()
             );
         }
         let facts = PointerFacts {
@@ -2258,7 +2091,7 @@ impl<'tcx> GlobalPointers<'tcx> {
             safe,
             exclusions,
             pointees,
-            writes,
+            pointee_ranges,
         };
         Self {
             exported,
@@ -2266,6 +2099,7 @@ impl<'tcx> GlobalPointers<'tcx> {
             candidates,
             failure,
             binding_independent,
+            diagnostic_independent,
             facts,
         }
     }

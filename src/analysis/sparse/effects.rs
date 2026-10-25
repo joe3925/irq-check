@@ -835,6 +835,62 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
         if self.tcx.is_foreign_item(instance.def_id())
             || matches!(instance.def, InstanceKind::Intrinsic(_) | InstanceKind::LlvmIntrinsic(_) | InstanceKind::Virtual(..))
             || !irq_check_rupta::util::type_util::has_instance_mir(self.tcx, instance.def) { return Ok(None); }
+        if self.tcx.crate_name(instance.def_id().krate).as_str() == "core"
+            && self.tcx.def_path_str(instance.def_id()) == "core::sync::atomic::atomic_compare_exchange" {
+            let body = self.tcx.instance_mir(instance.def);
+            let normalize = |ty| instance.instantiate_mir_and_normalize_erasing_regions(self.tcx,
+                TypingEnv::fully_monomorphized(), EarlyBinder::bind(self.tcx, ty));
+            if body.arg_count == 5 {
+                let pointer_ty = normalize(body.local_decls[mir::Local::from_usize(1)].ty);
+                let value_ty = normalize(body.local_decls[mir::Local::from_usize(2)].ty);
+                let failure_ty = normalize(body.local_decls[mir::Local::from_usize(5)].ty);
+                let result_ty = normalize(body.local_decls[mir::RETURN_PLACE].ty);
+                if pointer_ty.builtin_deref(true) == Some(value_ty)
+                    && value_ty.is_integral()
+                    && normalize(body.local_decls[mir::Local::from_usize(3)].ty) == value_ty
+                    && let ty::Adt(ordering, _) = failure_ty.kind()
+                    && let ty::Adt(result, _) = result_ty.kind()
+                    && ordering.variants().len() == 5 && result.variants().len() == 2 {
+                    let valid_orderings: Box<[_]> = ordering.variants().iter_enumerated()
+                        .filter(|(_, variant)| matches!(variant.name.as_str(), "Relaxed" | "Acquire" | "SeqCst"))
+                        .map(|(variant, _)| ordering.discriminant_for_variant(self.tcx, variant).val).collect();
+                    let ok = result.variants().iter_enumerated().find(|(_, variant)| variant.name.as_str() == "Ok");
+                    let error = result.variants().iter_enumerated().find(|(_, variant)| variant.name.as_str() == "Err");
+                    if valid_orderings.len() == 3 && let (Some((ok, _)), Some((error, _))) = (ok, error) {
+                        let value_layout = self.tcx.layout_of(TypingEnv::fully_monomorphized().as_query_input(value_ty))
+                            .map_err(|_| QueryStop::Unsupported)?;
+                        let result_layout = self.tcx.layout_of(TypingEnv::fully_monomorphized().as_query_input(result_ty))
+                            .map_err(|_| QueryStop::Unsupported)?;
+                        let previous = Source::Load { argument: 0, pointer_ty, offset: 0, ty: value_ty };
+                        let equal = Source::Binary { operation: mir::BinOp::Eq, left: Arc::new(previous.clone()),
+                            right: Arc::new(Source::Argument(1, value_ty)), ty: self.tcx.types.bool };
+                        let valid = (Source::Discriminant { source: Arc::new(Source::Argument(4, failure_ty)),
+                            ty: failure_ty.discriminant_ty(self.tcx) }, valid_orderings, false);
+                        let success = vec![valid.clone(), (equal.clone(), Box::new([1]), false)];
+                        let failure = vec![valid, (equal, Box::new([0]), false)];
+                        let mut alternatives = Vec::new();
+                        for (variant, conditions) in [(ok, success.clone()), (error, failure)] {
+                            let layout = result_layout.for_variant(&ty::layout::LayoutCx::new(self.tcx,
+                                TypingEnv::fully_monomorphized()), variant);
+                            if layout.fields.count() != 1 { return Ok(None); }
+                            alternatives.push((conditions, Source::Aggregate {
+                                fields: vec![(i128::from(layout.fields.offset(0).bytes()), value_ty, Some(previous.clone()))],
+                                variant: Some(variant), ty: result_ty,
+                            }));
+                        }
+                        self.budget.reserve(std::mem::size_of::<Source<'tcx>>() * 64)?;
+                        if std::env::var("IRQ_CHECK_TRACE_EFFECT").is_ok_and(|filter| instance.to_string().contains(&filter)) {
+                            eprintln!("irq-check: atomic effect summary {instance} return_cases=2 stores=1");
+                        }
+                        return Ok(Some(Arc::new(Summary {
+                            stores: vec![Store { conditions: success, destination: Source::Argument(0, pointer_ty),
+                                offset: 0, bytes: value_layout.size.bytes(), source: Source::Argument(2, value_ty) }],
+                            returned: Some(Source::Branches { alternatives, ty: result_ty }),
+                        })));
+                    }
+                }
+            }
+        }
         let limits = irq_check_rupta::limits::configuration().expect("validated analysis limits");
         if self.effects.active.len() >= limits.call_depth { return Err(QueryStop::RefinementLimit); }
         if !self.effects.active.insert(key) { return Ok(None); }
@@ -849,7 +905,10 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
             let body = index.body;
             let limits = irq_check_rupta::limits::configuration().expect("validated analysis limits");
             let mut bytes = body.local_decls.len().saturating_mul(std::mem::size_of::<Option<Source<'tcx>>>() * 4);
-            if bytes > limits.function_scratch_mib * 1024 * 1024 { return Err(QueryStop::ScratchLimit); }
+            if bytes > limits.function_scratch_mib * 1024 * 1024 {
+                self.budget.record_limit(QueryStop::ScratchLimit, "function effect-summary bytes", bytes, limits.function_scratch_mib * 1024 * 1024);
+                return Err(QueryStop::ScratchLimit);
+            }
             self.budget.reserve(bytes)?;
             let tcx = self.tcx;
             let normalize = |ty| instance.instantiate_mir_and_normalize_erasing_regions(tcx,
@@ -1016,7 +1075,10 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                     .saturating_add(alternatives.iter().map(|(conditions, source): &(Vec<(Source<'tcx>, Box<[u128]>, bool)>, Source<'tcx>)|
                         (source.nodes() + conditions.iter().map(|(source, values, _)| source.nodes() + values.len()).sum::<usize>())
                             * std::mem::size_of::<Source<'tcx>>() * 4).sum::<usize>());
-                if bytes > limits.function_scratch_mib * 1024 * 1024 { return Err(QueryStop::ScratchLimit); }
+                if bytes > limits.function_scratch_mib * 1024 * 1024 {
+                    self.budget.record_limit(QueryStop::ScratchLimit, "function effect-summary bytes", bytes, limits.function_scratch_mib * 1024 * 1024);
+                    return Err(QueryStop::ScratchLimit);
+                }
                 self.budget.scratch = scratch.saturating_add(self.effects.pending_bytes.saturating_sub(retained));
                 self.budget.reserve(bytes)?;
                 match &data.terminator().kind {

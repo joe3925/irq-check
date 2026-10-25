@@ -61,8 +61,17 @@ pub(crate) struct Flow<'tcx> {
     pub(crate) scalar_steps: HashMap<Point, usize>,
     pub(crate) evaluations: usize,
     pub(crate) changes: usize,
+    pub(crate) requirement_visits: usize,
+    pub(crate) requirement_repairs: usize,
+    pub(crate) requirement_repair_full: usize,
+    pub(crate) requirement_repair_affected: usize,
+    pub(crate) requirement_repair_visits: usize,
     pub(crate) generation: usize,
+    diagnostic_root: Option<usize>,
+    diagnostic_stop: Option<(Point, Address, QueryStop)>,
+    loss_origins: HashMap<usize, (Point, &'static str, &'static str)>,
     pub(crate) inputs: HashMap<usize, Vec<Point>>,
+    callees: HashMap<usize, Vec<(Location, usize)>>,
     pub(super) roots: HashSet<usize>,
     pub(crate) recursive: HashMap<usize, usize>,
 }
@@ -103,14 +112,20 @@ impl Flow<'_> {
 }
 
 impl<'a, 'tcx> Solver<'a, 'tcx> {
-    fn require(&mut self, id: usize) -> Result<(), QueryStop> {
+    fn require(&mut self, id: usize, schedule: bool) -> Result<(), QueryStop> {
+        if self.flow.active.as_ref().expect("active value-flow request").required.contains(&id) {
+            self.budget.charge(0)?;
+            self.flow.requirement_visits += 1;
+            return Ok(());
+        }
         let mut pending = vec![id];
         while let Some(id) = pending.pop() {
             self.budget.charge(0)?;
+            self.flow.requirement_visits += 1;
             let active = self.flow.active.as_mut().expect("active value-flow request");
             if !active.required.insert(id) { continue; }
             self.budget.reserve(std::mem::size_of::<usize>() * 8)?;
-            if self.flow.queued.contains(&id) { active.pending.push_front(id); }
+            if schedule && self.flow.queued.contains(&id) { active.pending.push_front(id); }
             let mut inputs: Vec<_> = self.flow.demands[id].inputs.iter().copied().collect();
             inputs.sort_unstable_by(|left, right| right.cmp(left));
             pending.extend(inputs);
@@ -132,6 +147,7 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                 && !self.controls.solving && self.flow.active.is_none();
             let stage_allowance = irq_check_rupta::limits::configuration().expect("validated analysis limits").scalar_steps;
             loop {
+                let stopped_conditions = self.controls.stopped_conditions.len();
                 let saved_refinement_limit = self.budget.refinement_limit;
                 if staged {
                     self.budget.refinement_limit = Some(self.budget.steps.saturating_add(stage_allowance)
@@ -143,6 +159,18 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                     Ok(values) => return ReadOutcome::Complete(values),
                     Err(reason) => reason,
                 };
+                if mode == RequestMode::RequiredBinding && self.budget.refinement_limit.is_none()
+                    && !self.controls.solving && self.flow.active.is_none()
+                    && self.controls.stopped_conditions.len() > stopped_conditions
+                    && matches!(reason, QueryStop::ControlMemory | QueryStop::RefinementLimit
+                        | QueryStop::ScratchLimit | QueryStop::AlternativeLimit)
+                {
+                    self.controls.epoch += 1;
+                    self.retain_completed();
+                    self.budget.scratch = scratch.saturating_add(self.flow.bytes.saturating_sub(stored));
+                    self.controls.dependency_stop = None;
+                    continue;
+                }
                 if mode != RequestMode::RequiredBinding || self.budget.refinement_limit.is_some()
                     || self.controls.solving || self.flow.active.is_some()
                     || !matches!(reason, QueryStop::RefinementLimit | QueryStop::TransferLimit
@@ -255,22 +283,18 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
         if let Some(current) = self.flow.current {
             self.flow.demands[current].cardinality = true;
         }
-        let mut successors = HashMap::<usize, Vec<usize>>::new();
         let mut pending = Vec::new();
-        for (&callee, inputs) in &self.flow.inputs {
-            self.budget.charge(inputs.len() * std::mem::size_of::<usize>() * 4)?;
-            for caller in inputs {
-                if caller.frame == frame && blocks.contains(&caller.location.block) {
-                    pending.push(callee);
-                }
-                successors.entry(caller.frame).or_default().push(callee);
+        for &(location, callee) in self.flow.callees.get(&frame).into_iter().flatten() {
+            self.budget.charge(std::mem::size_of::<usize>() * 4)?;
+            if blocks.contains(&location.block) {
+                pending.push(callee);
             }
         }
         let mut varying_frames = HashSet::new();
         while let Some(callee) = pending.pop() {
             self.budget.charge(std::mem::size_of::<usize>() * 4)?;
             if !varying_frames.insert(callee) { continue; }
-            pending.extend(successors.get(&callee).into_iter().flatten().copied());
+            pending.extend(self.flow.callees.get(&callee).into_iter().flatten().map(|(_, callee)| *callee));
         }
         for value in values {
             let mut lost = false;
@@ -412,7 +436,12 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
             let function = self.frames[self.flow.demands[current].key.point.frame].instance;
             if self.flow.function_bytes.get(&function).copied().unwrap_or(0).saturating_add(bytes)
                 > irq_check_rupta::limits::configuration().expect("validated analysis limits").function_scratch_mib * 1024 * 1024
-            { return Err(QueryStop::ScratchLimit); }
+            {
+                self.budget.record_limit(QueryStop::ScratchLimit, "function index bytes",
+                    self.flow.function_bytes.get(&function).copied().unwrap_or(0).saturating_add(bytes),
+                    irq_check_rupta::limits::configuration().expect("validated analysis limits").function_scratch_mib * 1024 * 1024);
+                return Err(QueryStop::ScratchLimit);
+            }
             self.budget.charge(bytes)?;
             self.flow.demands[current].indexes.insert(key);
             *self.flow.function_bytes.entry(function).or_default() += bytes;
@@ -495,6 +524,14 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
             else { vec![Alternative { value: Value::Bits(1), guards: Vec::new() }] };
         let input = self.entry_guard(frame, caller);
         let mut result = Vec::new();
+        let scoped_path = matches!(storage, Some(Object::Static(_)))
+            || storage.is_none() && values.iter().all(|value|
+            matches!(value.value, Value::Metadata(Metadata::Concrete(_))
+                | Value::Pointer(_, Metadata::Concrete(_))));
+        let binding_conditions: HashSet<_> = values.iter().chain(&targets).flat_map(|value|
+            value.guards.iter().filter(|(_, guard)| guard.required)
+                .map(|(frame, guard)| Point { frame: *frame, location: guard.branch })).collect();
+        let mut path_conditions = HashSet::new();
         for value in values {
             for target in &targets {
                 if matches!(target.value, Value::Function(instance) if instance != self.frames[frame].instance) { continue; }
@@ -504,6 +541,10 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                     for (owner, guard) in &mut path_guards {
                         guard.required = refine
                             && !value.guards.contains(&(*owner, Guard { required: false, ..*guard }));
+                        let condition = Point { frame: *owner, location: guard.branch };
+                        if scoped_path && guard.required && !binding_conditions.contains(&condition) {
+                            path_conditions.insert(condition);
+                        }
                     }
                     if let Some(guards) = self.merge(&guards, &path_guards)? {
                         result.push(Alternative { value: value.value, guards });
@@ -511,7 +552,7 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                 }
             }
         }
-        let values = self.feasible(result)?;
+        let values = self.feasible_with_paths(result, &path_conditions)?;
         let mut result = Vec::new();
         for value in values {
             let mut guards = value.guards;
@@ -592,6 +633,7 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
     }
 
     pub(crate) fn begin_query(&mut self, limit: usize) {
+        self.impacts.stopped.clear();
         self.controls.stopped_conditions.retain(|key, _| key.generation == self.flow.generation);
         self.controls.stopped_bytes = self.controls.stopped_conditions.keys().map(|key|
             std::mem::size_of::<(super::control::ConditionKey, (Point, QueryStop))>() * 4
@@ -600,21 +642,20 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
         self.controls.dependency_stop = None;
         self.controls.causes.clear();
         self.controls.attempted_loops.clear();
-        if !self.controls.loop_fallbacks.is_empty() {
-            self.controls.loop_fallbacks.clear();
-            self.controls.epoch += 1;
-        }
         self.index_choices.clear();
         self.loop_entries = Box::new([]);
         self.cut_recursive_returns = false;
         self.retain_completed();
         self.flow.scalar_steps.clear();
         self.input_choices.clear();
-        self.budget = QueryBudget { steps: 0, limit, scratch: 0, refinement_limit: None };
+        self.condition_origin = None;
+        self.budget = QueryBudget { steps: 0, limit, scratch: 0, refinement_limit: None, limit_usage: None };
     }
 
     pub(crate) fn retain_completed(&mut self) {
         assert!(self.flow.active.is_none());
+        self.flow.diagnostic_root = None;
+        self.flow.diagnostic_stop = None;
         let mut invalid: HashSet<_> = self.flow.demands.iter().enumerate().filter_map(|(id, demand)| {
             (demand.state != DemandState::Complete
                 || demand.key.generation != self.flow.generation
@@ -648,6 +689,9 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                     + demand.key.choices.len() * std::mem::size_of::<((Point, mir::Local), u128)>() * 2
                     + demand.key.loop_entries.len() * std::mem::size_of::<Point>() * 2
                     + demand.key.inputs.len() * std::mem::size_of::<(usize, usize)>() * 2
+                    + demand.key.condition_origin.as_ref().map_or(0, |key|
+                        std::mem::size_of::<super::control::ConditionKey>() * 4
+                            + (key.choices.len() + key.inputs.len() + key.witnesses.len() + key.loop_entries.len()) * 64)
                     + (demand.inputs.len() + demand.users.len()) * std::mem::size_of::<usize>() * 4
                     + demand.indexes.len() * std::mem::size_of::<(Point, mir::Local)>() * 4
                     + demand.values.len() * std::mem::size_of::<Alternative<'tcx>>() * 2
@@ -658,6 +702,8 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                 self.flow.ids.insert(demand.key.clone(), id);
             }
             self.flow.demands = retained;
+            self.flow.loss_origins = self.flow.loss_origins.drain().filter_map(|(id, origin)|
+                remap.get(&id).map(|&id| (id, origin))).collect();
             self.flow.queued.clear();
         }
     }
@@ -667,6 +713,7 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
         if inputs.contains(&caller) { return; }
         let previous = inputs.len();
         inputs.push(caller);
+        self.flow.callees.entry(caller.frame).or_default().push((caller.location, frame));
         self.flow.ancestors.clear();
         self.flow.ancestor_bytes = 0;
         if previous == 0 && !self.flow.roots.contains(&frame) { return; }
@@ -923,6 +970,8 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                                 }
                             }
                             if !overlaps { break; }
+                            self.record_value_loss(at, "inline assembly can change the storage binding",
+                                "inline assembly can change the storage binding");
                             result.push(Alternative {
                                 value: Value::Unknown(
                                     "inline assembly can change the storage binding",
@@ -1158,7 +1207,16 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                 }
                 let mut result = Vec::new();
                 if callers.is_empty() || self.flow.roots.contains(&point.frame) {
-                    result.extend(if let Some(&value) = self.root_scalar_witness.get(&point.frame) && address.offset == 0
+                    if frame.unknown_entry {
+                        self.record_value_loss(point, "the caller inputs are not retained in this function summary",
+                            "the shared function summary has no caller inputs");
+                    }
+                    result.extend(if frame.unknown_entry {
+                        vec![Alternative {
+                            value: Value::Unknown("the caller inputs are not retained in this function summary"),
+                            guards: Vec::new(),
+                        }]
+                    } else if let Some(&value) = self.root_scalar_witness.get(&point.frame) && address.offset == 0
                         && matches!(requested.kind(), ty::Int(_) | ty::Uint(_) | ty::Bool)
                         && frame.instance.instantiate_mir_and_normalize_erasing_regions(
                             self.tcx, TypingEnv::fully_monomorphized(),
@@ -1321,6 +1379,14 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                 return self.bounded(result);
             }
         }
+        if (self.controls.solving || self.controls.proving_assertion || self.cut_recursive_returns)
+            && matches!(address.object, Object::Static(_)) {
+            for instance in self.discovery_roots.clone() {
+                if self.preserves_storage(instance, address, requested)? || self.read_only(instance, false)? { continue; }
+                self.controls.dependency_stop.get_or_insert((self.refinement_origin.unwrap_or(point), QueryStop::ControlMemory));
+                return Err(QueryStop::ControlMemory);
+            }
+        }
         if !callers.is_empty() {
             let mut result = Vec::new();
             for caller in callers {
@@ -1354,7 +1420,11 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
         };
         if matches!(address.object, Object::Static(_) | Object::Heap(_)) {
             for instance in self.discovery_roots.clone() {
-                if self.preserves_storage(instance, address, requested) || self.read_only(instance, false)? { continue; }
+                if self.preserves_storage(instance, address, requested)? || self.read_only(instance, false)? { continue; }
+                if self.controls.solving || self.controls.proving_assertion || self.cut_recursive_returns {
+                    self.controls.dependency_stop.get_or_insert((self.refinement_origin.unwrap_or(point), QueryStop::ControlMemory));
+                    return Err(QueryStop::ControlMemory);
+                }
                 if !irq_check_rupta::util::type_util::has_instance_mir(self.tcx, instance.def) {
                     values.push(Alternative {
                         value: Value::Unknown("an initialization root has no checked memory effect"), guards: Vec::new(),
@@ -1425,12 +1495,17 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
             if exposed {
                 for definition in index.memory.get(&block).into_iter().flatten() {
                     let site = (self.frames[frame].instance, definition.location);
-                    let mut preserved = range.is_some() && !self.cut_recursive_returns && definition.place.is_none()
+                    let mut preserved = false;
+                    if range.is_some() && !self.cut_recursive_returns && definition.place.is_none()
                         && definition.location.statement_index == index.body.basic_blocks[block].statements.len()
                         && self.facts.covered_calls.contains(&site)
-                        && self.facts.safe_candidates.get(&site).is_some_and(|targets|
-                            !targets.is_empty() && targets.iter().all(|target|
-                                self.preserves_storage(*target, address, requested)));
+                        && let Some(targets) = self.facts.safe_candidates.get(&site).cloned().filter(|targets| !targets.is_empty())
+                    {
+                        preserved = true;
+                        for target in targets {
+                            if !self.preserves_storage(target, address, requested)? { preserved = false; break; }
+                        }
+                    }
                     preserved |= definition.place.is_none()
                         && definition.location.statement_index == index.body.basic_blocks[block].statements.len()
                         && matches!(index.body.basic_blocks[block].terminator().kind,
@@ -1612,6 +1687,8 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
         let bytes = (std::mem::size_of_val(&key) + std::mem::size_of::<usize>()) * 4;
         let id = self.choice_values.len();
         if id.saturating_add(1).saturating_mul(bytes) > self.cache_limit / 16 {
+            self.budget.record_limit(QueryStop::ScratchLimit, "choice cache bytes",
+                id.saturating_add(1).saturating_mul(bytes), self.cache_limit / 16);
             if std::env::var_os("IRQ_CHECK_TRACE").is_some() {
                 eprintln!("irq-check: choice storage limit entries={id} bytes={} limit={}", id * bytes, self.cache_limit / 16);
             }
@@ -1627,6 +1704,9 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
 
     fn flow_values(&mut self, id: usize) -> Result<Vec<Alternative<'tcx>>, QueryStop> {
         let demand = &self.flow.demands[id];
+        if self.flow.current.is_none() && demand.values.iter().any(|value| matches!(value.value, Value::Unknown(_))) {
+            self.flow.diagnostic_root = Some(id);
+        }
         let point = demand.key.point;
         let source = demand.key.address;
         let requested = demand.key.ty;
@@ -1749,11 +1829,14 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
             cut_recursive_returns: self.cut_recursive_returns,
             inputs: inputs.into_boxed_slice(),
             alias_object: if control || scalar { None } else { self.alias_object },
-            refinement_origin: origin, control,
+            refinement_origin: origin, condition_origin: self.condition_origin.clone(), control,
         };
         if self.flow.current.is_none() && self.flow.queued.is_empty()
             && self.flow.bytes > self.cache_limit / 2
         {
+            self.flow.diagnostic_root = None;
+            self.flow.diagnostic_stop = None;
+            self.flow.loss_origins.clear();
             self.flow.demands.clear();
             self.flow.ids.clear();
             self.flow.queued.clear();
@@ -1792,8 +1875,14 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                 + key.choices.len() * std::mem::size_of::<((Point, mir::Local), u128)>() * 2
                 + key.loop_entries.len() * std::mem::size_of::<Point>() * 2
                 + key.inputs.len() * std::mem::size_of::<(usize, usize)>() * 2;
+            let bytes = bytes + key.condition_origin.as_ref().map_or(0, |key|
+                std::mem::size_of::<super::control::ConditionKey>() * 4
+                    + (key.choices.len() + key.inputs.len() + key.witnesses.len() + key.loop_entries.len()) * 64);
             let function = self.frames[key.point.frame].instance;
             if self.flow.function_bytes.get(&function).copied().unwrap_or(0).saturating_add(bytes) > irq_check_rupta::limits::configuration().expect("validated analysis limits").function_scratch_mib * 1024 * 1024 {
+                self.budget.record_limit(QueryStop::ScratchLimit, "function demand bytes",
+                    self.flow.function_bytes.get(&function).copied().unwrap_or(0).saturating_add(bytes),
+                    irq_check_rupta::limits::configuration().expect("validated analysis limits").function_scratch_mib * 1024 * 1024);
                 if std::env::var_os("IRQ_CHECK_TRACE").is_some() {
                     eprintln!("irq-check: value-flow demand storage limit function={function} bytes={} total={} demands={}",
                         self.flow.function_bytes[&function], self.flow.bytes, self.flow.demands.len());
@@ -1839,6 +1928,9 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                 for function in [dependency, consumer] {
                     let bytes = std::mem::size_of::<usize>() * if dependency == consumer { 8 } else { 4 };
                     if self.flow.function_bytes.get(&function).copied().unwrap_or(0).saturating_add(bytes) > irq_check_rupta::limits::configuration().expect("validated analysis limits").function_scratch_mib * 1024 * 1024 {
+                        self.budget.record_limit(QueryStop::ScratchLimit, "function dependency bytes",
+                            self.flow.function_bytes.get(&function).copied().unwrap_or(0).saturating_add(bytes),
+                            irq_check_rupta::limits::configuration().expect("validated analysis limits").function_scratch_mib * 1024 * 1024);
                         if std::env::var_os("IRQ_CHECK_TRACE").is_some() {
                             eprintln!("irq-check: value-flow dependency storage limit function={function} bytes={} total={} demands={}",
                                 self.flow.function_bytes[&function], self.flow.bytes, self.flow.demands.len());
@@ -1855,13 +1947,14 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                     .ok_or(QueryStop::ScratchLimit)?;
                 self.budget.charge(std::mem::size_of::<usize>() * 8)?;
             }
-            self.require(id)?;
+            self.require(id, true)?;
             return self.flow_values(id);
         }
         let saved_choices = self.index_choices.clone();
         let saved_inputs = self.input_choices.clone();
         let saved_alias = self.alias_object;
         let saved_origin = self.refinement_origin;
+        let saved_condition = self.condition_origin.clone();
         let scratch = self.budget.scratch;
         let initial_bytes = self.flow.bytes;
         let before_request = self.budget.steps;
@@ -1872,7 +1965,7 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
             required: HashSet::new(), pending: VecDeque::new(), stopped_at: None, steps: 0,
         });
         let result = (|| {
-            self.require(id)?;
+            self.require(id, true)?;
             while let Some(current) = self.flow.active.as_mut().unwrap().pending.pop_front() {
                 self.flow.active.as_mut().unwrap().stopped_at = Some(current);
                 self.budget.charge(0)?;
@@ -1893,6 +1986,7 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                 self.alias_object = key.alias_object;
                 let origin = key.refinement_origin;
                 self.refinement_origin = origin;
+                self.condition_origin = key.condition_origin.clone();
                 self.flow.current = Some(current);
                 self.flow.current_inputs.clear();
                 self.flow.evaluations += 1;
@@ -1955,6 +2049,16 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                         .map(|value| value.guards.len()).sum::<usize>()
                         > irq_check_rupta::limits::configuration().expect("validated analysis limits").alternatives);
                 if summarize {
+                    if self.controls.solving || self.controls.proving_assertion || self.cut_recursive_returns {
+                        self.budget.record_limit(QueryStop::AlternativeLimit, "loop guard entries",
+                            self.flow.demands[current].values.iter().chain(values.iter()
+                                .filter(|value| !self.flow.demands[current].values.contains(value)))
+                                .map(|value| value.guards.len()).sum(),
+                            irq_check_rupta::limits::configuration().expect("validated analysis limits").alternatives);
+                        self.controls.dependency_stop.get_or_insert((key.point, QueryStop::AlternativeLimit));
+                        self.flow.enqueue(current);
+                        return Err(QueryStop::AlternativeLimit);
+                    }
                     let mut joined = self.flow.demands[current].values.clone();
                     for value in values {
                         if !joined.contains(&value) { joined.push(value); }
@@ -1993,6 +2097,15 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                     widen = true;
                     values = vec![top];
                 }
+                if !self.flow.loss_origins.contains_key(&current) && self.flow.loss_origins.len() < 128 {
+                    let origin = self.flow.current_inputs.iter().take(128).filter_map(|input| {
+                        let origin = *self.flow.loss_origins.get(input)?;
+                        (values.iter().any(|value| value.value == Value::Unknown(origin.1))
+                            && self.flow.demands[*input].values.iter().any(|value| value.value == Value::Unknown(origin.1)))
+                            .then_some((*input, origin))
+                    }).min_by_key(|(input, _)| *input).map(|(_, origin)| origin);
+                    if let Some(origin) = origin { self.flow.loss_origins.insert(current, origin); }
+                }
                 if widen {
                     for value in &self.flow.demands[current].values {
                         if matches!(value.value, Value::Function(_)) && value.path_proven()
@@ -2016,7 +2129,7 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                     if !removed.is_empty() {
                         self.budget.charge(removed.len() * std::mem::size_of::<usize>() * 4)?;
                         let consumer = self.frames[key.point.frame].instance;
-                        for input in removed {
+                        for &input in &removed {
                             self.flow.demands[current].inputs.remove(&input);
                             self.flow.demands[input].users.remove(&current);
                             self.flow.demands[input].users.shrink_to_fit();
@@ -2028,17 +2141,53 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                             self.flow.bytes = self.flow.bytes.saturating_sub(std::mem::size_of::<usize>() * 8);
                         }
                         self.flow.demands[current].inputs.shrink_to_fit();
-                        let active = self.flow.active.as_mut().unwrap();
-                        let mut pending = std::mem::take(&mut active.pending);
-                        active.required.clear();
-                        self.require(id)?;
-                        let active = self.flow.active.as_mut().unwrap();
-                        pending.retain(|id| active.required.contains(id) && self.flow.queued.contains(id));
-                        let mut queued: HashSet<_> = pending.iter().copied().collect();
-                        for id in active.pending.drain(..) {
-                            if queued.insert(id) { pending.push_back(id); }
+                        self.flow.requirement_repairs += 1;
+                        self.flow.requirement_repair_full += self.flow.active.as_ref().unwrap().required.len();
+                        let repair_scratch = self.budget.scratch;
+                        let mut affected = HashSet::new();
+                        let mut pending = removed;
+                        self.budget.reserve(pending.capacity() * std::mem::size_of::<usize>())?;
+                        while let Some(input) = pending.pop() {
+                            self.budget.charge(0)?;
+                            self.flow.requirement_repair_visits += 1;
+                            if input == id || input == current
+                                || !self.flow.active.as_ref().unwrap().required.contains(&input)
+                                || self.flow.demands[input].users.contains(&id)
+                                || self.flow.demands[input].users.contains(&current)
+                                || !affected.insert(input)
+                            { continue; }
+                            self.budget.reserve(std::mem::size_of::<usize>() * 8)?;
+                            let capacity = pending.capacity();
+                            pending.extend(self.flow.demands[input].inputs.iter().copied());
+                            self.budget.reserve((pending.capacity() - capacity) * std::mem::size_of::<usize>())?;
                         }
-                        active.pending = pending;
+                        self.flow.requirement_repair_affected += affected.len();
+                        if !affected.is_empty() {
+                            self.budget.reserve(affected.len() * std::mem::size_of::<usize>())?;
+                            let mut anchors = Vec::with_capacity(affected.len());
+                            for &input in &affected {
+                                for &user in &self.flow.demands[input].users {
+                                    self.budget.charge(0)?;
+                                    self.flow.requirement_repair_visits += 1;
+                                    if self.flow.active.as_ref().unwrap().required.contains(&user)
+                                        && !affected.contains(&user)
+                                    {
+                                        anchors.push(input);
+                                        break;
+                                    }
+                                }
+                            }
+                            anchors.sort_unstable();
+                            let active = self.flow.active.as_mut().unwrap();
+                            let required = active.required.len();
+                            for input in &affected { active.required.remove(input); }
+                            for input in anchors { self.require(input, false)?; }
+                            let active = self.flow.active.as_mut().unwrap();
+                            if active.required.len() != required {
+                                active.pending.retain(|id| active.required.contains(id) && self.flow.queued.contains(id));
+                            }
+                        }
+                        self.budget.scratch = repair_scratch;
                     }
                 }
                 let mut joined = if widen || summarize { Vec::new() } else { self.flow.demands[current].values.clone() };
@@ -2046,6 +2195,9 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                     if !joined.contains(&value) { joined.push(value); }
                 }
                 if scalar && joined.iter().any(|value| matches!(value.value, Value::Unknown(_)) && value.guards.is_empty()) {
+                    if let Some((_, reason, _)) = self.flow.loss_origins.get_mut(&current) {
+                        *reason = "the scalar value is not proved";
+                    }
                     joined = vec![Alternative {
                         value: Value::Unknown("the scalar value is not proved"), guards: Vec::new(),
                     }];
@@ -2081,6 +2233,8 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                     let function_bytes = self.flow.function_bytes.get(&function).copied().unwrap_or(0)
                         .saturating_sub(old_bytes).saturating_add(new_bytes);
                     if function_bytes > irq_check_rupta::limits::configuration().expect("validated analysis limits").function_scratch_mib * 1024 * 1024 {
+                        self.budget.record_limit(QueryStop::ScratchLimit, "function alternative bytes", function_bytes,
+                            irq_check_rupta::limits::configuration().expect("validated analysis limits").function_scratch_mib * 1024 * 1024);
                         if std::env::var_os("IRQ_CHECK_TRACE").is_some() {
                             eprintln!("irq-check: value-flow alternative storage limit function={function} bytes={function_bytes} total={} demands={}",
                                 self.flow.bytes, self.flow.demands.len());
@@ -2126,6 +2280,8 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                 }
                 self.budget.scratch = scratch.saturating_add(self.flow.bytes.saturating_sub(initial_bytes));
                 if self.budget.scratch > irq_check_rupta::limits::configuration().expect("validated analysis limits").query_scratch_mib * 1024 * 1024 {
+                    self.budget.record_limit(QueryStop::ScratchLimit, "query worklist bytes", self.budget.scratch,
+                        irq_check_rupta::limits::configuration().expect("validated analysis limits").query_scratch_mib * 1024 * 1024);
                     if std::env::var_os("IRQ_CHECK_TRACE").is_some() {
                         eprintln!("irq-check: worklist scratch limit bytes={} initial={initial_bytes} stored={}",
                             self.budget.scratch, self.flow.bytes);
@@ -2149,11 +2305,32 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
         self.input_choices = saved_inputs;
         self.alias_object = saved_alias;
         self.refinement_origin = saved_origin;
+        self.condition_origin = saved_condition;
         let result = result.and_then(|()| self.flow_values(id));
         if result.is_err() && let Some(current) = self.flow.active.as_ref().unwrap().stopped_at {
             self.flow.enqueue(current);
         }
         let mut active = self.flow.active.take().unwrap();
+        if let Err(reason) = &result {
+            let demand = &self.flow.demands[active.stopped_at.unwrap_or(active.root)];
+            self.flow.diagnostic_stop = Some((demand.key.point, demand.key.address, *reason));
+        }
+        if let Err(reason @ (QueryStop::ControlMemory | QueryStop::RefinementLimit
+            | QueryStop::ScratchLimit | QueryStop::AlternativeLimit)) = &result
+            && let Some(current) = active.stopped_at
+            && let Some(key) = self.flow.demands[current].key.condition_origin.clone()
+            && key.generation == self.flow.generation
+        {
+            let bytes = std::mem::size_of::<(super::control::ConditionKey, (Point, QueryStop))>() * 4
+                + (key.choices.len() + key.inputs.len() + key.witnesses.len() + key.loop_entries.len()) * 64;
+            if self.controls.stopped_bytes.saturating_add(bytes) <= self.cache_limit / 16
+                && !self.controls.stopped_conditions.contains_key(key.as_ref())
+            {
+                self.controls.stopped_bytes += bytes;
+                self.controls.stopped_conditions.insert((*key).clone(),
+                    self.controls.dependency_stop.unwrap_or((self.flow.demands[current].key.point, *reason)));
+            }
+        }
         if let Err(reason) = &result
             && self.controls.dependency_stop.is_none()
         {
@@ -2205,5 +2382,99 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
         }
         self.budget.scratch = scratch;
         result
+    }
+
+    pub(super) fn record_value_loss(&mut self, point: Point, result: &'static str, cause: &'static str) {
+        if let Some(id) = self.flow.current
+            && (self.flow.loss_origins.len() < 128 || self.flow.loss_origins.contains_key(&id))
+        {
+            self.flow.loss_origins.entry(id).or_insert((point, result, cause));
+        }
+    }
+
+    pub(crate) fn explain_read(&self, stop: Option<QueryStop>) -> Vec<(rustc_span::Span, String)> {
+        let mut notes = Vec::new();
+        if let Some(reason) = stop {
+            let usage = match reason {
+                QueryStop::TransferLimit => Some(("query transfer steps", self.budget.steps, self.budget.limit)),
+                _ => self.budget.limit_usage.filter(|(recorded, _, _, _, steps)| *recorded == reason && *steps == self.budget.steps)
+                    .map(|(_, resource, used, limit, _)| (resource, used, limit)),
+            };
+            if let Some((resource, used, limit)) = usage {
+                notes.push((rustc_span::DUMMY_SP, format!("analysis limit reached: {resource}: {used} used, {limit} allowed")));
+            } else {
+                notes.push((rustc_span::DUMMY_SP, format!("analysis stopped with {reason:?}; exact resource usage was not retained")));
+            }
+            let point = self.flow.diagnostic_stop.filter(|(_, _, recorded)| *recorded == reason).map(|(point, _, _)| point)
+                .or_else(|| self.controls.dependency_stop.filter(|(_, recorded)| *recorded == reason).map(|(point, _)| point));
+            if let Some(point) = point {
+                let frame = self.frames[point.frame];
+                if let Some(index) = self.indexes.get(&(frame.instance, frame.irq)) {
+                    let block = &index.body.basic_blocks[point.location.block];
+                    let span = block.statements.get(point.location.statement_index)
+                        .map_or(block.terminator().source_info.span, |statement| statement.source_info.span);
+                    notes.push((span.source_callsite(), format!("analysis stopped while resolving a dependency in {}", frame.instance)));
+                }
+            }
+            notes.push((rustc_span::DUMMY_SP, "the stop location does not identify the source of excessive analysis work".into()));
+            return notes;
+        }
+        let Some(root) = self.flow.diagnostic_root.filter(|id| *id < self.flow.demands.len()) else { return notes; };
+        let mut pending = VecDeque::from([root]);
+        let mut seen = HashSet::from([root]);
+        let mut truncated = false;
+        while let Some(id) = pending.pop_front() {
+            let demand = &self.flow.demands[id];
+            let Some(reason) = demand.values.iter().find_map(|value| match value.value {
+                Value::Unknown(reason) => Some(reason), _ => None,
+            }) else { continue; };
+            if let Some(&(point, result, cause)) = self.flow.loss_origins.get(&id)
+                && demand.values.iter().any(|value| value.value == Value::Unknown(result))
+            {
+                let frame = self.frames[point.frame];
+                if let Some(index) = self.indexes.get(&(frame.instance, frame.irq)) {
+                    let block = &index.body.basic_blocks[point.location.block];
+                    let span = block.statements.get(point.location.statement_index)
+                        .map_or(block.terminator().source_info.span, |statement| statement.source_info.span).source_callsite();
+                    let note = (span, format!("information was lost at this operation: {cause}"));
+                    if !notes.contains(&note) { notes.push(note); }
+                    if notes.len() == 3 { truncated = true; break; }
+                }
+            }
+            truncated |= demand.inputs.len() > 128;
+            let mut inputs: Vec<_> = demand.inputs.iter().take(128).copied().filter(|input|
+                self.flow.demands[*input].values.iter().any(|value| matches!(value.value, Value::Unknown(_)))).collect();
+            inputs.sort_unstable();
+            if inputs.is_empty() || id == root {
+                let point = demand.key.point;
+                let frame = self.frames[point.frame];
+                if let Some(index) = self.indexes.get(&(frame.instance, frame.irq)) {
+                    let block = &index.body.basic_blocks[point.location.block];
+                    let span = block.statements.get(point.location.statement_index)
+                        .map_or(block.terminator().source_info.span, |statement| statement.source_info.span).source_callsite();
+                    let object = match demand.key.address.object {
+                        Object::Static(def) => format!("static {}", self.tcx.def_path_str(def)),
+                        Object::Local(owner, local) | Object::PriorLocal(owner, local) | Object::SummaryLocal(owner, local) =>
+                            format!("local {local:?} in {}", self.frames[owner].instance),
+                        Object::Heap(at) => format!("allocation in {}", self.frames[at.frame].instance),
+                        Object::Allocation(_) => "constant allocation".into(),
+                    };
+                    let note = (span, format!("unresolved storage read recorded during this query: {reason}; {object}, byte offset {}", demand.key.address.offset)
+                        .chars().take(512).collect());
+                    if !notes.contains(&note) { notes.push(note); }
+                    if notes.len() == 3 { truncated |= !pending.is_empty() || !inputs.is_empty(); break; }
+                }
+            }
+            for input in inputs {
+                if seen.len() >= 128 { truncated = true; break; }
+                if seen.insert(input) { pending.push_back(input); }
+            }
+        }
+        notes.push((rustc_span::DUMMY_SP, if truncated {
+            "the dependency explanation is bounded; it does not identify every loss of information"
+        } else {
+            "these are recorded unresolved reads; the first loss of information is not established"
+        }.into()));
+        notes
     }
 }

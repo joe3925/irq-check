@@ -1,0 +1,92 @@
+{
+  "date_utc": "2026-10-10",
+  "driver_sha256": "6BEA8248301918E96A979B9306E6A7BC8CA57C9034DCF2DBD14FFB0D503F47E1",
+  "changes": [
+    "Pointer null checks identified by Rust diagnostic items use value-only contexts. Their bodies are still checked.",
+    "Unknown writes do not change immutable static storage when its type has no interior mutability.",
+    "The same read-only rule is used for serial reads, parallel reads and opaque-call writes.",
+    "Mutable statics and storage with interior mutability remain exposed to unknown writes. References from read-only storage are still followed.",
+    "The measurement result now includes the scenario process peak commit separately from dependency compiler peaks."
+  ],
+  "limits": "No memory limit. No time limit.",
+  "kernel_like_baseline": {
+    "driver_sha256": "4F45B89C2A2AD49E44DF8C47C7C871512FB91752A212F7F2BD3C7AA14B9C73B9",
+    "evidence": "target/scenarios/memory-20261010-211141-7410199",
+    "sampled_peak_private_bytes": 18126364672,
+    "process_peak_commit_bytes": 18140418048,
+    "elapsed_seconds": 397.4908399,
+    "exit_code": 101,
+    "reason": "completed",
+    "verdict": "The old checker also rejected unresolved IRQ calls. Both runs report the same set of diagnostic source locations; diagnostic counts differ.",
+    "private_memory_reduction_percent": 83.1
+  },
+  "source_changes": "The scenario sources and features are unchanged from the recorded baseline cases.",
+  "existing_scenario_checks": {
+    "evidence": "target/scenarios/20261010-211050-5049766",
+    "runner_exit_code": 0,
+    "pairs": ["formatting", "mixed-dyn", "correlated-dyn", "erased-records", "pointer-alias", "context-growth"],
+    "result": "All six safe cases were accepted. All six negative cases were rejected for the expected forbidden call. The runner also checked the saved call graph."
+  },
+  "runs": [
+    {
+      "scenario": "memory-growth",
+      "handlers": 1,
+      "case": "Final repeat with analysis evidence",
+      "evidence": "target/scenarios/memory-20261010-211837-2936348",
+      "dump": "target/memory-growth-fixed-diagnosis/memory_growth.json",
+      "sampled_peak_private_bytes": 10862592,
+      "process_peak_commit_bytes": 155189248,
+      "exit_code": 0,
+      "reason": "completed",
+      "incomplete": false,
+      "saved_call_sites": 438,
+      "graph_edges": 440,
+      "mutable_record_is_null_contexts": 4,
+      "const_record_is_null_contexts": 4,
+      "baseline_mutable_record_is_null_contexts": 6956,
+      "baseline_const_record_is_null_contexts": 7183
+    },
+    {
+      "scenario": "memory-growth",
+      "handlers": 1,
+      "evidence": "target/scenarios/memory-20261010-210734-5444826",
+      "sampled_peak_private_bytes": 10964992,
+      "process_peak_commit_bytes": 155021312,
+      "exit_code": 0,
+      "reason": "completed",
+      "context_batches": 156,
+      "scans": 1280,
+      "blocks": 5436
+    },
+    {
+      "scenario": "memory-growth-roots",
+      "features": "roots-17",
+      "handlers": 17,
+      "evidence": "target/scenarios/memory-20261010-210802-0263741",
+      "sampled_peak_private_bytes": 144445440,
+      "process_peak_commit_bytes": 189190144,
+      "exit_code": 0,
+      "reason": "completed"
+    },
+    {
+      "scenario": "kernel-memory",
+      "features": "escape,formatting,dispatch",
+      "handlers": 1,
+      "evidence": "target/scenarios/memory-20261010-210824-8065807",
+      "sampled_peak_private_bytes": 3060645888,
+      "process_peak_commit_bytes": 3084488704,
+      "exit_code": 101,
+      "reason": "completed",
+      "verdict": "Rejected: unresolved IRQ call paths. This is not a successful policy check.",
+      "context_batches": 4734,
+      "scans": 268594,
+      "blocks": 11682124
+    }
+  ],
+  "notes": [
+    "A fast compile can finish between private-memory samples. Use the process peak commit counter for the fast cases, not their sampled private value alone.",
+    "The kernel-like case still has a substantial formatting and iteration cost. This change does not remove all context growth.",
+    "The actual rustOS kernel has not been checked with this build.",
+    "No new tests were added."
+  ]
+}

@@ -1,0 +1,303 @@
+Kernel memory audit, 11 October 2026
+
+Follow-up: lock and pending-state fixes, 20:00 UTC
+
+The earlier memory reduction did not establish convergence. The old kernel
+run later reached 109,482 contexts and 105,375 pending contexts. Over a
+3,519.6-second window it completed 94,208 context scans, created 11,256
+contexts, and increased pending work by 14,557. Private memory subsequently
+exceeded 85 GiB before that diagnostic run was stopped.
+
+Three further change groups are now implemented:
+
+1. Tree sharing checks for an equal tree under a read lock. A miss takes the
+   write lock and checks again before insertion. Full equality is still
+   required; the hash is not accepted as proof of equality.
+
+2. Fact storage copies a snapshot under a read lock, then computes the update
+   and its differences outside the write lock. Commit checks object identity
+   and version. If either changed, the operation retries from a new snapshot.
+   The update callback has no external side effects. Committed differences,
+   not a failed attempt, control publication and redundant-write accounting.
+
+3. The worker applies its existing live-state and partition preparation at
+   enqueue as well as dequeue. It rejects states already seen or covered by
+   the widened state for that location and partition. It also removes covered
+   queued states when widening advances. Queue scans are rate-limited by queue
+   growth. The widening thresholds and reference limits are unchanged. The
+   counters covered-pending-states and pruned-pending-states show this work.
+   Scratch storage is reused, rather than allocated for each preparation.
+
+Files changed in this follow-up:
+  src/analysis.rs
+  src/pointer.rs
+  src/analysis/worker.rs
+
+Each group passed all 32 existing results, with the 18 scenarios launched
+together. No tests or source comments were added. Valid result sets:
+  target/root-cause-study/read-first-trees-20261011-193826-6528792/results.json
+  target/root-cause-study/optimistic-facts-retry-20261011-195033-5394683/results.json
+  target/root-cause-study/covered-frontier-20261011-195543-2351742/results.json
+
+The first optimistic-facts pass ran out of disk space during its 14 negative
+cases. Those results are not validation passes. The full retry passed.
+
+Latest kernel-memory result: exit 0, complete, 17,461 retained contexts,
+56 retired contexts, 590,458,880 bytes peak sampled commit. This is close to
+the preceding build's 592,502,784 bytes, not a large measured memory saving.
+
+Final driver SHA256 for this follow-up:
+  6EB971311CE7994B522272C627A1E5AF78DEE3993BD552995C1B7BA963323BE3
+Fresh full-kernel evidence:
+  target/scenarios/memory-20261011-195940-8494699-14ec3d1f
+The full-kernel run has no time or memory limit. Full convergence and the
+late-stage memory effect of these fixes are not yet verified.
+
+The user deleted storage-full.dmp and final-values-full.dmp to free disk
+space. Their text measurements remain. The sections below describe earlier
+snapshots and the previous handoff, not the current run status.
+
+Status
+
+The storage changes passed the existing 18 scenarios and 14 negative cases
+after each of six change groups. No new tests were added. The full kernel
+check is still in progress. This report does not claim kernel verification.
+No IRQ rule, unknown-call rule, context boundary, or numeric-pointer rule was
+weakened. The final run has no memory limit and no time limit.
+
+Final build check, sampled at 12:36:25 UTC
+
+The final run passed the old sample in both facts and processed blocks:
+
+                         Old baseline       Final build
+Private bytes            22,247,874,560       12,787,630,080
+Working set              20,350,869,504       12,453,474,304
+Facts                    485,839             511,972
+Contexts                 42,322              43,225
+Blocks processed         260,394,080         266,639,656
+Policy roots             17                  17
+Scans                    526,709             526,414
+Pending contexts         17,868              29,038
+Elapsed seconds          1,600.5             1,661.5
+
+Private memory is 11.91 GiB versus 20.72 GiB, a reduction of about 42.5%.
+The final sample has 5.4% more facts and 2.4% more processed blocks. Thus,
+the reduction is not explained by the final run being at an earlier stage.
+The states and queue contents still differ, so this is not an exact replay.
+The final process was not suspended for this sample. Its memory readings and
+the latest progress line were read close together, not as one atomic capture.
+Physical memory free at the sample was about 11.7 GiB.
+
+The final build does not show a large further private-memory reduction over
+the two intermediate changed builds. Those snapshots were about 12 GiB.
+Do not add their individual structure savings to the final process saving.
+
+The final driver remains active as PID 47348. Kernel verification has not
+finished. No further source changes or test runs are active at handoff.
+
+Causes and changes
+
+1. Copy-on-write maps copied spare capacity after entries were removed.
+   Flow maps and tree maps now copy live entries when capacity is excessive.
+   Unique maps and fact sets are compacted at state storage points. Shared
+   maps are not copied only to compact them.
+
+2. Equal memory shapes had separate map allocations.
+   memory_shape now returns a shared clone when the result equals its input.
+   Equality covers the complete state. Later writes still use copy-on-write.
+
+3. Small trees were excluded from sharing. Trees were shared too late, after
+   queued states had already accumulated. Binding and context stamping then
+   made new copies of trees that had been shared earlier.
+   The shared weak pool now accepts all tree sizes. States are processed
+   before enqueue. Arguments, return values, and bound context memory are
+   shared after their final transformation. A hash only selects candidates;
+   pointer identity or full value equality is required before reuse.
+
+4. Reference caches contained duplicate bases and spare vector capacity.
+   Reference lists now keep each base once, in first-seen order, and release
+   spare capacity. Graph edge vectors release capacity after deduplication.
+   Captured graph vector requests fell from 417,418,176 to 22,307,600 bytes.
+
+5. bind_tree built a fact set, then copied it into a second set to normalize
+   it. It now normalizes the first set in place and removes excess capacity.
+
+6. join_facts inserted numeric facts that an existing Unknown fact would
+   immediately remove. It now skips those insertions. It also releases
+   excess capacity after the existing reduction. The existing threshold of
+   eight numeric facts is unchanged. Reference and function facts are kept.
+
+Source files changed for these six groups:
+  src/analysis.rs
+  src/analysis/worker.rs
+Other changes in the working tree predate this work and are not claimed here.
+
+Comparable snapshots
+
+All byte counts below are decimal bytes. GiB means bytes / 1,073,741,824.
+Private bytes measure process private committed memory, not virtual address
+space and not working set. Requested allocation bytes exclude heap padding.
+
+                         Old baseline       Storage changes    Final-value sharing
+Capture UTC              09:03:27            11:02:21            11:50:11
+Private bytes            22,247,874,560       12,912,902,144      12,868,091,904
+Working set              20,350,869,504       11,920,838,656      11,562,950,656
+Elapsed seconds          1,600.5             1,845.4             1,980.4
+Facts                    485,839             486,554             488,011
+Contexts                 42,322              41,911              39,020
+Blocks processed         260,394,080         289,163,952         290,839,329
+Policy roots             17                  17                  17
+Worker pending states    903,123             74,893              337,037
+
+The storage snapshot uses about 42% less private memory than the baseline.
+It is not merely an earlier snapshot: it has slightly more facts and about
+11% more processed blocks. These are similar stages, not identical states.
+Worker scheduling and pending-state counts differ. Do not infer a precise
+speed improvement from these samples. The final-value run also overlapped a
+scenario run, which caused paging. Its elapsed time is not a clean speed test.
+
+Actual stored analysis structures
+
+These figures count unique allocations reachable from captured roots.
+Worker copies, pending queues, seen states, caches, and shared pools are
+included. Shared pointers are deduplicated. Table sizes include capacity.
+
+Requested bytes          Old baseline       Storage changes    Final-value sharing
+Flow map buckets         6,190,647,340        1,907,148,000       2,471,957,768
+Tree value tables        1,955,460,720          776,823,328         503,649,944
+Fact sets                5,723,890,028        3,792,693,104       2,950,333,212
+Arc allocations          1,099,655,696          479,965,696         288,743,424
+Return vectors             119,076,056          131,067,024         125,285,336
+Argument vectors            10,018,456           10,631,600          10,149,776
+Tree path buffers          110,507,576           74,968,712          61,904,092
+Address path buffers        11,725,616           10,242,604           5,362,156
+Reference cache buffers    263,481,344           79,279,360          29,532,736
+Other counted metadata     824,847,116          729,022,164         745,729,296
+Return table                 4,268,412            4,267,584           4,268,688
+Traversal vectors                1,616               33,200              10,880
+Traversal sets                   1,580                1,580               1,580
+
+Counts                   Old baseline       Storage changes    Final-value sharing
+Unique flow maps          2,551,995            1,681,496           1,903,621
+Unique trees             4,501,577            1,790,069             802,403
+Trees with <8 facts      4,280,367            1,568,998             671,747
+Empty trees                338,410              310,836              11,789
+Stored facts            15,987,077           11,217,694           8,598,319
+
+One context can retain many states, return alternatives, maps, and trees.
+Thus, a context count near 40,000 does not imply only 40,000 allocations.
+In the old sample, 749,668 published return alternatives alone held
+1,499,336 distinct memory maps: two per alternative.
+
+Final-value sharing removed 1,364,024,836 requested Windows-heap bytes from
+the counted analysis structures relative to the storage snapshot. However,
+flow map buckets grew by 564,809,768 bytes, and free Windows LFH cells grew
+by 685,947,008 bytes. The worker queue had 337,037 pending states instead of
+74,893. This explains why the process private size barely changed between
+those two samples. Freed objects do not necessarily release committed pages.
+Different pending work also prevents a strict one-change causal comparison.
+
+Complete committed-memory reconciliation: storage snapshot
+
+Captured process private bytes:                         12,912,902,144
+  Windows heaps:                                        10,278,854,656
+  Mimalloc committed pages:                              2,424,111,104
+  Other process private memory:                            209,936,384
+
+Windows heaps, reconciled to the byte:
+  Live requested allocations:                           7,342,818,569
+  Free LFH cells:                                       2,147,897,024
+  Padding in busy LFH cells:                               385,668,589
+  Active LFH backing storage beyond cells:                 167,507,664
+  Cached LFH backing blocks:                               61,823,760
+  LFH zone allocations:                                     5,291,024
+  Free NT heap blocks:                                    165,886,688
+  Padding in other busy NT heap blocks:                       381,882
+  Padding in heap virtual allocations:                       629,984
+  Segment metadata:                                          842,976
+  Other Windows heaps:                                       106,496
+  Total:                                              10,278,854,656
+
+The walk checked all 599 main-heap segments and all 71,465 active LFH
+subsegments. Free cells are committed allocator storage, not live facts.
+The largest free-cell classes were 544-byte cells (843,843,008 free bytes),
+2,192-byte cells (488,335,952), 1,104-byte cells (311,616,144), and 2,448-byte
+cells (137,083,104). A cell size alone does not prove the owning Rust type.
+
+Live Windows allocations assigned to named structures:   6,785,564,265
+  Analysis structures from the table above:              6,088,995,956
+  Graph table, edge buffers, and strings:                   29,784,889
+  Site vectors and normal buffers:                         21,851,968
+  Backend points-to tables and vectors:                   310,925,536
+  Backend edge outer indexes:                              10,965,728
+  Effect reader tables:                                    25,938,000
+  Escape alias tables:                                     34,296,356
+  Compiler middle arenas:                                 150,432,312
+  Compiler HIR arenas:                                     26,295,056
+  Compiler MIR direct vectors:                             80,438,336
+  MIR liveness and loop-header tables:                       5,403,584
+  Worker scratch outer vectors:                               236,544
+Live Windows allocations not yet assigned to types:        557,254,304
+
+The compiler arena count covers 32 workers. The MIR count covers 13,844
+bodies, 103,578 basic blocks, and 491,380 statements. It does not cover all
+nested compiler allocations. The remaining 557,254,304 bytes must not be
+called compiler memory by exclusion. They are live requests with no proven
+type assignment in this audit.
+
+Mimalloc reconciliation:
+  Known live flow-map bucket requests:                  1,907,148,000
+  Worker scratch buffer requests:                          37,556,936
+  Marked-used bytes beyond those requests:                 175,854,488
+  Free capacity within counted pages:                     160,465,984
+  Other committed page storage:                           143,085,696
+  Total:                                               2,424,111,104
+
+The 175,854,488-byte difference can include block rounding, deferred frees,
+and other worker buffers. It is not a measured live leak. The audit does not
+yet split all those parts. The 209,936,384 other process private bytes also
+have no complete type assignment. Thus, allocator accounting is complete
+for the captured main heap, but object-type accounting is not 100% complete.
+
+The old unexplained 5,112,119,864-byte remainder cannot be fully assigned
+after the fact: its full dump was not retained. The new complete dump proves
+that allocator free storage and padding form a large part of the remaining
+process memory. It does not prove the exact old distribution was the same.
+
+Validation and evidence
+
+All six valid scenario result sets contain 32 accepted results:
+  target/root-cause-study/compact-storage-20261011-101916-3704911/results.json
+  target/root-cause-study/shared-shapes-20261011-102304-2565963/results.json
+  target/root-cause-study/shared-pending-trees-verified-20261011-102736-0717207/results.json
+  target/root-cause-study/shared-final-values-20261011-111306-5801092/results.json
+  target/root-cause-study/bind-in-place-20261011-113359-4630774/results.json
+  target/root-cause-study/normalized-joins-20261011-120406-6339030/results.json
+
+Latest kernel-memory scenario:
+  Exit code 0; accepted; not incomplete; no compiler failure.
+  17,465 retained contexts; 56 retired contexts.
+  Peak sampled commit 592,723,968 bytes; elapsed 178.5635338 seconds.
+
+Final driver SHA256:
+  3F0FCCB11610AFEC937854140D171265E968FF34F5E3716BBC28270A488AC7D8
+Final full-kernel evidence directory:
+  target/scenarios/memory-20261011-120801-5685195-8080e7df
+The earlier diagnostic kernel runs were stopped on purpose. Their exit 101
+must not be presented as a completed verification failure.
+
+Primary memory evidence in target/memory-audit-tools:
+  storage-full.dmp; storage-roots.json
+  storage-structures-expanded.txt; storage-other-final.txt
+  storage-heap-verified.txt; storage-census-final.txt
+  storage-compiler-arenas.txt
+  storage-scratch.txt
+  final-values-full.dmp; final-values-roots.json
+  final-values-structures.txt; final-values-heap.txt; final-values-census.txt
+
+Remaining risk
+
+The analysis still stores many distinct states. Sharing equal trees cannot
+remove states whose contents differ. Queue growth and allocator retention
+can still raise private memory later in the run. These changes reduce known
+waste; they do not prove a fixed memory bound or full kernel convergence.

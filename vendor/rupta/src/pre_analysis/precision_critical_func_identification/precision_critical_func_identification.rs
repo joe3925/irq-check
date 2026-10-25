@@ -47,8 +47,27 @@ impl<'r, 'a, 'tcx, 'compilation> PrecCritFnIdent<'r, 'a, 'tcx, 'compilation> {
                     self.rta.acx.tcx, reference.generic_args.clone());
                 let signature = self.rta.acx.tcx.fn_sig(def_id)
                     .instantiate(self.rta.acx.tcx, specializer.generic_args).skip_binder();
+                let name = self.rta.acx.tcx.item_name(def_id);
+                let memory_parameters: &[usize] = match name.as_str() {
+                    "atomic_store" | "atomic_xchg" | "write_via_move" | "volatile_store" | "unaligned_volatile_store" => &[1, 2],
+                    "atomic_cxchg" | "atomic_cxchgweak" => &[1, 3],
+                    _ => &[],
+                };
                 let has_pointer = |ty: rustc_middle::ty::Ty<'tcx>| ty.is_any_ptr()
-                    || !crate::util::type_util::get_pointer_projections(self.rta.acx.tcx, ty).is_empty();
+                    || !crate::util::type_util::get_value_projections(self.rta.acx.tcx, ty, name.as_str().starts_with("atomic_")).is_empty();
+                if !memory_parameters.is_empty() {
+                    let mut pfg = FuncPFG::new(func_id);
+                    pfg.param_with_memory_flow.extend(memory_parameters.iter().copied());
+                    if matches!(name.as_str(), "atomic_xchg" | "atomic_cxchg" | "atomic_cxchgweak") {
+                        pfg.param_with_flow.insert(1);
+                        pfg.has_arg_to_return_flow = true;
+                    }
+                    self.func_pfg_map.insert(func_id, pfg);
+                    if let Some(&node_id) = self.rta.call_graph.func_nodes.get(&func_id) {
+                        self.worklist.push_front(node_id);
+                    }
+                    continue;
+                }
                 if has_pointer(signature.output()) && signature.inputs().iter().copied().any(has_pointer) {
                     if let Some(&node_id) = self.rta.call_graph.func_nodes.get(&func_id) {
                         self.worklist.push_front(node_id);
@@ -64,8 +83,12 @@ impl<'r, 'a, 'tcx, 'compilation> PrecCritFnIdent<'r, 'a, 'tcx, 'compilation> {
                 Some(promoted) => &self.rta.acx.tcx.promoted_mir(def_id)[promoted],
                 None => self.rta.acx.tcx.instance_mir(reference.kind),
             };
-            let pfg = FuncPointerFlowAnalysis::new(self.rta, func_id, mir).calculate_intra_pointer_flow();
-            if pfg.has_arg_to_return_flow {
+            let atomic_relations = self.rta.acx.tcx.crate_name(def_id.krate).as_str() == "core"
+                && self.rta.acx.tcx.def_path_str(def_id).starts_with("core::sync::atomic::");
+            let mut analysis = FuncPointerFlowAnalysis::new(self.rta, func_id, mir);
+            analysis.pfg.atomic_relations = atomic_relations;
+            let pfg = analysis.calculate_intra_pointer_flow();
+            if pfg.has_arg_to_return_flow || !pfg.param_with_memory_flow.is_empty() {
                 if let Some(&node_id) = self.rta.call_graph.func_nodes.get(&func_id) {
                     self.worklist.push_front(node_id);
                 }
@@ -126,6 +149,8 @@ impl<'r, 'a, 'tcx, 'compilation> PrecCritFnIdent<'r, 'a, 'tcx, 'compilation> {
                 Some(pfg) => Some(pfg.param_with_flow.clone()),
                 None => None,
             };
+            let param_with_memory_flow = func_pfg_map.get(&func_id)
+                .map(|pfg| pfg.param_with_memory_flow.clone()).unwrap_or_default();
 
             // Collect incoming edges first to release the iterator's borrow on the graph
             // before we mutate func_pfg_map / worklist below.
@@ -155,6 +180,17 @@ impl<'r, 'a, 'tcx, 'compilation> PrecCritFnIdent<'r, 'a, 'tcx, 'compilation> {
                     let is_closure_or_dyn_call = src_func_pfg.closure_dyn_callsites.contains(&location);
                     for arg in args {
                         let (arg_idx, arg_path) = arg.clone();
+                        let memory_flow = if is_static_call {
+                            param_with_memory_flow.contains(&arg_idx)
+                        } else if is_closure_or_dyn_call && arg_idx == 1 {
+                            param_with_memory_flow.contains(&1)
+                        } else {
+                            !param_with_memory_flow.is_empty()
+                        };
+                        if memory_flow && src_func_pfg.atomic_relations {
+                            new_edges_added |= src_func_pfg.memory_outputs.insert(arg_path.clone());
+                            new_edges_added |= src_func_pfg.add_edge(arg_path.clone(), arg_path.clone(), PFGEdgeEnum::CallPFGEdge(location));
+                        }
                         // For static calls, only consider the parameters that have flow to the callee.
                         // For closure/dyn calls, the second argument will be dispatched to parameter 2..N in callee,
                         // we connect arg 2 to return if any of parameter 2..N has flow in callee.
@@ -180,7 +216,7 @@ impl<'r, 'a, 'tcx, 'compilation> PrecCritFnIdent<'r, 'a, 'tcx, 'compilation> {
 
                 if new_edges_added {
                     src_func_pfg.solve_graph_reachability();
-                    if src_func_pfg.has_arg_to_return_flow {
+                    if src_func_pfg.has_arg_to_return_flow || !src_func_pfg.param_with_memory_flow.is_empty() {
                         worklist.push_back(src_node_id);
                     }
                 }

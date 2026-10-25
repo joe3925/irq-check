@@ -1,0 +1,1359 @@
+IRQ solver work log
+Started: 2026-10-13, local time.
+
+Required result
+
+Use Rupta for whole-program pointer candidates. Use IRQ-rooted queries to
+prove call targets and the memory effects needed for those targets.
+Do not report Forbidden from an unproved pointer candidate.
+Report Unknown if a pointer binding cannot be proved.
+Keep trusted blocks narrow. Cut IRQ analysis at irq::unreachable.
+Complete the refactor. Check the existing scenarios and the kernel.
+Do not call the task complete from a small passing subset.
+
+Work state
+
+The worktree had many changes before this log started. Keep those changes.
+Use target/solver-refactor-next for this work. Do not stop other runs.
+No scenario files were added in this run.
+
+Latest full scenario audit: saved attempt 51, 2026-10-15.
+
+The saved binary in target/solver-after-51-validation passes 113 of 115
+existing cases. This includes 94 of the 96 cases supported by run.ps1,
+with applicable cache checks, and all 19 additional audit cases.
+Only panic-format safe and negative fail. No whole-project pass is claimed.
+The additional cases cover all eight kernel-memory modes, memory-growth,
+five memory-growth-roots modes, four writer-growth modes, and the
+context-growth-boundary support library. Both writer-growth negative
+modes report the required forbidden_write, with no Unknown error.
+Standard evidence: target/scenarios/20261015-182614-0310878 through
+target/scenarios/20261015-183210-9878319.
+Additional evidence: target/scenarios/memory-20261015-182839-9497598
+through target/scenarios/memory-20261015-183432-5978550.
+The support library build exits zero with metadata irq_audit_51_boundary.
+
+The saved attempt 63 binary repeats the 96-case run.ps1 audit. It passes
+94 cases, including applicable cache checks. Only panic-format safe and
+negative fail. The other 19 cases have not been rerun on that binary.
+Evidence: target/scenarios/20261015-191558-0159295 through
+target/scenarios/20261015-192227-5054417. The saved executable is in
+target/solver-after-63-validation.
+
+The kernel after attempt 51 finishes in 67.62 seconds with three Unknown
+errors and 1,673,199,616 peak private bytes. Its first stopped snapshots
+are TaskUpdate storage and Program storage. The whole-Scheduler capture
+bound is no longer its first stop.
+Evidence: target/scenarios/memory-20261015-182603-5102620.
+
+Attempts 52 and 54 through 57 do not fix panic-format. Attempt 53 was
+removed because it broke passing safety cases. Attempts 58 through 61
+keep the focused control cases passing. Panic-format and the kernel
+still fail. Attempt 62 narrows pointer-preflight branch checks. Results
+from the saved attempt 51 binary do not establish acceptance of later
+builds.
+
+The entries below record individual fixes, not whole-scenario acceptance.
+
+Previous attempts from this run
+
+1. Add the call point to the entry-read cycle key.
+   State: retained.
+   Reason: reads of the same storage at different calls are not the same read.
+   Result: did not fix panic-format or boot-registry.
+
+2. Track data-address uncertainty and vtable uncertainty separately.
+   Keep path fields separate in the Rupta coverage check.
+   State: retained; more checks required.
+   Result: coverage-local, coverage-write, and coverage-unknown passed.
+   Evidence: target/scenarios/20261014-024847-2892502,
+   20261014-024849-6814184, and 20261014-024852-0632174.
+   Boot-registry still had zero proved indirect calls in global coverage.
+   Do not treat this change as a fix for the two main failures.
+
+3. Read metadata first in entry snapshots.
+   State: removed.
+   Result: did not fix the main failures.
+   A later split of data and metadata also broke buffered-format.
+
+4. Use one whole-fat-pointer key for global initialization and reuse its
+   metadata for word reads.
+   State: removed.
+   Result: boot-registry still failed. Heap-registry and global-update lost
+   bindings that worked before the change.
+   Evidence: target/scenarios/20261014-025439-3237220,
+   20261014-025502-9716949, and 20261014-025504-5435333.
+   Do not repeat this change without a new explanation for those failures.
+
+5. Keep all proof-storage queries at word size. Do not widen data reads.
+   State: removed.
+   Result: panic-format still failed. Buffered-format and heap-registry failed.
+   Evidence: target/scenarios/20261014-025556-1970462,
+   20261014-025616-7152758, and 20261014-025618-9585839.
+   The prior rule remains: widen a fat pointer's data word, but not its
+   metadata word.
+
+6. Fold constant SwitchInt branches in the MIR query index.
+   State: retained; full checks still required.
+   Reason: T::IS_ZST has a known value for the concrete iterator type.
+   The query followed both the real pointer path and the zero-size path.
+   Result: panic-format work fell from about 1.177 million to 1.066 million
+   transfers. It still failed. Boot-registry still failed.
+   Heap-registry and buffered-format passed both cases.
+   Evidence: target/scenarios/20261014-030857-0677129,
+   20261014-030919-0622387, 20261014-030921-9402146,
+   and 20261014-030924-8549990.
+   This is not sufficient to explain the unknown iterator end pointer.
+
+7. Trace pointer transfers in boot-registry.
+   State: cause confirmed.
+   Evidence: target/scenarios/20261014-031621-8386922.
+   The first initialized iterator start has a heap object and length 2.
+   Its end pointer becomes Unknown in the Offset operation in ptr::add.
+   Add a trace of both Offset operands to find the first lost value.
+   Build with that trace completed in 38.61 seconds.
+   Operand trace: target/scenarios/20261014-031836-8429220.
+   The first initialized ptr::add has the known heap pointer on the left.
+   Its right operand is Unknown: the scalar value needs more refinement.
+   Thus the 1,000-step scalar limit stops a length needed for pointer flow.
+
+8. Apply the short scalar limit only during branch refinement.
+   State: retained; main failures remain.
+   Keep the normal pointer-query limit for required scalar dependencies.
+   Put the branch-refinement mode in read and effect cache keys, so a
+   limited branch query cannot replace the result of a required query.
+   This does not increase the total pointer-query limit.
+   Result: the first initialized iterator now has length Bits(2) and a
+   known end pointer. Boot-registry still enters recursive effect queries.
+   Heap-registry and buffered-format passed safe, negative, and cache checks.
+   Panic-format still failed with a missing Formatter entry binding.
+   Evidence: target/scenarios/20261014-032143-7954792,
+   20261014-032206-3998425, 20261014-032209-9655392,
+   and 20261014-032214-7546913.
+
+Open failures
+
+9. Check branch reachability before a memory-effect proof follows a write
+   or a call.
+   State: removed.
+   The storage_unchanged scan did not test paths. Its assumptions also
+   removed branch guards. Thus a recursive call behind a false scalar
+   condition could still enter another effect query.
+   Keep guards during the short branch check. If that check is incomplete,
+   inspect the write or call as before. Never skip it from Unknown.
+   Result: did not fix either main case. Heap-registry safe changed from
+   pass to Unknown. Panic-format work rose to 1.419 million transfers.
+   Evidence: target/scenarios/20261014-032944-6989851,
+   20261014-033008-1698889, and 20261014-033014-8407144.
+   Do not repeat the broad branch check in every effect scan.
+
+10. Cache reads at the common definition point.
+    State: in progress.
+    read_uncached already moved unexposed single-definition locals to their
+    definition point. But it stored the result only under each use point.
+    First attempt: send the normalized read through read_edge again.
+    This broke buffered-format safe and did not fix the two main cases.
+    Evidence: target/scenarios/20261014-033257-6348839,
+    20261014-033322-3680972, and 20261014-033324-8723865.
+    Revised attempt: move normalization before the read-cache lookup.
+    Do not add another recursive read or another active-read entry.
+    Keep the same address, type, guards, call frame, and successor.
+
+11. Keep bounded slice-find pointer flow in read-only effect summaries.
+    State: in progress.
+    The existing slice-find model was disabled when assume_readonly was
+    set. Such summaries cannot use scalar arguments to select an entry.
+    For a proved bounded slice and a read-only predicate, retain every
+    possible element reference in the effect summary. Retain both Option
+    variants. Do not use this broad result for the normal IRQ target query.
+The normal query still evaluates the predicate and checks its calls.
+    The first validation run did not test this change: core could not
+    compile because the disk was full. Evidence:
+    target/scenarios/20261014-033532-6732979. Do not count this as a solver
+    failure. The remaining runs could not write their logs.
+
+Disk state
+
+At the last check, the drive had about 1.1 GB free. The scenario build
+cache used about 37 GB. No checker, cargo, or rustc process was running.
+A command to remove six old generated cache folders was blocked by tool
+policy. Nothing was deleted. The user was asked to free at least 10 GB.
+Source and evidence files must be kept.
+
+Last source checks
+
+cargo check --target-dir target/solver-refactor-next passed.
+rustfmt check passed for src/analysis/global.rs, src/analysis/query.rs,
+and src/analysis/sparse.rs. Formatting was limited to these three files.
+The revised attempt 10 and attempt 11 compile, but scenario validation
+still needs disk space. The latest release binary was built before the
+format-only change to those files.
+
+The next disk check showed about 8 GB free. No cleanup command from this
+run succeeded. Scenario validation resumed with the existing release
+binary, which has both pending semantic changes.
+
+Additional acceptance evidence
+
+target/scenario-audit-20261014-024407-results.json records an independent
+115-case audit of a saved binary. It passed 102 cases and failed 13.
+Its source note states that files changed during that run. Do not treat
+these results as tests of the current binary.
+The audit also lists writer-growth negative, recursive formatting,
+local-callback safe, global-update safe, and unbounded,cut negative.
+Check these cases before completion, as well as the two main failures.
+
+Attempts 10 and 11: validation result
+
+The revised cache placement and the read-only find model passed
+heap-registry, buffered-format, and registry-predicate, including each
+negative case and cache check. Boot-registry and panic-format still fail.
+Evidence: target/scenarios/20261014-034007-5883113,
+20261014-034029-3216673, 20261014-034032-8994877,
+20261014-034037-4826660, and 20261014-034040-3780519.
+State: retained for now; full acceptance is not proved.
+
+12. Do not reuse resource-limited results as completed query facts.
+    State: removed.
+    Some short unchanged proofs convert TransferLimit to false and cache
+    that result. Scalar reads can also return Unknown after a short limit.
+    Track failed refinement work through nested reads. Do not cache a
+    resulting Unknown. Do not cache a failed short unchanged proof.
+    Result: repeated short proofs increased work. Neither main case passed.
+    Heap-registry failed both cases. Buffered-format safe also failed.
+    Panic-format used about 3.25 million transfers across its queries.
+    Evidence: target/scenarios/20261014-034512-3448584,
+    20261014-034534-2643406, 20261014-034538-2090230,
+    and 20261014-034540-4000109.
+    Do not repeat broad removal of incomplete cache entries. A future
+    change needs bounded retries and dependency-driven invalidation.
+
+13. Mark fixed vtables at the MIR unsize operation.
+    State: retained; the main failures remain.
+    Rupta treats concrete and dyn pointee types as equivalent for pointer
+    propagation. It emits a Direct edge for this unsize, not a Cast edge.
+    The coverage check only exempted Cast edges from vtable uncertainty.
+    The boot trace therefore propagated Box::leak address uncertainty
+    through the known Forbidden-to-dyn conversion into every consumer.
+    Record the exact source and target pointer fields of each concrete
+    unsize. Exempt only those edges from vtable uncertainty. Keep data
+    uncertainty and all other writes and definitions.
+    Require Rupta to contain the source concrete pointee type before the
+    edge can stop vtable uncertainty. The release build passed after a
+    compiler API name was corrected.
+    Result: boot-registry and panic-format still fail. Heap-registry,
+    buffered-format, coverage-local, coverage-write, and coverage-unknown
+    pass their expected cases. Boot now loses coverage through the data
+    address of the registry iterator, not through the concrete unsize.
+    Evidence: target/scenarios/20261014-035425-4291122,
+    20261014-035500-9777587, 20261014-035503-9822412,
+    20261014-035507-5284252, 20261014-035512-0692967,
+    20261014-035515-4781168, and 20261014-035518-8822321.
+
+panic-format: an entry snapshot loses the Formatter writer binding while
+it tries to prove memory unchanged across nested formatting calls.
+The query then reaches its work limit. The small buffered case passes.
+
+boot-registry: the iterator end becomes Unknown. Global initialization
+queries then enter recursive callback effects and reach the work limit.
+The heap-registry case with initialization inside the IRQ root passes.
+
+No kernel run has verified the changes recorded above.
+
+14. Preserve pointer arguments across layout-compatible call signatures.
+    State: callback mapping fixed; panic-format still fails end to end.
+    A points-to dump confirms a missing call bridge, not a dyn limitation.
+    Argument::fmt passes NonNull<()> to a formatter function that receives
+    a reference. The call target is present. Its first parameter is empty.
+    add_inter_procedural_edges uses the argument's field projections for
+    the parameter too. It writes parameter.0 instead of the pointer-valued
+    parameter. The subsequent Task.device call has no Rupta target.
+    Map argument and parameter pointer fields by their byte offsets.
+    Use a cast edge for unequal pointer types, with existing Rupta cast
+    propagation. Apply the same rule to the returned value. Keep coverage
+    gaps when a target pointer field has no matching source field.
+    Evidence: target/scenarios/20261014-035737-0789399,
+    target/scenarios/20261014-035852-2677878, and
+    target/solver-refactor-next/panic-points.txt.
+    Result: only the Rupta callback gap is fixed. Panic-format has zero
+    unresolved Rupta call sites. Its graph has 510 contexts and 1,026 call
+    bindings, up from 424 contexts and 825 bindings. It still fails in the
+    recursive summary. Heap-registry and buffered-format still pass.
+    Evidence: target/scenarios/20261014-040151-0917898,
+    20261014-040213-6391648, 20261014-040216-5229684,
+    20261014-040220-1360427, 20261014-040224-9309766,
+    and 20261014-040235-2214120.
+
+15. Retain the destination field of a scalar write in pointer coverage.
+    State: in progress.
+    The next trace starts at a DebugTuple aggregate. Scalar writes to a
+    field currently mark the entire pointee object unknown. This also
+    marks its separate Formatter reference unknown. Retain the projection
+    after Deref. Mark that storage field, not the entire object.
+    Keep whole-object treatment for unmodeled bulk copies. An unknown
+    destination address must still invalidate memory coverage.
+    Result: heap-registry, buffered-format, and the three coverage controls
+    pass their expected cases. Panic-format and boot-registry still fail.
+    The first unknown path now comes from without_provenance in the
+    zero-size branch of SliceIter<usize>::new, not a scalar-field write.
+    Evidence: target/scenarios/20261014-040703-4513077 through
+    20261014-040724-6713458.
+
+16. Apply the existing constant-branch rule to Rupta graph construction.
+    State: in progress.
+    The IRQ index already folds constant SwitchInt conditions. Rupta still
+    visits every MIR block. It includes the integer-to-pointer operation
+    for zero-size elements in an iterator of usize. That branch cannot
+    run for this monomorphized type, but it starts a new uncertainty chain.
+    Share the constant-successor rule between the IRQ index and Rupta.
+    Do not prune unknown conditions or use IRQ annotations in Rupta.
+    The writer-growth negative case also confirms this chain after fixes
+    14 and 15: SliceIter<u8>::new -> without_provenance_mut<u8> -> shared
+    NonNull<u8>::as_ptr -> UTF-8 write. It has 1,970 uncertain nodes out
+    of 2,156 and stops at AlternativeLimit. The limit is not the cause.
+    Evidence: target/solver-refactor-next/writer-fields-evidence.
+    Result: formatting now passes its safe case. Its negative case still
+    loses the argument storage address in a recursive summary. Rupta has
+    73 uncertain nodes out of 2,027 and no unknown memory or calls there.
+    Local-callback, global-update, heap-registry, and buffered-format pass
+    their safe, negative, and cache checks. Panic-format and boot-registry
+    still fail. Their first uncertainty chains exceed the trace length.
+    Extend that trace before choosing another semantic change.
+    Evidence: target/scenarios/20261014-041014-3330602 through
+    20261014-041054-6345478.
+
+17. Keep no-provenance values separate from unknown memory addresses.
+    State: in progress.
+    The full panic-format chain starts at the integer length tag made by
+    Arguments::from_str. The boot-registry chain starts at the dangling
+    pointer made for a zero-size allocation. Both use an integer-to-raw-
+    pointer transmute. They cannot address a nonzero memory allocation.
+    Record this value kind in the global graph. Propagate it across value
+    edges, not across a dereference. Do not turn an empty points-to set
+    from this kind alone into global memory uncertainty. Keep ordinary
+    integer-to-pointer casts unknown. Keep function-pointer conversions
+    and unresolved calls unknown. The IRQ query rules do not change.
+    Evidence: target/scenarios/20261014-041527-5295899 and
+    target/scenarios/20261014-041549-2669992.
+    Reference: https://doc.rust-lang.org/std/mem/fn.transmute.html
+    Reference: https://doc.rust-lang.org/std/ptr/fn.without_provenance.html
+
+    The writer-growth negative case passes after attempt 16. It reports
+    the established forbidden_write call. It has 40 uncertain nodes out
+    of 2,067. There is no global memory or parameter invalidation.
+    Evidence: target/solver-refactor-next/writer-constant-evidence.
+    Result: boot-registry now has 6 uncertain nodes out of 713, with no
+    global memory or parameter invalidation. Its IRQ query still exceeds
+    its scratch limit. Panic-format still has offset-related uncertainty.
+    The coverage-write, coverage-unknown, heap-registry, and buffered-
+    format controls keep their expected results.
+    Evidence: target/scenarios/20261014-042123-3612313 through
+    target/scenarios/20261014-042201-4526935.
+
+18. Retain allocation origins when a recursive entry is normalized.
+    State: in progress.
+    EntrySnapshot replaces local storage IDs with summary IDs. It drops
+    their allocation classes. call_effect cannot use Rupta write sets for
+    those summary objects and repeats the full unchanged-storage proof.
+    Preserve each known local allocation class in the normalized entry.
+    Inherit these classes when one summary supplies another summary.
+    Use a write set only when all recorded classes are disjoint from it.
+    Do not infer a class for heap or constant objects with no exact map.
+    Include the classes in summary keys and compatibility checks.
+    Evidence: target/scenarios/20261014-042239-7391802.
+
+19. Use the checked Rust link for external write summaries.
+    State: in progress.
+    Rupta resolves panic_impl to the program's panic handler. The write
+    summary pass still rejects the external declaration before it follows
+    that checked link. This removes write summaries from registry_wake and
+    makes initialization queries descend through recursive IRQ callbacks.
+    Follow a covered Rupta bridge at Location::START. Keep an external
+    call unknown if that bridge is absent or incomplete.
+    Evidence: target/scenarios/20261014-042659-4498257.
+    Result: write summaries increase from 208 to 228 for boot-registry,
+    and from 264 to 344 for recursive formatting. Both failures remain.
+    Attempt 18 also leaves the recursive formatting failure in place.
+    Evidence: target/scenarios/20261014-043041-4371165 through
+    target/scenarios/20261014-043112-9915839.
+
+20. Connect IRQ heap objects to covered Rupta allocation classes.
+    State: in progress.
+    may_alias and call_effect return no global alias information for every
+    Object::Heap. This discards the covered points-to set of the allocation
+    call's destination. Use that set when the destination is a whole local.
+    A set with several classes remains an over-approximation. Use it only
+    to prove that all classes are disjoint from a write set. Keep unknown
+    destinations conservative. Preserve these classes in recursive entries
+    too. Do not skip the allocation call that initializes the queried heap.
+    Result: release build passes. Boot-registry still fails, but the safe
+    query falls from 1,000,008 to 68,092 transfers. The error is now an
+    unknown storage address. Formatting safe and cache checks pass; its
+    negative case still fails. Panic-format still fails. Heap-registry,
+    buffered-format, coverage-write, and coverage-unknown keep their
+    expected results, including applicable cache checks.
+    Evidence: target/scenarios/20261014-043851-6237209 through
+    target/scenarios/20261014-043930-9051490.
+
+21. Keep each known slice range in the bounded find query.
+    State: in progress.
+    Boot has two proved registry arrays: the static initializer and the
+    heap allocation. Both iterator bounds are known. The find query accepts
+    only one start and one end. It falls back to the loop query and loses
+    the storage address. Evaluate all compatible bounds in the same
+    allocation. Require every range and predicate result to be complete.
+    Match captured storage through its preserved allocation origins.
+    Shift these origins with the other cells in the predicate snapshot.
+    Do not use Rupta candidates as established callback bindings.
+    Evidence: target/scenarios/20261014-043958-7591411.
+    Reference: https://doc.rust-lang.org/src/core/slice/iter/macros.rs.html
+    Result: boot-registry passes its safe, negative, and cache checks.
+    Heap-registry, global-update, and registry-predicate also pass. The
+    formatting negative case and both panic-format cases still fail.
+    Boot safe uses 103,940 transfers, 107 frames, and 27 sites. Its recursive
+    registry summary reaches Safe. The negative case proves Forbidden.
+    Evidence: target/scenarios/20261014-044415-8640042 through
+    target/scenarios/20261014-044453-0445892.
+
+22. Do not prove a whole-function invariant before an acyclic read.
+    State: in progress.
+    Argument::fmt has no loop. At the callback entry, the writer pointer is
+    already in the parent snapshot. read_uncached first tries to prove it
+    unchanged across the whole function, including the callback that has
+    not run yet. That proof consumes the 16,384-step entry budget. The new
+    snapshot then contains only the formatter address and writer metadata.
+    Limit this early invariant optimization to reads in loop blocks.
+    Other reads still check every preceding write and call. The loop and
+    call-effect proofs remain in place. No query limit is increased.
+    Evidence: target/scenarios/20261014-044542-8026807 and
+    target/scenarios/20261014-044810-4241799.
+    Result: panic-format safe work falls from about 1.63 million to 1.12
+    million transfers. Both cases still fail. Formatting safe passes, but
+    its negative case still reports Unknown. Boot-registry, heap-registry,
+    buffered-format, and global-update pass both cases and cache checks.
+    The existing unbounded,cut negative case also still fails.
+    Evidence: target/scenarios/20261014-044921-9249793 through
+    target/scenarios/20261014-045002-5111905.
+
+23. Trace bounded memory-effect proofs below the main query limit.
+    State: diagnosis in progress.
+    Attempt 22 preserves the first PanicInfo formatter entry. A later
+    writer read still spends its budget in Formatter::pad and in proofs
+    for the new formatter local inside fmt::write. The existing stop trace
+    hides these short proof limits. Add IRQ_CHECK_TRACE_PROOF to select an
+    active function in those proofs. This changes logging only.
+    Evidence: target/scenarios/20261014-045025-1811965.
+    Run rustfmt only on src/analysis/sparse.rs, global.rs, and query.rs.
+    Result: the trace reaches a nested stable_local proof for the local
+    formatter in fmt::write while it checks the outer formatter's writer
+    field. Callback and iterator argument reads consume the inner budget.
+    Evidence: target/scenarios/20261014-045513-6140498.
+    The scoped rustfmt check and git diff --check pass.
+
+24. Do not start a local whole-function invariant inside another proof.
+    State: removed.
+    The summary-object invariant already requires an empty assumption
+    stack. The local-object invariant does not. Apply the same condition
+    to the local shortcut. Keep backward reads and loop-effect checks.
+    This prevents nested lifetime proofs from taking over a memory-effect
+    query. It does not assume that a write is absent.
+    Result: no failed case passes. Panic-format safe work increases from
+    about 1.12 million to 1.32 million transfers. Remove this change.
+    Boot-registry, heap-registry, buffered-format, and global-update still
+    pass both cases and cache checks.
+    Evidence: target/scenarios/20261014-050257-7569135 through
+    target/scenarios/20261014-050333-3702093.
+
+25. Do not export direct stack writes as caller-visible memory effects.
+    State: in progress.
+    The write summary includes every local assignment in a callee. At
+    context depth zero, a recursive call then appears to overwrite the
+    same local in its caller's older frame. Direct local assignments write
+    the new frame only. Exclude them from exported write sets. Keep all
+    writes through pointers, including pointers to an older stack frame.
+    Keep the allocation-call exception in the heap query.
+    Result: boot-registry, heap-registry, buffered-format, global-update,
+    coverage-write, and coverage-unknown pass their expected cases and
+    applicable cache checks. Formatting safe passes; its negative case
+    still fails. Both panic-format cases still fail. The change does not
+    fix those remaining failures.
+    Evidence: target/scenarios/20261014-050548-5308249 through
+    target/scenarios/20261014-050632-2759134.
+
+Full kernel check after attempt 25
+
+The run completes with exit 101 in 85.16 seconds. Peak private memory is
+1,642,123,264 bytes. Peak commit is 1,798,455,296 bytes. No time or memory
+limit stops the run. Two diagnostics remain:
+  console.rs:518: the assertion-panic target query reaches TransferLimit.
+  scheduling/domain.rs:372: the recursive enqueue summary loses a storage
+  address.
+Rupta has 41,576 contexts and 44 unresolved call sites. Global coverage
+still invalidates memory and parameters: 279,074 of 302,919 nodes are
+uncertain. This is not a kernel pass.
+Evidence: target/scenarios/memory-20261014-050636-2525836.
+
+26. Apply scalar branch limits to assertion conditions too.
+    State: in progress.
+    SwitchInt refinement sets refining_guard. Assert target resolution
+    does not. An assertion can spend the whole pointer-query budget on
+    its scalar condition. The code catches that failed read but then has
+    no budget left to return the known compiler panic target.
+    Use the same scalar-refinement mode for both branch forms. If the
+    condition remains unknown, keep the panic edge. Do not mark it safe.
+    Evidence: the console.rs:518 error in the kernel check after 25.
+    Result: release build passes. Boot-registry keeps its safe, negative,
+    and cache passes. Formatting keeps its safe and cache passes, but its
+    negative case still fails. Both panic-format cases still fail. The
+    kernel assertion result is not yet checked with this change.
+    Evidence: target/scenarios/20261014-051718-6824992 through
+    target/scenarios/20261014-051756-2774839.
+
+27. Compare larger budgets before changing the default limits.
+    State: in progress.
+    The user accepts memory use up to 10 GiB. Set IRQ_CHECK_MEMORY_MIB to
+    10240 for this check. First compare the default query budget of
+    100,000 steps with 1,000,000 steps on panic-format. The entry and
+    memory-effect subqueries also have fixed limits. A higher outer
+    budget does not raise these inner limits.
+    Result: a tenfold outer budget increase does not fix either panic
+    case. Safe work is 1,119,335 transfers, compared with 1,118,964 at the
+    default setting. The same later Formatter::write_str entry is absent.
+    Evidence: target/scenarios/20261014-051800-1493423.
+    Next comparison: scale the inner step limits with the configured
+    query budget. Keep the default values and the 1,000-step scalar limit.
+    The scale is baseline * query_steps / 100000. For example:
+        let steps = QueryBudget::refinement_steps(16384);
+        self.budget.limit = limit.min(self.budget.steps.saturating_add(steps));
+    Also make the static-writer probe respect the remaining parent budget.
+    This probe previously replaced that budget with an 8,192-step limit.
+    Result: with both inner and outer limits raised tenfold, formatting
+    passes its safe, negative, and cache checks. Panic-format still fails
+    both cases. Its safe work rises to 5,014,828 transfers. Later summaries
+    get further, but lose the Argument::fmt storage address. More steps
+    alone do not close the panic proof. Keep the default query limit.
+    Evidence: target/scenarios/20261014-052057-9123561 and
+    target/scenarios/20261014-052121-4759424.
+
+28. Model the compiler caller-location return value.
+    State: in progress.
+    PanicInfo reaches Location::fmt with an unknown location pointer.
+    Rupta models caller_location, but the IRQ return query does not.
+    Use Body::caller_location_span to handle inlined scopes. Follow the
+    caller chain while the function needs the hidden caller location.
+    Use the compiler constant, not a synthetic location:
+        let constant = self.tcx.span_as_caller_location(span);
+    Keep an unknown tracked entry unknown. Do not infer a caller span
+    when the frame has no caller. Immutable constant memory then uses
+    the existing allocation read rule.
+    Evidence: target/scenarios/20261014-052346-8524565.
+    Reference: https://raw.githubusercontent.com/rust-lang/rust/923c95cdf5ba65cea505aa2ea829f578e1506ed8/compiler/rustc_codegen_ssa/src/mir/block.rs
+    Result: release build passes. Boot-registry, buffered-format,
+    heap-registry, coverage-write, and coverage-unknown keep their
+    expected results. Formatting negative and both panic-format cases
+    still fail at the default limits. Panic safe uses 1,117,638 transfers.
+    This fixes a return model gap, not the remaining writer proof.
+    Evidence: target/scenarios/20261014-053042-8952785 through
+    target/scenarios/20261014-053123-3616226.
+
+29. Measure each nested call in the unchanged-storage proof.
+    State: diagnosis in progress.
+    Add step counts to the existing opt-in IRQ_CHECK_TRACE_EFFECT output.
+    The stopped read can be only the last operation before the limit.
+    Measure the calls that spent the budget before selecting a fix.
+    Result: the writer check enters Formatter::pad and CharIndices
+    updates. Several nested call proofs reach their inner limit.
+    Evidence: target/scenarios/20261014-054008-2737817.
+
+30. Separate allocation identity from offset precision.
+    State: in progress.
+    Propagate uncertain offsets separately from unknown pointer origins.
+    A write with an uncertain offset invalidates the known allocation.
+    A load through that offset still has unknown pointer contents.
+    Unknown allocation origins keep the global fallback.
+    In an IRQ alias query, do not evaluate an offset when the base
+    allocation is already disjoint from the requested allocation.
+    Also return an error when snapshot collection stops. Do not return
+    an incomplete set of cells as a completed entry snapshot.
+    No limits are increased. These changes do not yet retain write
+    ranges or distinguish callee storage from caller storage.
+    Result: panic-format still fails, now with an explicit incomplete
+    snapshot error. Safe work is 127,018 transfers, down from 1,117,638.
+    The uncertain-node count remains 3,468 of 3,972. Boot-registry,
+    coverage-write, and coverage-unknown keep their expected results.
+    Formatting safe passes. Formatting negative remains unknown.
+    Evidence: target/scenarios/20261014-054347-9022772 through
+    target/scenarios/20261014-054417-9714883.
+
+31. Retain checked byte ranges in global write summaries.
+    State: retained, partial fix.
+    Keep pointee field and byte offsets while exporting write facts.
+    Check layout bounds and arithmetic. An unknown offset, index, cast
+    layout, or allocation extent retains a whole-object write effect.
+    Propagate ranges with the transitive write summary. Use them to
+    reject non-overlapping writes in the IRQ call-effect query.
+    Result: panic safe uses 126,773 transfers and still fails. This
+    change alone does not solve the formatting proof. Argument-relative
+    effects and separate call-frame storage are not implemented here.
+    The coverage trace now starts at an uncertain-offset load used by
+    <&dyn Debug>::fmt. That unknown call still causes global invalidation.
+    Evidence: target/scenarios/20261014-054604-6765462.
+
+32. Keep incomplete preservation checks distinct in the cache.
+    State: in progress.
+    Cache Preserved, MayWrite, or Incomplete with its stop reason and
+    available budget. Reuse an incomplete result until at least twice
+    the previous budget is available. Input state remains in
+    the cache key. Do not clear all failed results to force a retry.
+    Snapshot collection also reports layout and collection limits.
+    No new tests or comments are added. The C: drive has about 260 MB
+    free. The environment blocked removal of four old build caches.
+    Result: the release build and scoped formatting check pass.
+    Scenario and kernel checks are not run for this change. Only about
+    180 MB remains free. More disk space is required for those checks.
+
+33. Use the existing recursive effect proof for one storage range.
+    State: implementation in progress; not scenario-verified.
+    The current effect summary requires no external writes. It cannot
+    express an options write that preserves the writer field.
+    Extend the snapshot with:
+        preserved: Option<(Address, Ty<'tcx>)>
+    Map this address with the actual call arguments. Keep each fresh
+    callee object separate from the preserved caller object. Check
+    writes against this region with checked bounds. Unknown addresses
+    and bounds still prevent a proof.
+    Assume only the preserved region while closing the recursive call
+    states. Prove every reachable write and call before accepting the
+    summary. Other storage still uses the normal memory query.
+    Include the preserved region in read-cache and summary keys. Never
+    cache a range-specific result as a general read-only function.
+    This extends the current solver. It does not add another pointer
+    analysis or raise limits. Disk space is still about 180 MB.
+    The range snapshot can retain a known local, heap, or summary
+    allocation when its offset is unknown. The previous fallback kept
+    only static and constant allocations. Keep exact offset queries for
+    the preserved object. Unknown offsets in that object do not prove
+    that a write is outside the preserved range.
+    Result: the release build and scoped formatting check pass.
+    Checked that range results have separate summary and read-cache
+    keys. General read-only facts cannot use a range-specific result.
+    Fresh callee writes use their own object identity. Same-object
+    writes require non-overlap and known allocation bounds.
+    No scenario or kernel check is claimed for this change. The only
+    filesystem drive is C:, with about 180 MB free. There are no live
+    checker or compiler processes. Validation requires more free space.
+    Validation remains blocked on the third consecutive disk-space
+    check. C: has 190,689,280 bytes free. No other filesystem drive is
+    available. No checker, compiler, or build process is running.
+    Cache removal was blocked by the environment. Do not start more
+    builds or claim scenario acceptance until sufficient space is free.
+    The next check is panic-format, followed by the control scenarios
+    and the full kernel. The complete goal remains unfinished.
+
+Attempt 33: validation after the user freed disk space.
+    State: checked; not sufficient.
+    C: has 12.46 GiB free. No checker or compiler was running.
+    Panic-format still fails both cases. Safe work is 127,015 transfers.
+    Formatting safe and its cache pass. Formatting negative is Unknown.
+    Boot-registry, heap-registry, buffered-format, global-update,
+    coverage-write, and coverage-unknown have their expected results.
+    Evidence: target/scenarios/20261014-064348-5064093 through
+    target/scenarios/20261014-064509-9585436.
+    The kernel completes in 69.04 seconds, with 1,696,280,576 peak private
+    bytes. It reports three Unknown errors, in panic_common, wake_reaper,
+    and TaskHandle drop. Snapshot collection stops with TransferLimit
+    or ScratchLimit. No kernel pass is claimed.
+    Evidence: target/scenarios/memory-20261014-064553-4422239 and
+    target/solver-refactor-next/kernel-after-33-evidence.
+    The panic trace shows that range proofs still follow aborting panic
+    paths in Arguments::as_str and related helpers. Entry snapshots
+    also use their short field budgets on pointer wrapper calls.
+    Evidence: target/scenarios/20261014-064603-7851304 and
+    target/scenarios/20261014-065332-9449943.
+
+34. Restrict range preservation to paths that can return to the caller.
+    State: implementation in progress.
+    A storage read after a normal return does not depend on writes on a
+    path that cannot return. Build the reverse set of blocks that can
+    reach Return or TailCall. Use that set only for the range-specific
+    effect proof. Do not change the IRQ call-path check or general
+    read-only facts. Unknown unwind effects remain conservative.
+        if returning.as_ref().is_some_and(|blocks| !blocks.contains(&location.block)) {
+            continue;
+        }
+    Also exclude calls whose declared result is never from this range
+    proof. The IRQ safety query must still check those calls.
+    Result: release build and scoped formatting pass. Panic-format still
+    fails both cases, with 127,263 safe transfers. Formatting safe and
+    cache pass; negative remains Unknown. This is not a complete fix.
+    Evidence: target/scenarios/20261015-165836-5702592,
+    20261015-165908-8705346, and 20261015-170011-1155496.
+
+35. Do not stop each effect-entry field at 256 transfers.
+    State: removed.
+    The trace stops a direct NonNull::from_ref pointer chain while the
+    enclosing entry query still has several thousand steps available.
+    The same field then starts another 256-step origin query and loses
+    its binding again. This turns finite pointer copies into Unknown.
+    Let the field read use the existing entry budget:
+        let values = self.read(source, ty, point, false);
+    Keep the total entry and effect limits unchanged. Keep the origin
+    fallback for a completed query with an unknown offset.
+    Result: both panic cases still fail. Safe work is 126,786 transfers.
+    Boot-registry and buffered-format still pass. Formatting negative
+    still fails. A full field query spends the entry budget on the
+    changing byte iterator before the origin fallback can run.
+    Evidence: target/scenarios/20261015-170220-1941400 through
+    target/scenarios/20261015-170248-2081179. Trace:
+    target/scenarios/20261015-170352-9242271.
+    Restore the field limit. Do not repeat this removal alone.
+
+36. Try the direct write proof before a recursive entry snapshot.
+    State: implementation in progress.
+    Attempt 33 added the range summary before the direct storage proof.
+    The trace shows a Bytes::next preservation query spending 4,066
+    steps on a snapshot, then the direct proof taking 149 steps for the
+    same caller storage. This work repeats inside iterator loops.
+    Move the range summary into the existing failed-proof fallback:
+        if !unchanged && probe {
+            let preserved = self.preserved.replace((proof_address, proof_type));
+            let summary = self.recursive_summary(child, true, false);
+            self.preserved = preserved;
+        }
+    Keep all write checks and the existing total query limits.
+    Result: release build passes. Panic-format still fails both cases.
+    Formatting safe and cache pass; negative remains Unknown.
+    Evidence: target/scenarios/20261015-170706-9695218 and
+    target/scenarios/20261015-170737-8505468.
+
+37. Use complete Rupta candidates for memory-preservation proofs.
+    State: implementation in progress.
+    The effect proof currently asks for one exact call binding. That
+    binding can need the same memory-preservation proof already active.
+    A preservation proof can check every possible target instead.
+    Use Rupta candidates only when coverage proves the set complete.
+    Keep exact bindings for IRQ calls and for call-result values:
+        let targets = if probe {
+            self.effect_targets(point)?
+        } else {
+            self.targets(point)?
+        };
+    All candidates must preserve the storage. A candidate alone cannot
+    produce a Forbidden report. Incomplete coverage keeps the existing
+    query. Also store a successful range fallback in the preservation
+    cache. Do not keep its earlier failed direct proof as the result.
+    Result: build passes. Formatting negative and both panic-format
+    cases still fail. Boot-registry, coverage-write, and coverage-unknown
+    keep their expected results. Unbounded,cut negative still reports
+    a possible Forbidden call and fails its expected safe result.
+    Evidence: target/scenarios/20261015-171044-1398166 through
+    target/scenarios/20261015-171119-0239288.
+
+38. Return a requested exact refinement from the pointer-only preflight.
+    State: implementation in progress.
+    The formatting-negative trace first returns NeedsRefinement from
+    the pointer-only recursive proof. The caller ignores that result
+    and starts a larger snapshot. That snapshot stops before the IRQ
+    query can refine the concrete recursive arguments.
+    Return NeedsRefinement to the existing exact-query path:
+        Ok(SummaryResult::Safe | SummaryResult::NeedsRefinement)
+    This does not accept the candidate as a forbidden binding. The
+    normal IRQ query must still establish the call and its guards.
+    Result: release build passes. Formatting and local-callback pass
+    safe, negative, and cache checks. Panic-format still fails both
+    cases. Unbounded,cut negative still reports a possible Forbidden.
+    Evidence: target/scenarios/20261015-171729-6500191 through
+    target/scenarios/20261015-171757-7236889.
+
+39. Keep full field reads only in the range-specific entry query.
+    State: implementation in progress.
+    Attempt 35 removed the field limit from general read-only probes.
+    That broke the cheap static-writer proof on the changing iterator.
+    Keep its short field limit. In a range-specific proof, let exact
+    pointer copies use the existing entry budget. Attempt 36 now keeps
+    these snapshots behind the direct write check.
+        if effects_only && self.preserved.is_none() {
+            self.budget.limit = limit.min(self.budget.steps + 256);
+        }
+    Do not increase the entry, effect, or total query limits.
+    Result: release build and scoped formatting pass. Both panic-format
+    cases still fail. Formatting, boot-registry, and buffered-format
+    pass safe, negative, and cache checks.
+    A diagnostic run with IRQ_CHECK_QUERY_STEPS=1000000 also fails both
+    panic-format cases. Safe work is 273,448 transfers. Larger nested
+    proofs still lose the Argument::fmt storage address. The final
+    error is an incomplete recursive entry snapshot. Keep the default
+    query limit unchanged. Do not repeat a limit increase alone.
+    Evidence: target/scenarios/20261015-172036-3961757 through
+    target/scenarios/20261015-172145-6032151.
+
+40. Use range preservation for a failed value query as well.
+    State: implementation in progress.
+    The trace has no range-specific snapshot starts at the failing
+    Location::fmt call. The fallback requires probe=true. The outer
+    memory read is a value query, so it cannot enter the range proof.
+    Nested direct proofs stop at the enclosing short budget instead.
+    Permit the existing range proof after a failed direct value query:
+        if !unchanged && !self.readonly_probing {
+            let summary = self.recursive_summary(child, true, false);
+        }
+    Keep general read-only fallbacks restricted to effect probes.
+    A successful range proof means Unchanged for this storage only.
+    Keep incomplete results conservative. No default limit changes.
+    Evidence: target/scenarios/20261015-172914-8514893.
+    Result: both panic-format cases still fail. The trace now confirms
+    that the range proof runs. It stops while it builds a Sink::write_str
+    entry, although that function already has a static-write-only proof.
+    Evidence: target/scenarios/20261015-173112-0596969.
+
+41. Reuse static-write-only facts inside range preservation.
+    State: implementation in progress.
+    The direct call-effect query uses a known static writer to preserve
+    non-static storage. The recursive effect closure does not use the
+    same fact unless allow_static_writes is set. A range proof therefore
+    expands Sink::write_str again and spends its entry budget on the
+    byte iterator. Apply the existing fact in both paths:
+        proof.preserved.is_some_and(|(address, _)| {
+            !matches!(address.object, Object::Static(_))
+        }) && proof.static_writers.contains(&target)
+    Do not use this fact to preserve a static object.
+    Result: both panic-format cases still fail. The range proof skips
+    Sink::write_str as intended. It then spends the remaining work on
+    Arguments::as_str and the fields of its formatting arguments.
+    Evidence: target/scenarios/20261015-173308-4405976.
+
+42. Distinguish normal-return read-only effects from all effects.
+    State: implementation in progress.
+    The read-only classifier checks every panic path in small helpers.
+    A path that cannot return can make Arguments::as_str appear to
+    change memory after a normal return. Range proofs then copy all
+    of its argument storage and enter those helpers again.
+    Keep separate cache keys:
+        readonly: HashMap<(Instance<'tcx>, bool), bool>
+    For normal-return effects, check blocks that can reach Return or
+    TailCall. Keep all-effects queries for unwind checks and for child
+    calls with a possible unwind. This does not cut IRQ safety paths.
+    Result: build passes. Formatting, boot-registry, buffered-format,
+    coverage-write, and coverage-unknown keep their expected results.
+    Panic-format still fails both cases. Safe work is 126,600 transfers.
+    The range proof now skips Arguments::as_str. It stops inside the
+    core::fmt::write effect closure after three states.
+    Evidence: target/scenarios/20261015-173557-1693844 through
+    target/scenarios/20261015-173724-9617867.
+    The kernel finishes in 71.95 seconds, with 1,643,900,928 peak private
+    bytes and three Unknown errors. Recursive Scheduler entries also
+    stop at the snapshot size bound. No kernel pass is claimed.
+    Evidence: target/scenarios/memory-20261015-173607-1943201 and
+    target/solver-refactor-next/kernel-after-42-evidence.
+    A second tenfold diagnostic budget still fails. The new range
+    fallback runs, but Chars::count and iterator-entry reads spend much
+    of the work on exact offsets in other allocations. Keep the
+    default limits unchanged.
+    Evidence: target/scenarios/20261015-173756-0791204.
+
+43. Query allocation identity first in effect snapshots.
+    State: implementation in progress.
+    The effect snapshot first asks for exact pointer values. Only after
+    that query fails does it try the allocation-only fallback. This
+    spends the field budget on changing iterator offsets even when
+    the write is in a different allocation from the watched storage.
+    Use the existing alias filter for the first effect-entry read:
+        self.alias_object = Some(self.preserved.map_or(
+            Object::Summary(usize::MAX, usize::MAX),
+            |(address, _)| address.object,
+        ));
+    Keep exact offsets within the watched object. Preserve private
+    storage and extent data when an allocation-only pointer crosses
+    a summary boundary. An unknown allocation still blocks the proof.
+    First check: both panic-format cases still fail. The range query
+    now finishes early with an unknown vtable. The snapshot stores
+    Metadata::Thin for a two-word dyn pointer after an alias-only read.
+    Thin is not a valid metadata result for that layout. Read metadata
+    separately without an allocation filter. Rebuild the full pointer
+    cells with those metadata alternatives.
+    Evidence: target/scenarios/20261015-174237-1429246.
+    With separate metadata reads, the spurious missing-vtable result
+    is gone. Both default-budget panic-format cases still stop.
+    Evidence: target/scenarios/20261015-174622-2319059.
+
+44. Do not capture arguments that the callee never uses.
+    State: implementation in progress.
+    Scheduler::unpark does not use its self argument. Snapshot creation
+    nevertheless follows self into the complete Scheduler, including
+    the large core array, and stops at the field bound.
+    Record argument use from reachable MIR statements and terminators.
+    Exclude lifetime markers and code after an IRQ cut. Preserve the
+    argument ordinals, but do not queue unused argument values:
+        objects.insert(object, ordinal);
+        if !index.used_arguments.contains(&local) {
+            continue;
+        }
+    Arguments used by calls, drops, addresses, or projections remain
+    in scope. This does not omit a value that the body can read.
+    Result: release build passes. Scenario and kernel checks will use
+    this change together with attempt 45.
+
+45. Keep exact offsets for callback-bearing and erased entry pointers.
+    State: implementation in progress.
+    The larger attempt 43 run reaches Argument::fmt and stops on an
+    unknown storage address. Allocation-only reads also erased the
+    position in an array of formatting arguments. That position is
+    required to bind the stored callback, even if the array is separate
+    from the watched writer storage.
+    Use allocation-first reads only for known pointer-free pointees.
+    Keep exact reads for pointers to pointer-bearing storage, unit
+    pointees with an erased type, and dyn receivers:
+        !pointee.is_unit() && !pointee.is_any_ptr()
+            && !matches!(pointee.kind(), ty::Dynamic(..))
+            && get_pointer_projections(tcx, pointee).is_empty()
+    This retains the byte-buffer shortcut without erasing callback
+    storage positions. Unknown fallback facts remain conservative.
+    Evidence: target/scenarios/20261015-174724-1929735.
+    Result: release build and scoped formatting pass. Formatting,
+    boot-registry, heap-registry, buffered-format, global-update,
+    coverage-write, and coverage-unknown keep their expected results.
+    Panic-format still fails both cases. Unbounded,cut negative still
+    reports a possible Forbidden call.
+    Evidence: target/scenarios/20261015-175142-4051236 through
+    target/scenarios/20261015-175226-4990530.
+    The kernel finishes in 62.48 seconds, with 1,651,142,656 peak private
+    bytes and three Unknown errors. The unpark entry no longer stops
+    on its unused Scheduler argument. A later Option<&Scheduler>
+    entry still follows the whole Scheduler and hits the field bound.
+    Evidence: target/scenarios/memory-20261015-175152-2539029 and
+    target/solver-refactor-next/kernel-after-45-evidence.
+
+46. Retain scalar input identity through constant arithmetic.
+    State: implementation in progress.
+    The cut failure needs the relation between two guards. The first
+    guard selects Forbidden only when remaining == 1. The next call
+    receives remaining - 1 and reaches irq::unreachable at zero.
+    Independent unknown scalar values lose this relation.
+        Value::Symbolic(root_argument, constant_offset, width)
+        Value::Predicate(root_argument, width, expected, equal)
+    Track constant add and subtract modulo the integer width. Check
+    equality and inequality constraints together in feasible(). This
+    rejects remaining == 1 combined with remaining - 1 != 0.
+    Seed symbols only for a typed integer root argument. Unsupported
+    arithmetic remains unknown. Recursive snapshots abstract symbols
+    to Unknown so outer frame identities cannot enter a summary key.
+    Result: build passes. Cut, escaping-cut, unbounded, stable-cycle,
+    and formatting checks keep their expected results. Unbounded,cut
+    negative still fails, but the first impossible Forbidden path is
+    removed. Exact refinement continues to deeper recursive calls,
+    then loses scalar precision. This is not a complete cut fix.
+    Panic-format still fails both cases.
+    Evidence: target/scenarios/20261015-175409-7167546 through
+    target/scenarios/20261015-175449-8071074.
+
+47. Use the existing demand capture for mutable static fields.
+    State: implementation in progress.
+    Passing Option<&Scheduler> causes a snapshot of the entire static
+    Scheduler, even though Option::expect does not read those fields.
+    Mutable static fields already have a demand mechanism: a missing
+    entry read adds its address and type to summary_globals, then the
+    safety closure retries with that field captured.
+    Do not enqueue a whole static pointee merely because a pointer to
+    it is present. Keep its identity, explicit demanded fields, and
+    the preserved range:
+        if !frozen && !outside && !matches!(address.object, Object::Static(_)) {
+            enqueue(&mut pending, (address, normalized, pointee));
+        }
+    Missing mutable fields remain Unknown until their capture succeeds.
+    A stopped capture still cannot return a successful summary.
+    Result: release build passes. Boot-registry, heap-registry,
+    global-update, and formatting keep their expected results.
+    Panic-format still fails. The kernel finishes in 64.89 seconds,
+    with 1,658,753,024 peak private bytes and three Unknown errors.
+    The Scheduler array field stop is removed. The panic closure now
+    checks 108 states before an entry query reaches its transfer limit.
+    Evidence: target/scenarios/20261015-175947-8629308 through
+    target/scenarios/20261015-180021-7439772 and
+    target/scenarios/memory-20261015-175957-7775087.
+
+48. Give each distinct summary state a separate frame.
+    State: implementation in progress.
+    The context table keys states by (instance, EntrySnapshot), but
+    frame() keys them only by instance, caller, and flags. Two entry
+    states at one call point can therefore share a frame. The second
+    entry replaces the first while checked still contains that frame.
+    Allocate a new frame after the state-key lookup finds a new state:
+        let context = proof.summary_frame(frame, entry);
+    Keep exact-call frame interning unchanged. Only a matching summary
+    state key can reuse an abstract entry frame.
+    Result: release build and scoped formatting pass. The saved binary
+    in target/solver-after-48-validation passes 92 of 96 standard cases.
+    Both panic-format cases, stable-cycle negative, and unbounded,cut
+    negative fail. Later source edits cannot change these results.
+
+49. Keep branch-specific argument combinations in safety summaries.
+    State: implementation in progress.
+    entry_snapshot removes guards from each cell independently. This
+    merges a Forbidden receiver with a counter that belongs to another
+    branch. Keep separate snapshots when pointer or enum alternatives
+    have different guards:
+        let entries = proof.entry_snapshots(source, false, &target_guards)?;
+        for entry in entries {
+            let context = proof.summary_frame(frame, entry);
+        }
+    Apply each snapshot's guards to all its fields. A scalar equality
+    can then reduce Symbolic(input, offset, width) to concrete bits.
+    Unknown scalar cells at a summary entry get a fresh identity for
+    that entry. Do not import an outer frame identity into a snapshot.
+    After a pointer-only NeedsRefinement result, try the full guarded
+    closure. If that closure cannot finish, retain NeedsRefinement;
+    do not replace it with the failed full-snapshot result from 38.
+    Effect snapshots keep their conservative joined values. Limit the
+    entry partitions to 32 within the existing query budget.
+    Result: build passes. Unbounded,cut passes safe, negative, and cache
+    checks. Its negative case closes in eight summary states and 7,763
+    total IRQ transfers, without a diagnostic cutoff.
+    Stable-cycle also passes both cases and cache. Formatting,
+    local-callback, boot-registry, cut, unbounded, and unbounded,stable-cycle
+    keep their expected results. Panic-format still fails both cases.
+    Evidence: target/scenarios/20261015-180933-1463814 through
+    target/scenarios/20261015-181122-1309141.
+    The larger panic-format diagnostic still fails at Formatter::pad_integral.
+    Exact iterator field copies still consume the inner effect budget.
+    Evidence: target/scenarios/20261015-181210-4086017.
+
+50. Capture non-static effect fields on demand.
+    State: implementation in progress.
+    Effect snapshots still copy all pointer fields from complete iterator
+    objects. Most of those fields supply read-only byte data, not write
+    addresses or callbacks. Keep argument values and allocation identity,
+    then capture fields that the effect closure actually requests:
+        summary_fields: HashSet<(Instance, PointerObject, i128, Ty)>
+    A missing summary cell records its origin, byte offset, and type.
+    Propagate that demand to caller summaries, then retry with the field
+    present. Each entry key contains all captured values. Distinct call
+    objects remain distinct; the shared origin only selects fields to read.
+    Keep existing eager capture when an object has no usable origin.
+    Safety snapshots retain their existing field capture. Missing cells
+    remain Unknown, and stopped captures still fail explicitly.
+    Result: build and the formatting, boot-registry, heap-registry,
+    buffered-format, global-update, coverage, cut, and stable-cycle
+    checks pass. Panic-format still fails. A larger diagnostic budget
+    shows that field demands supply missing callback fields. However,
+    effect entries still read all used arguments before checking writes.
+    This includes byte slices passed through character-count code.
+    Evidence: target/scenarios/20261015-181927-2031230 through
+    target/scenarios/20261015-182014-2277293 and
+    target/scenarios/20261015-182100-0121015.
+
+51. Apply effect-field demand capture to argument cells.
+    State: implementation in progress.
+    A read-only byte argument does not need its value captured until
+    the effect proof uses it for a write address or call target.
+    Reserve argument object identities, but capture only requested cells:
+        if effects_only {
+            capture(summary_fields[instance, argument]);
+            continue;
+        }
+    Record missing argument cells with their function and local origin.
+    Use the same bounded retry as non-static field demands. Missing
+    cells stay Unknown. Safety snapshots keep their guarded capture.
+    Result: release build passes. The ten focused modes keep their
+    results, including the two failing panic-format cases. With a larger
+    diagnostic budget, the safety closure reaches 75 states instead of
+    27. Sink::write_char is now proved to write only private or static
+    storage. The Location effect proof stops after eight demand retries.
+    The kernel still has three Unknown errors. It finishes in 67.62
+    seconds with 1,673,199,616 peak private bytes.
+    Evidence: target/scenarios/20261015-182352-8356876 through
+    target/scenarios/20261015-182442-1840196 and
+    target/scenarios/memory-20261015-182603-5102620.
+
+52. Collect independent effect demands in one pass.
+    State: implementation in progress.
+    An effect closure stops at its first missing binding. Each retry
+    then repeats the prior work before it finds the next missing field.
+    Record incomplete writes and calls, then check the other sites:
+        incomplete.get_or_insert(reason);
+        continue;
+    Return Unknown if any site remains incomplete. Only a complete
+    pass can return Safe. Keep transfer and retry limits unchanged.
+    Result: build passes. Panic-format still fails at the default limit
+    and at the larger diagnostic limit. Sink::write_str now needs three
+    demand retries instead of seven. Location::fmt reaches forty effect
+    states, but still lacks a writer binding after eight retries.
+    Evidence: target/scenarios/20261015-182938-1721363 and
+    target/scenarios/20261015-183038-0032421.
+
+53. Use field demands for referenced safety storage too.
+    State: removed.
+    Safety entries still follow every pointer into its full allocation.
+    The kernel stops while it captures TaskUpdate and Program storage,
+    before it checks the calls that need those values. Keep argument
+    values and their guards, but capture referenced fields on demand:
+        let deferred = !origins.is_empty();
+    Missing safety fields already record demands and cause a retry.
+    Keep eager capture when no allocation origin is available. A demand
+    only selects fields to capture; it does not merge call-frame objects
+    or establish a callback target. Do not change any proof limit.
+    Result: this one-line extension is not sufficient. Boot-registry,
+    heap-registry, global-update, unbounded,cut, and stable-cycle lose
+    bindings. The kernel still fails. Restore eager safety capture.
+    Effect demand capture remains separate. Do not repeat this change
+    without preserving the safety entry's correlated field closure.
+    Evidence: target/scenarios/20261015-183436-4384691 through
+    target/scenarios/20261015-183523-7722397 and
+    target/scenarios/memory-20261015-183446-3447193.
+
+54. Keep allocation bounds for symbolic pointer offsets.
+    State: implementation in progress.
+    Attempt 46 added Symbolic and Predicate scalar values. Array indexing
+    accepts those values as unknown indices, but BinOp::Offset accepts
+    only Value::Unknown. A symbolic offset therefore bypasses both the
+    allocation-identity fallback and bounded element enumeration:
+        Value::Unknown(_) | Value::Symbolic(..) | Value::Predicate(..)
+    Use the existing unknown-offset path for all three scalar forms.
+    Keep checked allocation extents, index guards, and unknown-origin
+    failures. This does not infer an exact value for a symbolic offset.
+    Result: build and focused control cases pass. Panic-format still
+    fails. The kernel still has three Unknown errors, in 67.40 seconds
+    with 1,696,854,016 peak private bytes. This fixes a missing transfer
+    case, but it does not remove the current budget stop.
+    Evidence: target/scenarios/20261015-183829-4122300 through
+    target/scenarios/20261015-183918-8615102 and
+    target/scenarios/memory-20261015-183839-3517528.
+
+55. Use bounded offset ranges directly in effect closures.
+    State: implementation in progress.
+    The trace shows a known formatting-argument array. Before the
+    existing bounded-offset fallback can select its elements, the
+    effect proof tries to compute arg_index. That computation reads
+    the complete encoded format template through branches and loops.
+    It reaches the budget before returning an unknown scalar value.
+    Effect closures need every possible target, not one exact index:
+        let right = if effect_proof && offset && !constant {
+            Unknown("the effect proof uses a bounded offset range")
+        } else {
+            operand(index)
+        };
+    Use the existing checked allocation bounds and index enumeration.
+    Keep literal offsets exact. Keep exact IRQ call queries unchanged.
+    Unknown origins and unbounded ranges still fail conservatively.
+    Evidence: target/scenarios/20261015-183953-4692910.
+    Result: build and focused control cases pass. Panic-format still
+    fails. With the diagnostic budget, one Location effect pass falls
+    from 7,325 to 4,469 transfers. A later pass still needs more than
+    the default effect budget. Field capture also needs multiple rounds
+    just to obtain the formatter and callback-array argument pointers.
+    Evidence: target/scenarios/20261015-184151-4596814 through
+    target/scenarios/20261015-184246-4778340.
+
+56. Seed shallow callback-bearing arguments in effect entries.
+    State: implementation in progress.
+    Attempt 51 defers even the arguments that locate callbacks and
+    pointer-containing objects. This adds a retry at each call layer.
+    Capture those shallow argument values on the first pass:
+        if effects_only && !argument_has_pointer_bearing_pointee {
+            capture_demanded_argument_fields();
+        } else {
+            capture_argument_value();
+        }
+    Keep referenced storage on demand. Keep byte and scalar data
+    arguments on demand. Recognize pointer-bearing arguments by layout,
+    not by function name. Safety entry capture stays unchanged.
+    Result: build passes. Panic-format still fails at both budgets.
+    Evidence: target/scenarios/20261015-184529-7105328 and
+    target/scenarios/20261015-184549-6952937.
+
+57. Retain completed context-independent work between proofs.
+    State: implementation in progress.
+    A nested proof copies the parent's read-only cache, but its new
+    results are discarded at return. Each demand retry also rebuilds
+    its MIR indices. Preserve that work:
+        proof.indexes = self.indexes.clone();
+        self.indexes.extend(proof.indexes);
+        self.readonly.extend(proof.readonly);
+    MIR indices remain keyed by function and IRQ mode. Read-only facts
+    remain keyed by function and normal-return mode. Do not transfer
+    caller-specific reads, assumptions, or incomplete effect results.
+    Result: release build passes. Panic-format still fails at both
+    budgets. The trace shows repeated reads of the preserved field
+    across the format interpreter's branches.
+    Evidence: target/scenarios/20261015-185001-2902572,
+    target/scenarios/20261015-185043-5126747, and
+    target/scenarios/20261015-185135-3347469.
+
+58. Read the preserved entry field directly inside an effect proof.
+    State: implementation in progress.
+    The effect proof assumes that calls preserve its watched byte range.
+    However, each read of that range still walks all preceding blocks.
+    The Argument::fmt snapshot spends the remaining budget on the same
+    writer metadata at offsets inside the format interpreter.
+    Extend the existing inductive assumption to reads of that captured
+    range. Use its summary entry, not a new caller-wide assumption:
+        if self.assumes_preserved(address, requested) {
+            return self.read(address, requested, entry_point, false);
+        }
+    Keep all direct write and call checks. A write to the watched range
+    prevents Safe. Incomplete checks remain Unknown. Do not apply this
+    shortcut to safety queries or to local storage without an entry.
+    Result: build and focused control cases pass. Panic-format still
+    fails at both budgets. At the larger diagnostic budget, Location::fmt
+    proves preservation after two retries, down from five in attempt 56.
+    The safety closure still loses the Argument receiver pointer.
+    Evidence: target/scenarios/20261015-185342-0874102 through
+    target/scenarios/20261015-185427-4854002 and
+    target/scenarios/20261015-185531-1631148.
+
+59. Use bounded offsets in pointer-only safety preflight.
+    State: implementation in progress.
+    The pointer-only preflight removes scalar entry facts and guards,
+    but still tries to compute exact scalar pointer offsets. Use the
+    same allocation-bounded alternatives as the effect proof:
+        self.assume_readonly || self.summary_pointer_only
+    A preflight can prove Safe only if all alternatives are safe. Any
+    forbidden candidate still requires exact refinement. Do not change
+    exact target queries or full guarded safety summaries. Include the
+    pointer-only mode in summary trace output.
+    Result: release build passes. Panic-format still fails at the default
+    budget. The literal-message path has a separate type-view mismatch.
+    Evidence: target/scenarios/20261015-185809-2808008.
+
+60. Permit an integer view of captured pointer bytes.
+    State: implementation in progress.
+    Arguments::from_str puts (length << 1 | 1) in its args field.
+    Arguments::as_str reads that field as usize to select the literal
+    path. The entry snapshot captures a raw-pointer cell. Its reader
+    permits other pointer types, but rejects an integer of the same
+    width. This loses the known tag even though the bytes are present.
+    Apply the same integer-view rule used by storage assumptions:
+        ty::Ref(..) | ty::RawPtr(..) | ty::FnPtr(..)
+            | ty::Int(_) | ty::Uint(_)
+    Keep the existing size checks. Preserve the abstract value; do not
+    invent the numeric address of an allocation. Unknown values stay
+    unknown. Do not infer pointers from arbitrary integer operations.
+    Result: release build passes. Panic-format still fails at the default
+    limit. Its pointer-only preflight skips path checks, so it cannot use
+    the recovered tag to exclude the placeholder branch for a literal.
+    Evidence: target/scenarios/20261015-190036-1923775.
+
+61. Keep bounded path checks in pointer-only safety preflight.
+    State: implementation in progress.
+    The preflight ignores all call-site paths, including guards whose
+    values are already available from pointer-sized tag fields. It then
+    requests a callback from a literal-only format message. Reuse the
+    existing bounded dominator-path query:
+        if !self.assumptions.is_empty() || self.assume_readonly {
+            return unconstrained_path;
+        }
+    Do not discard paths only because summary_pointer_only is set.
+    Keep the existing 4,096-transfer path allowance and conservative
+    fallback. Effect proofs still use their unguarded over-approximation.
+    Result: build and focused controls pass. Panic-format still fails.
+    With the diagnostic budget, the prior unknown literal callback is
+    gone. The safety closure reaches 227 states, then the cumulative
+    scratch bound stops it. It uses about 2.7 million transfers. Checking
+    every loop guard in pointer preflight adds substantial scalar work.
+    The kernel finishes in 65.33 seconds with three Unknown errors and
+    1,698,525,184 peak private bytes. This is not acceptance.
+    Evidence: target/scenarios/20261015-190323-1899160 through
+    target/scenarios/20261015-190411-0384926,
+    target/scenarios/20261015-190423-0281158, and
+    target/scenarios/memory-20261015-190333-0388435.
+
+62. Limit pointer-preflight path checks to acyclic guards.
+    State: implementation in progress.
+    Keep the literal-versus-callback tag check before the format loop.
+    Do not interpret loop conditions in the pointer-only abstraction:
+        !summary_pointer_only || !loop_blocks.contains(&branch)
+    After a bounded path check, keep only whether any path remains.
+    Discard its residual scalar guards in pointer-only mode. Full safety
+    queries retain all guards. Include the mode in the path-cache key.
+    Result: build passes. Panic-format still fails at both budgets. The
+    larger run reaches 268 safety states, then stops at the cumulative
+    scratch bound after about 2.7 million transfers. The old unknown
+    literal callback is no longer the first failure. No complete panic
+    proof is claimed. Controls have not been rerun for this build.
+    Evidence: target/scenarios/20261015-190826-1731732 and
+    target/scenarios/20261015-190846-2543553.
+
+63. Measure state and entry-capture work.
+    State: diagnosis in progress.
+    Add opt-in IRQ_CHECK_TRACE_STATE output for each summary state and
+    each callee entry. Record transfer cost, captured cells, pending
+    states, effect mode, pointer-only mode, and cumulative scratch.
+    This changes tracing only. Use the measurements to find the costly
+    input dependencies. Do not change proof limits for this trace.
+    Result: a five-cell Formatter::write_fmt entry costs about 127,000
+    transfers. Several PanicInfo::fmt states each cost about 173,000.
+    These states repeat preservation work for the formatter writer.
+    Formatter::pad_integral also spends over 10,000 transfers in one
+    effect state. The cell count is not the limiting quantity.
+    Evidence: target/scenarios/20261015-191547-6652835.
+
+64. Classify callback-bearing argument types through pointer fields.
+    State: implementation in progress.
+    Attempt 56 seeds any argument whose immediate pointee has pointers.
+    This includes Location and its string data, even when those values
+    are not used to select a callback. Follow the type's pointer fields
+    until they reach a function pointer, dyn receiver, or erased unit:
+        pending.extend(pointer_fields(ty));
+        if ty.is_fn_ptr() || is_dyn(ty) { return true; }
+    Use that classification for eager effect arguments and capture
+    priority. Other effect fields still use the existing demand process.
+    Missing write-address or callback data cannot yield Safe. Safety
+    capture retains all its fields. No proof limit is changed.
+    Result: release build and scoped formatting pass. Panic-format still
+    fails at both budgets. Repeated PanicInfo states still cost about
+    173,000 transfers. The type filter is not the main cause of that cost.
+    Evidence: target/scenarios/20261015-191944-7506722 and
+    target/scenarios/20261015-192004-7962628.
+
+65. Check completed range summaries before a new direct proof.
+    State: implementation in progress.
+    The trace shows repeated entry costs close to three direct-proof
+    budgets. A new frame starts its direct storage proof before looking
+    up an existing normalized range summary. Check an exact captured
+    entry first when a completed summary for the callee exists:
+        if completed_summaries.contains(&captured_entry) {
+            return unchanged;
+        }
+    This is a cache-only lookup. A miss does not run a new closure before
+    the direct proof. Keep the existing bounded capture and fallback.
+    Retain completed snapshots from nested proofs. Add static-write mode
+    to their keys, along with instance, entry facts, and IRQ mode. Never
+    transfer incomplete results or caller-specific read-cache entries.
+    This differs from attempt 33, which ran a new range proof first.
+    Build note: a check started before the build process had returned.
+    Windows then blocked replacement of the running driver executable.
+    The checks in target/scenarios/20261015-192312-4320750 and
+    target/scenarios/20261015-192314-4367865 use attempt 64, not 65.
+    Rebuild with no active checker, then run the checks again.
+    Result: the later release build passes. The focused controls keep
+    their expected results. Panic-format still fails at both budgets.
+    The larger run uses 240 completed range-cache hits. It reaches 292
+    states, then the per-function alternative bound stops Arguments::as_str.
+    A later PanicInfo state costs about 91,000 transfers, down from
+    about 173,000. This is not a complete panic proof.
+    Evidence: target/scenarios/20261015-192521-9604651 through
+    target/scenarios/20261015-192601-8177677.
+
+66. Limit referenced-field capture in pointer-only safety preflight.
+    State: implementation in progress.
+    Arguments::as_str captures the complete format callback array and
+    its referenced objects, although it only reads the tag and string
+    fields. These unused fields create distinct states until the
+    per-function alternative bound stops the closure.
+        let deferred =
+            (effects_only || summary_pointer_only) && !origins.is_empty();
+    Use field demands in pointer-only preflight. Keep the full guarded
+    safety capture unchanged. Missing fields remain Unknown and request
+    a retry. Do not accept an incomplete proof. This differs from
+    attempt 53, which also changed the full guarded safety capture.
+    Evidence: target/scenarios/20261015-192948-8430163.
+    Result: release build and scoped formatting pass. Boot-registry,
+    heap-registry, global-update, unbounded,cut, and stable-cycle pass
+    both cases and their cache checks. Panic-format still fails at both
+    budgets. At the larger budget, capture now stops earlier, in a
+    PanicInfo formatter entry after 26 safety states. Missing field
+    demands recover some bindings, but memory-preservation reads still
+    exhaust the entry allowance. This change is not a confirmed fix.
+    Evidence: target/scenarios/20261015-193214-1118246,
+    target/scenarios/20261015-193234-5328184, and
+    target/scenarios/20261015-193306-5770978 through
+    target/scenarios/20261015-193320-5807845.

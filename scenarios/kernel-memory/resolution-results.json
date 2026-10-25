@@ -1,0 +1,65 @@
+{
+  "driver_sha256": "BC074C5D2BA0CD9EFEA9C5420D400CC5346259F4A53042EE922C2C328623969D",
+  "source_sha256": "63B07154873B5CCB045C6FA6A36B6C33E3185A614F8C328C9A0AFB432E260CE3",
+  "memory_limit": null,
+  "time_limit": null,
+  "changes": [
+    "Keep null and non-null raw pointer states separate in startup and IRQ analysis.",
+    "Keep pointer null status in the flow merge key, without heap contents.",
+    "Find default allocator shim targets through module metadata when the export list omits them. Require an exact compiler symbol match.",
+    "Do not infer an external entry for the panic implementation. Keep actual calls and explicit IRQ context marks."
+  ],
+  "runs": [
+    {
+      "scenario": "kernel-memory",
+      "features": ["formatting", "dispatch"],
+      "evidence": "target/scenarios/memory-20261010-215741-4630431",
+      "exit_code": 0,
+      "seconds": 94.552899,
+      "target_peak_private_bytes": 993886208,
+      "target_peak_commit_bytes": 1000067072
+    },
+    {
+      "scenario": "kernel-memory",
+      "features": ["formatting", "dispatch"],
+      "evidence": "target/scenarios/memory-20261010-220127-9490185",
+      "exit_code": 0,
+      "seconds": 85.5686776,
+      "target_peak_private_bytes": 972484608,
+      "target_peak_commit_bytes": 990973952
+    },
+    {
+      "scenario": "kernel-memory",
+      "features": ["escape", "formatting", "dispatch"],
+      "evidence": "target/scenarios/memory-20261010-215917-0788205",
+      "exit_code": 101,
+      "seconds": 195.7030973,
+      "target_peak_private_bytes": 2572972032,
+      "target_peak_commit_bytes": 2601005056,
+      "verdict": "Unresolved calls remain. The escape feature writes through a pointer returned by an excluded dependency."
+    },
+    {
+      "scenario": "memory-growth",
+      "evidence": "target/scenarios/memory-20261010-215751-6130918",
+      "exit_code": 0,
+      "target_peak_commit_bytes": 155000832
+    },
+    {
+      "scenario": "memory-growth-roots",
+      "features": ["roots-17"],
+      "evidence": "target/scenarios/memory-20261010-215835-5242170",
+      "exit_code": 0,
+      "target_peak_commit_bytes": 189947904
+    }
+  ],
+  "existing_checks": {
+    "evidence": "target/scenarios/20261010-215845-9480291",
+    "accepted": 10,
+    "context_growth_safe": "target/scenarios/memory-20261010-220102-8207321",
+    "context_growth_safe_exit_code": 0,
+    "context_growth_negative": "target/scenarios/memory-20261010-215935-7494283",
+    "context_growth_negative_exit_code": 101,
+    "context_growth_negative_target": "forbidden_growth"
+  },
+  "actual_kernel_checked": false
+}

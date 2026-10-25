@@ -66,6 +66,8 @@ impl Fact {
 struct Summary {
     returned: Fact,
     conditions: HashMap<Location, Fact>,
+    arguments: HashMap<Location, Box<[Fact]>>,
+    calls_safe: bool,
 }
 
 type SummaryKey<'tcx> = (Instance<'tcx>, bool, Option<usize>, Box<[Fact]>);
@@ -74,18 +76,121 @@ type SummaryKey<'tcx> = (Instance<'tcx>, bool, Option<usize>, Box<[Fact]>);
 pub(crate) struct ScalarCache<'tcx> {
     summaries: HashMap<SummaryKey<'tcx>, Summary>,
     bytes: usize,
+    frames: HashMap<usize, (usize, Vec<SummaryKey<'tcx>>, usize)>,
+    frame_bytes: usize,
 }
 
 impl<'a, 'tcx> Solver<'a, 'tcx> {
     pub(super) fn scalar_condition(&mut self, point: Point) -> Result<Option<u128>, QueryStop> {
+        self.scalar_summary(point).map(|(condition, _)| condition)
+    }
+
+    pub(in crate::analysis) fn scalar_summary(&mut self, point: Point) -> Result<(Option<u128>, bool), QueryStop> {
+        if let Some((generation, roots, _)) = self.scalars.frames.get(&point.frame)
+            && *generation == self.flow.generation
+        {
+            return self.scalar_summaries(point, roots.clone());
+        }
+        let scratch = self.budget.scratch;
+        let answer = (|| {
+            let mut pending = vec![(point.frame, false)];
+            let mut seen = HashSet::new();
+            let mut ordered = Vec::new();
+            while let Some((frame, ready)) = pending.pop() {
+                self.budget.charge(std::mem::size_of::<usize>() * 12)?;
+                if ready { ordered.push(frame); continue; }
+                if !seen.insert(frame) { continue; }
+                pending.push((frame, true));
+                if self.scalars.frames.get(&frame).is_some_and(|(generation, _, _)| *generation == self.flow.generation) { continue; }
+                for caller in self.flow.inputs.get(&frame).into_iter().flatten() {
+                    pending.push((caller.frame, false));
+                }
+            }
+            let mut answer = (None, false);
+            for id in ordered {
+                let frame = self.frames[id];
+                let generic: Vec<_> = self.frame_contexts[id].as_ref().filter(|contexts| !contexts.is_empty())
+                    .map_or_else(|| vec![(frame.instance, frame.irq, None, Box::<[Fact]>::default())],
+                        |contexts| contexts.iter().map(|&context| (frame.instance, frame.irq, Some(context), Box::<[Fact]>::default())).collect());
+                let roots = if let Some((generation, roots, _)) = self.scalars.frames.get(&id)
+                    && *generation == self.flow.generation
+                { roots.clone() } else {
+                    let mut roots = if self.flow.roots.contains(&id) { generic.clone() } else { Vec::new() };
+                    let callers = self.flow.inputs.get(&id).cloned().unwrap_or_default();
+                    let index = self.index(id)?;
+                    for caller in callers {
+                        let parent = self.index(caller.frame)?;
+                        let args = match &parent.body.basic_blocks[caller.location.block].terminator().kind {
+                            TerminatorKind::Call { args, .. } | TerminatorKind::TailCall { args, .. } => Some(args),
+                            _ => None,
+                        };
+                        let parent_roots = self.scalars.frames.get(&caller.frame)
+                            .filter(|(generation, _, _)| *generation == self.flow.generation)
+                            .map(|(_, roots, _)| roots.clone()).unwrap_or_default();
+                        let mut inputs = None::<Vec<Fact>>;
+                        let mut complete = !parent_roots.is_empty();
+                        for key in parent_roots {
+                            let Some(arguments) = self.scalars.summaries.get(&key)
+                                .and_then(|summary| summary.arguments.get(&caller.location))
+                            else { complete = false; break; };
+                            if let Some(inputs) = &mut inputs {
+                                if inputs.len() != arguments.len() { complete = false; break; }
+                                for (input, &argument) in inputs.iter_mut().zip(arguments.iter()) { *input = input.join(argument); }
+                            } else { inputs = Some(arguments.to_vec()); }
+                        }
+                        let mut inputs = inputs.filter(|_| complete).unwrap_or_default();
+                        for (position, input) in inputs.iter_mut().enumerate() {
+                            let compatible = args.and_then(|args| args.get(position)).filter(|_| position < index.body.arg_count)
+                                .is_some_and(|argument| self.ty(id, index.body.local_decls[mir::Local::from_usize(position + 1)].ty)
+                                    == self.ty(caller.frame, argument.node.ty(parent.body, self.tcx)));
+                            if !compatible || !matches!(input, Fact::Bits(_) | Fact::Variant(_)) { *input = Fact::Unknown; }
+                        }
+                        inputs.truncate(index.body.arg_count);
+                        while inputs.last() == Some(&Fact::Unknown) { inputs.pop(); }
+                        for mut root in generic.clone() {
+                            root.3 = inputs.clone().into_boxed_slice();
+                            if !root.3.is_empty() && !self.scalars.summaries.contains_key(&root)
+                                && self.scalars.summaries.keys().filter(|key|
+                                    key.0 == root.0 && key.1 == root.1 && key.2 == root.2 && !key.3.is_empty()).count() >= 8
+                            { root.3 = Box::default(); }
+                            if !roots.contains(&root) { roots.push(root); }
+                        }
+                    }
+                    if roots.is_empty() { roots = generic; }
+                    roots
+                };
+                let at = if id == point.frame { point } else { Point { frame: id, location: Location::START } };
+                let value = self.scalar_summaries(at, roots.clone())?;
+                if id == point.frame { answer = value; }
+                let bytes = std::mem::size_of::<(usize, Vec<SummaryKey<'tcx>>, usize)>() * 4
+                    + roots.iter().map(|key| std::mem::size_of::<SummaryKey<'tcx>>() * 4
+                        + key.3.len() * std::mem::size_of::<Fact>() * 4).sum::<usize>();
+                if let Some((_, _, previous)) = self.scalars.frames.remove(&id) {
+                    self.scalars.frame_bytes = self.scalars.frame_bytes.saturating_sub(previous);
+                }
+                if self.scalars.frame_bytes.saturating_add(bytes) > self.cache_limit / 32 {
+                    self.scalars.frames.clear();
+                    self.scalars.frame_bytes = 0;
+                }
+                if bytes <= self.cache_limit / 32 {
+                    self.budget.reserve(bytes)?;
+                    self.scalars.frame_bytes += bytes;
+                    self.scalars.frames.insert(id, (self.flow.generation, roots, bytes));
+                }
+            }
+            Ok(answer)
+        })();
+        self.budget.scratch = scratch;
+        answer
+    }
+
+    fn scalar_summaries(&mut self, point: Point, roots: Vec<SummaryKey<'tcx>>) -> Result<(Option<u128>, bool), QueryStop> {
         let frame = self.frames[point.frame];
-        let roots: Vec<_> = self.frame_contexts[point.frame].as_ref().filter(|contexts| !contexts.is_empty())
-            .map_or_else(|| vec![(frame.instance, frame.irq, None, Box::<[Fact]>::default())],
-                |contexts| contexts.iter().map(|&context| (frame.instance, frame.irq, Some(context), Box::<[Fact]>::default())).collect());
         if roots.iter().all(|root| self.scalars.summaries.contains_key(root)) {
             let value = roots.iter().fold(Fact::Bottom, |value, root| value.join(
                 self.scalars.summaries[root].conditions.get(&point.location).copied().unwrap_or(Fact::Unknown)));
-            return Ok(match value { Fact::Bits(bits) => Some(bits), _ => None });
+            let safe = !roots.is_empty() && roots.iter().all(|root| self.scalars.summaries[root].calls_safe);
+            return Ok((match value { Fact::Bits(bits) => Some(bits), _ => None }, safe));
         }
         let scratch = self.budget.scratch;
         let limits = irq_check_rupta::limits::configuration().expect("validated analysis limits");
@@ -95,7 +200,7 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
         let mut queued = HashSet::new();
         for root in &roots {
             if !self.scalars.summaries.contains_key(root) {
-                summaries.insert(root.clone(), Summary { returned: Fact::Bottom, conditions: HashMap::new() });
+                summaries.insert(root.clone(), Summary { returned: Fact::Bottom, conditions: HashMap::new(), arguments: HashMap::new(), calls_safe: false });
                 queue.push_back(root.clone());
                 queued.insert(root.clone());
             }
@@ -179,10 +284,13 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                 let mut block_queued = HashSet::from([mir::START_BLOCK]);
                 let mut returned = Fact::Bottom;
                 let mut conditions = HashMap::<Location, Fact>::new();
+                let mut arguments = HashMap::<Location, Box<[Fact]>>::new();
+                let mut argument_bytes = 0usize;
+                let mut calls_safe = crate::forbidden(self.tcx, instance).is_none();
                 while let Some(block) = blocks.pop_front() {
                     block_queued.remove(&block);
                     self.budget.scratch = scratch;
-                    self.budget.charge(bytes.saturating_add(retained))?;
+                    self.budget.charge(bytes.saturating_add(retained).saturating_add(argument_bytes))?;
                     let mut state = entries[block.as_usize()].clone().expect("reachable scalar block");
                     let data = &body.basic_blocks[block];
                     for (statement_index, statement) in data.statements.iter().enumerate() {
@@ -328,6 +436,24 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                     }
                     if index.stops[block.as_usize()].is_some() { continue; }
                     let at = Location { block, statement_index: data.statements.len() };
+                    if let TerminatorKind::Call { args, .. } | TerminatorKind::TailCall { args, .. } = &data.terminator().kind {
+                        let incoming: Box<[_]> = args.iter().map(|argument|
+                            match Fact::operand(self.tcx, instance, &index, &state, &argument.node) {
+                                fact @ (Fact::Bits(_) | Fact::Variant(_)) => fact,
+                                _ => Fact::Unknown,
+                            }).collect();
+                        if let Some(previous) = arguments.get_mut(&at) {
+                            for (previous, &incoming) in previous.iter_mut().zip(incoming.iter()) { *previous = previous.join(incoming); }
+                        } else {
+                            argument_bytes = argument_bytes.saturating_add(std::mem::size_of::<(Location, Box<[Fact]>)>() * 4
+                                + incoming.len() * std::mem::size_of::<Fact>() * 4);
+                            if bytes.saturating_add(argument_bytes) > limits.function_scratch_mib * 1024 * 1024 {
+                                return Err(QueryStop::RefinementLimit);
+                            }
+                            self.budget.charge(argument_bytes)?;
+                            arguments.insert(at, incoming);
+                        }
+                    }
                     let mut successors: Vec<_> = data.terminator().successors().collect();
                     match &data.terminator().kind {
                         TerminatorKind::SwitchInt { discr, targets } => {
@@ -335,10 +461,11 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                             let previous = conditions.entry(at).or_insert(Fact::Bottom);
                             *previous = previous.join(value);
                             if let Fact::Bits(bits) = value { successors = vec![targets.target_for_value(bits)]; }
-                            else if value == Fact::Bottom { successors.clear(); }
+                            else if value == Fact::Bottom { successors.clear(); calls_safe = false; }
                         }
                         TerminatorKind::Assert { cond, expected, target, unwind, .. } => {
                             let value = Fact::operand(self.tcx, instance, &index, &state, cond);
+                            calls_safe &= matches!(value, Fact::Bits(bits) if (bits != 0) == *expected);
                             let previous = conditions.entry(at).or_insert(Fact::Bottom);
                             *previous = previous.join(value);
                             if let Fact::Bits(bits) = value {
@@ -358,6 +485,16 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                             };
                             let result_ty = normalize(destination.ty(body, self.tcx).ty);
                             let mut result = Fact::Unknown;
+                            let function_ty = normalize(func.ty(body, self.tcx));
+                            let direct = if let ty::FnDef(def, args) = *function_ty.kind() {
+                                Instance::try_resolve(self.tcx, TypingEnv::fully_monomorphized(), def,
+                                    self.tcx.instantiate_bound_regions_with_erased(args)).ok().flatten()
+                                    .filter(|target| !matches!(target.def, InstanceKind::Virtual(..)))
+                            } else { None };
+                            let mut call_safe = direct.is_some_and(|target| self.facts.safe.contains(&target))
+                                || self.facts.covered_calls.contains(&(instance, at))
+                                    && self.facts.safe_candidates.get(&(instance, at)).is_some_and(|targets|
+                                        !targets.is_empty() && targets.iter().all(|target| self.facts.safe.contains(target)));
                             if needed.contains(&destination.local) && destination.projection.is_empty() && (matches!(result_ty.kind(), ty::Bool | ty::Int(_) | ty::Uint(_))
                                 || matches!(result_ty.kind(), ty::Adt(adt, _) if adt.is_enum())) {
                                 let function_ty = normalize(func.ty(body, self.tcx));
@@ -376,11 +513,13 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                                     } else { Vec::new() };
                                 if !targets.is_empty() {
                                     result = Fact::Bottom;
+                                    let mut targets_safe = true;
                                     for (original, mut context) in targets {
-                                        let Some(target) = self.linked_target(original) else { result = Fact::Unknown; break; };
+                                        let Some(target) = self.linked_target(original) else { result = Fact::Unknown; targets_safe = false; break; };
                                         if target != original { context = None; }
                                         if matches!(target.def, InstanceKind::Intrinsic(_))
                                             && self.tcx.item_name(target.def_id()).as_str() == "black_box" && args.len() == 1 {
+                                            targets_safe &= self.facts.safe.contains(&target);
                                             result = result.join(Fact::operand(self.tcx, instance, &index, &state, &args[0].node));
                                             continue;
                                         }
@@ -390,7 +529,7 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                                             let body = self.tcx.instance_mir(target.def);
                                             let returned_ty = target.instantiate_mir_and_normalize_erasing_regions(self.tcx,
                                                 TypingEnv::fully_monomorphized(), EarlyBinder::bind(self.tcx, body.local_decls[mir::RETURN_PLACE].ty));
-                                            if returned_ty != result_ty { result = Fact::Unknown; break; }
+                                            if returned_ty != result_ty { result = Fact::Unknown; targets_safe = false; break; }
                                         }
                                         let callee_body = if !matches!(target.def, InstanceKind::Intrinsic(_) | InstanceKind::LlvmIntrinsic(_) | InstanceKind::Virtual(..))
                                             && !self.tcx.is_foreign_item(target.def_id())
@@ -409,7 +548,7 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                                                 _ => Fact::Unknown,
                                             }
                                         }).collect();
-                                        if inputs.contains(&Fact::Bottom) { continue; }
+                                        if inputs.contains(&Fact::Bottom) { targets_safe = false; continue; }
                                         while inputs.last() == Some(&Fact::Unknown) { inputs.pop(); }
                                         let mut callee = (target, irq, context, inputs.into_boxed_slice());
                                         if !callee.3.is_empty() && !summaries.contains_key(&callee) && !self.scalars.summaries.contains_key(&callee)
@@ -421,24 +560,34 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                                             else {
                                                 users.entry(callee.clone()).or_default().insert(key.clone());
                                                 if !summaries.contains_key(&callee) {
-                                                    summaries.insert(callee.clone(), Summary { returned: Fact::Bottom, conditions: HashMap::new() });
+                                                    summaries.insert(callee.clone(), Summary { returned: Fact::Bottom, conditions: HashMap::new(), arguments: HashMap::new(), calls_safe: false });
                                                     if queued.insert(callee.clone()) { queue.push_back(callee.clone()); }
                                                 }
                                                 summaries[&callee].returned
                                             };
+                                        targets_safe &= self.facts.safe.contains(&target)
+                                            || self.scalars.summaries.get(&callee).or_else(|| summaries.get(&callee))
+                                                .is_some_and(|summary| summary.calls_safe);
                                         let fact = if let Fact::Argument(argument) = fact {
                                             args.get(argument.saturating_sub(1)).filter(|argument| normalize(argument.node.ty(body, self.tcx)) == result_ty)
                                                 .map_or(Fact::Unknown, |argument| Fact::operand(self.tcx, instance, &index, &state, &argument.node))
                                         } else { fact };
                                         result = result.join(fact);
                                     }
+                                    call_safe |= targets_safe;
                                 }
                             }
+                            calls_safe &= call_safe;
                             if !destination.is_indirect() { state[destination.local.as_usize()] = result; }
                             if matches!(data.terminator().kind, TerminatorKind::TailCall { .. }) { returned = returned.join(result); }
                         }
-                        TerminatorKind::InlineAsm { .. } => state.fill(Fact::Unknown),
-                        TerminatorKind::Drop { place, .. } if !place.is_indirect() => state[place.local.as_usize()] = Fact::Unknown,
+                        TerminatorKind::InlineAsm { .. } => { state.fill(Fact::Unknown); calls_safe = false; }
+                        TerminatorKind::Drop { place, .. } => {
+                            let ty = normalize(place.ty(body, self.tcx).ty);
+                            calls_safe &= !matches!(ty.kind(), ty::Dynamic(..))
+                                && self.facts.safe.contains(&Instance::resolve_drop_glue(self.tcx, ty));
+                            if !place.is_indirect() { state[place.local.as_usize()] = Fact::Unknown; }
+                        }
                         _ => {}
                     }
                     for successor in successors {
@@ -502,16 +651,20 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                 }
                 let summary = summaries.get_mut(&key).expect("evaluated scalar summary");
                 let joined = summary.returned.join(returned);
-                let changed = joined != summary.returned;
+                let changed = joined != summary.returned || calls_safe != summary.calls_safe;
                 summary.returned = joined;
                 summary.conditions = conditions;
+                summary.arguments = arguments;
+                summary.calls_safe = calls_safe;
                 if changed {
                     for user in users.get(&key).into_iter().flatten() {
                         if queued.insert(user.clone()) { queue.push_back(user.clone()); }
                     }
                 }
                 retained = summaries.values().map(|summary| std::mem::size_of::<Summary>() * 8
-                    + summary.conditions.len() * std::mem::size_of::<(Location, Fact)>() * 4).sum::<usize>()
+                    + summary.conditions.len() * std::mem::size_of::<(Location, Fact)>() * 4
+                    + summary.arguments.values().map(|arguments| std::mem::size_of::<(Location, Box<[Fact]>)>() * 4
+                        + arguments.len() * std::mem::size_of::<Fact>() * 4).sum::<usize>()).sum::<usize>()
                     + summaries.keys().map(|key| std::mem::size_of::<SummaryKey<'tcx>>() * 4 + key.3.len() * std::mem::size_of::<Fact>()).sum::<usize>()
                     + users.values().flat_map(|users| users.iter()).map(|key| std::mem::size_of::<SummaryKey<'tcx>>() * 4 + key.3.len() * std::mem::size_of::<Fact>()).sum::<usize>();
                 if retained > self.cache_limit / 16 { return Err(QueryStop::RefinementLimit); }
@@ -536,12 +689,14 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
         let value = roots.iter().fold(Fact::Bottom, |value, root| value.join(
             summaries.get(root).or_else(|| self.scalars.summaries.get(root))
                 .and_then(|summary| summary.conditions.get(&point.location)).copied().unwrap_or(Fact::Unknown)));
+        let safe = !roots.is_empty() && roots.iter().all(|root|
+            summaries.get(root).or_else(|| self.scalars.summaries.get(root)).is_some_and(|summary| summary.calls_safe));
         if self.scalars.bytes.saturating_add(retained) > self.cache_limit / 16 {
             self.scalars.summaries.clear();
             self.scalars.bytes = 0;
         }
         self.scalars.bytes += retained;
         self.scalars.summaries.extend(summaries);
-        Ok(match value { Fact::Bits(bits) => Some(bits), _ => None })
+        Ok((match value { Fact::Bits(bits) => Some(bits), _ => None }, safe))
     }
 }

@@ -1,0 +1,762 @@
+irq-check measured results
+
+2026-10-10: full-kernel run with all four pruning changes
+- Started at target/scenarios/memory-20261011-031406-4935315. Checker: target/pruning-final-build/release/irq-check.exe. Driver SHA256: 07245F725CFAD3FA89131285D463985B194FD0CB8725F350E71951FAB9EBF607.
+- Rebuilt the main source in release mode; Cargo reported it current in 0.79 seconds. Self-check passed. This is the main-source binary, not the benchmark-switch copy.
+- Kernel manifest: C:/Users/Boden/Documents/rustOS/kernel/Cargo.toml. Working directory: C:/Users/Boden/Documents/rustOS. Target: x86_64-rustos-kernel.json. Build-std: core,alloc,compiler_builtins,panic_abort. Release build uses target/pruning-kernel-cargo.
+- Memory sampling and solver statistics are enabled. Memory and time limits are disabled. Diagnostic snapshots are disabled. No other kernel checker run was active at launch. Result pending.
+
+2026-10-10: retain all four pruning changes
+- User approved all four changes after the concurrent comparison. Verified that atomic read footprints, context/storage collection and fact compaction, unused argument pruning, and expired tree cleanup are already enabled in the main source.
+- No additional solver edit was needed. Benchmark switches and the extra peak-counter instrumentation remain in target/pruning-study/source only; they were not copied into the main source.
+- cargo +nightly check --locked --bins passed in 1.39 seconds. The diff whitespace check for src/analysis.rs and src/pointer.rs passed. No tests, code comments, or formatting were added.
+- This confirms the source state. No installed binary was replaced and no commit was made. Full-kernel memory reduction remains unverified.
+
+2026-10-10: corrected concurrent per-change study
+- Completed: all 108 runs have saved results, 18 per setting. Full recovered matrix: performance/concurrent-pruning-results.txt. All used driver peak counters, the same binary, default package features, and no memory or time limits.
+- Each setting passed 16 IRQ scenarios and built the helper library. Default kernel-memory was incomplete in all six settings, with 19 to 21 incomplete-analysis errors. There was no compiler-error or panic marker. No new pass-to-fail outcome was observed in this matrix.
+- Collection-only reduced default context-growth peak from 403124224 to 349204480 bytes (13.38 percent) and retired 2177 contexts. Combined peak was 345223168 bytes (14.36 percent lower), with 2182 retired contexts. Formatting collection-only peak fell from 396115968 to 385167360 bytes.
+- Other individual changes did not show broad memory gains. Their largest observed increases were atomic +0.99 percent, arguments +1.45 percent, and trees +2.53 percent, all on default context-growth. These are single-run observations, not established stable regressions. Collection and combined also had small increases on other cases.
+- The command ended with exit 1 when its final report append hit a file-sharing error. All scenario analyses and result files were already complete. The recovered report contains all 108 measurements; the report-write error is not a solver failure.
+- User clarified that each change must run all 18 scenarios at the same time. The sequential matrix is superseded and its completed evidence is retained.
+- New runner: target/pruning-study/concurrent-changes.ps1. Each setting starts 18 separate worker processes, waits for all 18 to report ready, then releases them through one shared start signal. Settings run as separate batches: baseline, atomic only, collection only, arguments only, trees only, combined.
+- Each package uses its default features and its own Cargo target directory. The helper library is build-only. Memory and time limits remain disabled. All six settings use the same peak-counter binary. Results from this concurrent study must not be mixed with the earlier sequential or large-feature runs.
+- Each completed batch appends its 18 results below. Concurrent timings include resource contention. A nonzero exit or incomplete analysis is not a pass.
+
+2026-10-10: separate pruning measurements and concurrent scenario batch
+- Requested: measure each of the four changes separately and start every existing scenario together.
+- Prepared a benchmark-only source copy at target/pruning-study/source. Main source and existing binaries remain unchanged. The copy uses one bit per change in IRQ_CHECK_PRUNING_STUDY: atomic/read proofs=1, context/storage collection and fact compaction=2, unused arguments=4, expired tree cleanup=8.
+- The controlled baseline disables all four paths. It retains the new storage-ID and empty cache infrastructure. It is not the historical baseline binary. Collection disabled means all stored objects and alias entries remain roots and fact compaction is skipped.
+- The concurrent batch starts all 18 existing packages together on the current combined binary. Each package uses a separate Cargo target directory. Existing negative features run after their package's default case. The boundary package is a helper library, not an IRQ policy scenario.
+- Each concurrent case has a 2 GiB private-memory limit and a 900-second time limit. Limit stops are incomplete results, not passes. The earlier kernel process remains untouched. Concurrent elapsed times are not isolated speed measurements.
+- Per-change measurements will run after the concurrent batch. No tests, scenario sources, or main solver changes are added for this study.
+- User requested removal of the memory limit. The concurrent batch will restart without memory or time limits. Earlier limited attempts remain separate and are not completed benchmark results.
+- Benchmark build and self-check passed. Driver SHA256: 89EEE7B937ABC35FC974F468C07C81F2DFD150D012D98B10C550FD1C4EDF5FBF. Six settings use the same binary: 0, 1, 2, 4, 8, 15. Each individual setting enables only its named pruning change. These are controlled ablations, not six historical source revisions.
+- The uncapped batch stopped when two jobs used the same timestamp-based evidence directory. This is a measurement-runner failure. The copied runner now adds a GUID suffix. The helper library has no IRQ roots; its copied-runner invocation now omits the required-root setting and checks compilation only. The main runner and solver source are unchanged.
+- Separate measurements use all 18 existing packages. Context-growth uses chain-64, writer-growth uses large, and kernel-memory uses formatting,dispatch. These six-setting runs execute one at a time after the corrected concurrent batch. Memory and time limits remain disabled. Each result is saved at target/pruning-study/separate-results.jsonl.
+- Also added the historical verified-memory binary as a seventh control for each package. The all-disabled copied build retains shared infrastructure; comparison with the historical binary can show costs not isolated by the four switches. Zero target-memory samples are reported as unavailable, not zero memory use.
+- Corrected concurrent batch completed: 16 IRQ scenarios passed, the helper library built, and all 14 negative features reported the expected forbidden call without compiler, panic, or incomplete-analysis errors. Default kernel-memory exited 101 with 21 incomplete-analysis errors; peak sampled driver commit was 1688043520 bytes. Its escape feature was enabled. This is not a pass or an established regression. Evidence: target/pruning-study/bulk-results.json; kernel-memory log: memory-20261011-021807-6183527-5e66a033.
+- First separate memory-growth runs completed for all six switch settings. Collection retired 18 contexts. Short target processes were sampled inconsistently, so their sampled memory values do not establish regressions. A benchmark-only driver build now adds the Windows process peak counter at normal process exit. New measurements wait for that build; active analysis is not stopped. No memory or time cap was added.
+- Peak-counter build and self-check passed. The matrix restarts on that build. Earlier sampled comparisons remain at target/pruning-study/separate-preliminary-results.jsonl. The waiting controller was replaced only after its active analysis finished. Each new completed case appends a measured row to this file and to target/pruning-study/separate-results.jsonl. Default kernel-memory is also included to check its incomplete outcome against each configuration.
+- Peak-counter driver SHA256: E9B1EFCCA87DA49988C0BE9271EDA92E6A3E44C93D698E96ED0301386117491E. Its only extra solver-independent change reads the Windows process peak-commit counter before the driver exits. Historical-binary values remain sampled.
+- First complete peak-counter case, memory-growth: baseline 187379712 bytes; atomic only 186294272; collection only 187105280; argument pruning only 186601472; tree cleanup only 186044416; combined 186327040. All passed. These single-run differences are below one percent and do not establish a memory ranking. Collection retired 18 contexts in its individual and combined runs. Detailed measured rows are appended below.
+- Chain-64 individual comparison completed on the peak-counter build. All six controlled settings passed. Baseline: 834617344 bytes, 9393 retained contexts. Atomic only: 820957184 bytes, 9221 retained. Collection only: 781303808 bytes, 7921 retained, 1433 retired. Arguments only: 829583360 bytes, 9310 retained. Trees only: 818495488 bytes, 9375 retained, 63 expired buckets removed. Combined: 774418432 bytes, 7683 retained, 1448 retired. Retained counts are not total-ever-created counts.
+- Chain-64 peak reductions against the controlled baseline: atomic 1.64 percent; collection 6.39 percent; arguments 0.60 percent; trees 1.93 percent; combined 7.21 percent. Each value is from one run. Effects are not additive. Collection has the largest measured individual effect in this case. Small changes need repeats before they can be treated as stable gains. No individual peak-memory regression appeared in this case.
+- The remaining per-change matrix is still running, starting with writer-growth large. No overall regression verdict is available yet. No memory or time limit applies. Completed rows continue to append below.
+
+2026-10-10: context and storage pruning, implementation in progress
+- Added atomic intrinsic footprints for integer and Boolean storage. Pointer atomics and unsupported operations keep the full-input fallback. Store footprints retain the destination cell because the effect model uses weak updates.
+- Added argument-path collection from MIR uses. Context input construction omits unused arguments and unused fields before it follows storage references. Whole-object uses retain the whole object.
+- Changed collection roots so unescaped private storage and private alias entries do not independently retain their owners. Exported backend storage, escaped objects, global storage, pending work, calls, and unknown-write origins remain protected.
+- Added stable storage IDs and fact-table compaction. Removed values can be released after they leave all retained points-to sets. Backend-exported storage IDs are pinned and are not reused.
+- Added expired weak-tree bucket cleanup at collection boundaries. Large excess index capacity can be released.
+- No tests or scenario sources were added. Compile and existing-scenario verification are pending. No memory improvement is claimed.
+- Initial cargo +nightly check --locked --bins passed in 3.31 seconds. The release build uses target/pruning-build and does not replace existing binaries. An earlier full-kernel run remains active on target/verified-memory-build; scenario times will not be isolated measurements.
+- Final release build passed in 3m 39s. Self-check passed. Driver SHA256: A79036F9E7609A73604B3385FBE2141E50EB4A93257223E2EC7424A825F1F920. Existing graph checks, cache checks, and normal-mode chain-64 verification are in progress. Baseline chain evidence: target/scenarios/memory-20261011-013413-8296106. Candidate chain evidence: target/scenarios/memory-20261011-013758-5865904.
+- Collection review then added roots for storage and alias owners outside the retirement candidate set. This protects retained discovery storage even if it has no known-node entry. The final source is being built in target/pruning-final-build. The A79036F9 build is now an intermediate candidate. Its graph checks have collection disabled and do not verify the final collection change.
+- Fresh baseline chain-64 exited 0 in 183.547 seconds. Analysis-driver peak commit: 831893504 bytes. Fresh baseline kernel-memory formatting,dispatch exited 0 in 127.132 seconds. Analysis-driver peak commit: 670560256 bytes. Evidence: memory-20261011-013413-8296106 and memory-20261011-013834-3840210. Overall process-tree peaks include compiler processes and are not used as analysis-driver peaks.
+- Intermediate chain-64 exited 0 in 173.688 seconds with 757575680 analysis-driver peak commit bytes, 55591 scans, and 267179 block visits. Its collection passes retired 1444 contexts and removed 2614 storage objects. The first nonempty pass removed 647 interned facts and 145 expired tree buckets. This establishes that the intermediate collection path ran. It does not verify the later root correction or establish a full-kernel benefit.
+- Final build target/pruning-final-build passed in 3m 31s and passed self-check. Driver SHA256: E0AE572A9805AE7BB413033A3A9BF914BDB7481DA4A34217AF1FAD0BEC1422B4. Normal-mode chain, writer, and formatting/dispatch comparisons and forbidden-call checks are in progress. No original binaries were replaced.
+- All 24 existing graph-checked safe and forbidden cases and 12 cache checks passed on the intermediate binary at target/scenarios/20261011-013748-7309751. The only later source change protects extra collection roots; graph mode disables that collection branch. These checks cover the unchanged argument and atomic footprint code, not final normal-mode collection.
+- Final chain-64 passed at target/scenarios/memory-20261011-014421-3853826: 155.435 seconds; 771780608 analysis-driver peak commit bytes; 55862 scans; 268064 block visits. Against the fresh baseline, peak commit fell 7.23 percent. Retained non-discovery contexts fell from 9339 to 7707. Collection retired 1444 contexts, removed 2614 storage objects, removed 695 interned facts, and removed 210 expired tree buckets. Retained counts are not total-ever-created context counts.
+- The baseline, intermediate, and final chain source hashes match 1A1E4915343E872AE01D1C1EB7A4AAD49EBC0DB7281EBE52F234FA26B604244C. The final diff check for src/analysis.rs and src/pointer.rs passed.
+- Fresh writer-growth large baseline passed at target/scenarios/memory-20261011-014041-6453553: 348.093 seconds; 489062400 analysis-driver peak commit bytes; 39353 scans; 7996085 block visits. The final writer comparison is pending.
+- E0AE572A normal-mode checks completed. Chain-64 negative at memory-20261011-014656-8847596 found forbidden_growth after retiring 1445 contexts. Writer negative at memory-20261011-015014-7286764 found forbidden_write. Neither log reports a compiler error, panic, or incomplete check.
+- E0AE572A kernel-memory formatting,dispatch passed at memory-20261011-014908-4909972: 89.062 seconds; 675307520 analysis-driver peak commit bytes; 69227 scans; 2612928 blocks. Peak commit was 0.71 percent above the fresh baseline. No meaningful reduction is established.
+- E0AE572A writer-growth large passed at memory-20261011-014431-3347822: 343.332 seconds; 514560000 analysis-driver peak commit bytes; 39353 scans; 7996092 blocks. Peak commit rose 5.21 percent. No contexts retired in this case; 66 unused interned facts were removed.
+- Kernel-memory source hashes match 63B07154873B5CCB045C6FA6A36B6C33E3185A614F8C328C9A0AFB432E260CE3. Writer source hashes match 76B25216120483358697AC4DA8CFAC9C91C6437A2781233C9BC65000118A9407.
+- Follow-up: argument-use maps now use the MIR definition ID as the cache key. InstanceKind::Item uses the same MIR body across generic substitutions; this map contains only syntactic field-use paths. This removes duplicate maps across instantiations without changing the use proof. Rebuild and a repeated writer comparison are pending. The observed peak increase is not yet attributed to this cache.
+- Cache-sharing release build passed in 2m 30s; self-check and source diff check passed. Current driver SHA256: 07245F725CFAD3FA89131285D463985B194FD0CB8725F350E71951FAB9EBF607. Path: target/pruning-final-build/release/irq-check-driver.exe. Repeated writer evidence: target/scenarios/memory-20261011-015418-3539005. The preceding binary differs only in the argument-use cache key.
+- Scope limits: measurements cover the combined changes, not separate per-change speedups. Unsupported atomic wrappers and pointer atomics retain full inputs. Externally reachable and backend-exported storage remains protected. The existing full-kernel run was left on its original verified-memory binary; no second full-kernel run was started. Full-kernel peak reduction and removal of paging are not established.
+- Current cache-sharing writer-growth large passed at target/scenarios/memory-20261011-015418-3539005: 367.774 seconds; 497201152 analysis-driver peak commit bytes. Peak commit is 1.66 percent above the fresh baseline, compared with 5.21 percent for the preceding candidate. These single runs do not isolate the effect of cache sharing. Source hash remains 76B25216120483358697AC4DA8CFAC9C91C6437A2781233C9BC65000118A9407. The current-binary forbidden writer check is pending at memory-20261011-020026-3180768.
+- Completed: the current-binary writer negative case exited 101 in 27.699 seconds and found forbidden_write at target/scenarios/memory-20261011-020026-3180768. There was no compiler error, panic, or incomplete-check diagnostic. The current large writer used 39353 scans and 7996083 block visits; it removed 80 unused interned facts and retired no contexts.
+- All four requested changes are retained in source. Existing scenario and cache checks passed as qualified by binary above. No tests, scenario sources, or code comments were added, and no whole-project formatting was run. The final build, self-check, and source diff check passed. The measured chain trial reduced peak commit by 7.23 percent and retired 1444 contexts; writer and formatting/dispatch do not establish a peak-memory reduction. No universal memory or full-kernel speedup is claimed.
+
+Rules
+- Record measured values only.
+- A context count is not a measure of completed work. Different builds can create different contexts.
+- Scans include repeated processing. The log field facts is the internal revision counter, not a count of unique facts.
+- Analysis elapsed time is not the full xtask time.
+- A run without a policy verdict is not a pass.
+- Record concurrent work and debugger pauses. Do not use these runs as isolated benchmarks.
+
+Environment
+- Checker revision: 4f24097623c41c7b0246264a42da72793b9b33c1, with local changes.
+- Kernel revision: b3b3103c5b6696f93d3fc510fedcd861f2f191a6, with existing local changes.
+- Compiler: 1.100.0-nightly, 923c95cdf5ba65cea505aa2ea829f578e1506ed8, x86_64-pc-windows-msvc.
+- Build settings: opt-level 3, fat LTO, one codegen unit.
+- Hardware parallelism reported by checker: 32.
+- Kernel command: cargo +nightly run -p xtask -- build --platform x86_64-uefi --release
+- Kernel directory: C:\Users\Boden\Documents\rustOS
+- Selected analysis crates: alloc, core, kernel, spin.
+- Initial IRQ roots: 17. Panic strategy: abort.
+- The parent-layout kernel compiler arguments contain no enabled feature cfgs. They select opt-level 3, LTO, and one codegen unit.
+
+2026-10-09: escaped-queue installed build
+- Change: only escaped storage enters the shared opaque-effect dirty queue. Keep argument-reachable storage and static effects.
+- Driver: target\escaped-queue-install\bin\irq-check-driver.exe
+- Driver SHA256: B666F88E22F01D624E95696B16855694E855964AE59878F25765A86F9AFE3809
+- Log: target\kernel-escaped-queue.log
+- Detailed function and opaque-effect traces enabled.
+- Last recorded analysis time: 1210.8 seconds.
+- Scans: 516256. Contexts: 38990. Pending: 2277. Policy roots seeded: 0.
+- Internal revision counter: 316697. Block visits: 158183718.
+- Context batches: 407. Worker threads observed: 32.
+- Context batch time: 1181.931 seconds. Publication time: 18.758 seconds.
+- Result: stopped for trace overhead investigation. No policy verdict.
+- Debugger showed symbol-formatting lock contention from the detailed value trace.
+- Scenarios: all five safe and five negative outcomes, plus five cache checks, accepted in 207.3617573 seconds.
+- Scenario evidence: target\scenarios\20261010-060021-3060347
+
+2026-10-09: trace-cache installed build
+- Changes: cache function-trace selection; remove the rule that kept private dead locals live solely because global havoc exists.
+- Driver: target\trace-cache-install\bin\irq-check-driver.exe
+- Driver SHA256: EC4093CCA00F310721ABE310DB13CB81EB64836B21E011EF583CD42A9591E490
+- Log: target\kernel-trace-cache.log
+- xtask start: 2026-10-09T23:21:32.2906323-07:00
+- Detailed function and opaque-effect traces disabled. Statistics enabled.
+- Fresh analysis ID: trace-cache-20261010.
+- At 2026-10-09T23:35:03.0377968-07:00, the last published analysis time was 761.0 seconds.
+- Scans: 748163. Contexts: 60725. Pending: 9910. Policy roots seeded: 17.
+- Internal revision counter: 585377. Block visits: 175224560.
+- Context batches: 1081. Worker threads observed: 32.
+- Context batch time: 699.952 seconds. Publication time: 22.757 seconds.
+- Process sample: 7402.203125 CPU seconds; 10.396400451660156 GiB private memory.
+- Result at this sample: running, no policy verdict.
+- Concurrent work: checker builds and scenario runs.
+- One debugger sample paused the process. The debugger detached. Active workers processed flow states; many other workers waited for the batch.
+- Scenarios: all five safe and five negative outcomes, plus five cache checks, accepted in 182.0309425 seconds.
+- Scenario evidence: target\scenarios\20261010-062122-3791795
+
+2026-10-09: semantic-diagnostics installed build
+- Changes: store precision-loss records by compiler identity; format them only for output. Compare cached tree fingerprints before full equality. Query numeric cell type at most once per cell. Skip fact merges whose normalized destination already contains the incoming facts.
+- Driver: target\semantic-diagnostics-install\bin\irq-check-driver.exe
+- Driver SHA256: BFF838D19E3B4C340D266A2F8514BB71EA07A5808AAF018B6081FABAE03248EF
+- Scenarios: all five safe and five negative outcomes, plus five cache checks, accepted in 180.2316353 seconds.
+- Scenario evidence: target\scenarios\20261010-063021-7699902
+- Concurrent work: trace-cache kernel run.
+- Kernel result: not run with this binary yet. No kernel speedup claim.
+
+Live samples
+- performance\trace-cache-samples.jsonl records new process samples and the last published analysis counters.
+- CPU percent uses the CPU-time change divided by wall-time change and the processor count reported by Windows.
+- The full kernel log is retained separately. Live sampling does not set or infer the xtask exit status.
+
+2026-10-09: trace-cache run ended
+- xtask exit: 1. Full xtask elapsed time: 987.8015993 seconds.
+- Failure: Rupta field-type assertion in vendor\rupta\src\util\type_util.rs:524.
+- Assertion: ordinal < variant.fields.len().
+- Last published analysis time: 876.5 seconds. Scans: 969377. Contexts: 80563. Pending: 39299.
+- Policy roots seeded: 17. Internal revision counter: 887580. Block visits: 204254926.
+- Context batches: 1105. Context batch time: 807.069 seconds. Publication time: 28.199 seconds.
+- Result: checker panic, not a kernel policy verdict.
+- Next action: capture the invalid type, field ordinal, projection path, and backtrace with the newer installed build. Do not treat the missing projection as safe.
+
+2026-10-09: parent-layout change, verification pending
+- Code inspection found that Rupta cast-path normalization queried field offsets from the field type, not the containing object type.
+- The old offset helper returned zero when it had no offset entry. This could merge distinct storage paths.
+- Change: query the parent target layout and require a verified zero offset. Keep downcast field paths because a synthesized tuple does not prove the enum variant's physical offset.
+- Add the field type, ordinal, and projection path to assertion diagnostics.
+- This defect is confirmed by source inspection. Its relation to the observed kernel assertion is not yet proved.
+- Installed driver: target\parent-layout-install\bin\irq-check-driver.exe
+- Driver SHA256: AD28E3C3B02D655EEBB703CEE3A6264D2B4590A5CF24B47020D5BA32690AEC20
+- Installation completed in 1 minute 3 seconds. Self-check passed.
+- Fresh xtask start: 2026-10-09T23:42:10.8695088-07:00
+- Analysis ID: parent-layout-20261010. Statistics and full panic backtraces enabled. Detailed value traces disabled.
+- Log: target\kernel-parent-layout.log
+- Scenario evidence directory: target\scenarios\20261010-064200-9725144
+- Scenarios: all five safe and five negative outcomes, plus five cache checks, accepted in 182.9297435 seconds.
+- Kernel verdict: pending. Live samples: performance\parent-layout-samples.jsonl.
+
+2026-10-09: cost-ordered batches, verification pending
+- Keep each context's block-visit count from its previous scan.
+- Start contexts with larger previous counts first in each batch. All contexts remain in the batch.
+- Purpose: reduce idle worker time while a few long contexts finish.
+- No measured benefit yet. The parent-layout kernel run does not include this change.
+- Installed driver: target\cost-order-install\bin\irq-check-driver.exe
+- Driver SHA256: C0714C1735E46BE872A06D5D04676E8A4799DDDACFFD4C7A939B9E24FEE45DE0
+- Scenarios: all five safe and five negative outcomes, plus five cache checks, accepted in 179.5588434 seconds.
+- Scenario evidence: target\scenarios\20261010-064604-0966686
+- Concurrent work: parent-layout kernel run. Kernel verdict on this binary: not yet measured.
+
+2026-10-10: parent-layout run ended
+- xtask exit: 1. Full xtask elapsed time: 1321.7728022 seconds.
+- Failure: field 4 is outside alloc::sync::ArcInner<memory::dma::RegisteredDmaDevice>.
+- Invalid backend path: shared_storage_54016.4.
+- Full backtrace: target\kernel-parent-layout.log.
+- Last published analysis time: 1199.3 seconds. Scans: 1012780. Contexts: 98271. Pending: 32476.
+- Policy roots seeded: 17. Internal revision counter: 1002879. Block visits: 267190125.
+- Context batches: 1298. Context batch time: 1119.990 seconds. Publication time: 30.809 seconds.
+- Result: checker panic, not a kernel policy verdict. The parent-layout correction did not resolve this failure.
+
+2026-10-10: reference access-view change, verification pending
+- The shared-storage feedback bridge added raw object addresses without converting them to the receiving pointer's access type.
+- Change: use the backend cast-view operation when the object type differs from the pointer's pointee type. Keep the original storage identity.
+- Unsupported views remain coverage gaps. Do not substitute an empty safe target set.
+- This build also includes cost-ordered batches.
+- Preserve its matching PDB beside the installed driver for subsequent debugger work.
+- Driver: target\reference-view-install\bin\irq-check-driver.exe
+- Driver SHA256: 75B3BCE928C744BDF4CB844D5D98620D98320A194F6FB292A9EDF63E74C4DF97
+- Self-check passed. Fresh xtask start: 2026-10-10T00:07:05.1723679-07:00.
+- Analysis ID: reference-view-20261010. Statistics and full panic backtraces enabled. Detailed value traces disabled.
+- Log: target\kernel-reference-view.log
+- Scenario evidence: target\scenarios\20261010-070655-2822036
+- Scenarios: all five safe and five negative outcomes, plus five cache checks, accepted in 177.8257269 seconds.
+- Kernel verdict: pending. Live samples: performance\reference-view-samples.jsonl.
+- Process affinity check: all 32 logical processors allowed; 34 process threads. This check does not prove full CPU use or rule out every other scheduling limit.
+
+2026-10-10: reference-view run ended
+- xtask exit: 1. Full xtask elapsed time: 922.198417 seconds.
+- Failure: unsupported index projection in vendor\rupta\src\util\type_util.rs:1455.
+- Symbolized stack: try_eval_path_type -> Propagator::node_path_and_ty -> Propagator::propagate -> Analysis::synchronize_backend.
+- Full backtrace: target\kernel-reference-view.log.
+- Last published analysis time: 817.2 seconds. Scans: 1057267. Contexts: 101328. Pending: 23597.
+- Policy roots seeded: 17. Internal revision counter: 969357. Block visits: 208528129.
+- Context batches: 1119. Context batch time: 741.186 seconds. Publication time: 37.104 seconds.
+- Result: checker panic, not a kernel policy verdict. The earlier field assertion was not reported in this run.
+- Next build adds the base type and complete path to the index assertion. No safe fallback is added.
+
+2026-10-10: index-diagnostic run
+- Driver: target\index-diagnostic-install\bin\irq-check-driver.exe
+- Driver SHA256: 4FB16AEE0764D1CFDC039A32589E43DD85A863E716B6730698D840FF323EBDD9
+- Self-check passed. Fresh xtask start: 2026-10-10T00:25:29.0601078-07:00.
+- Analysis ID: index-diagnostic-20261010. Statistics and full panic backtraces enabled. Detailed value traces disabled.
+- Log: target\kernel-index-diagnostic.log
+- Semantic behavior is unchanged from the reference-view build; only the panic diagnostic changed.
+- Scenario suite not repeated for this diagnostic-only change. Kernel result: pending.
+
+2026-10-10: reference-constraint build, verification pending
+- The typed-path bridge did not invoke Rupta's normal cast propagation between overlapping pointer fields.
+- Replace that shortcut with an address edge into an interned reference node and a cast edge to the destination.
+- Process new cast edges with Rupta's existing cast propagator. It establishes the typed view and the field aliases.
+- Driver: target\reference-constraint-install\bin\irq-check-driver.exe
+- Driver SHA256: F1CA728182A2B45FBFD74C091C3ECE5F4AAFABA29BE8674358672D85CEF4C71E
+- Installation and self-check passed. Matching PDB retained beside the driver.
+- Scenario and kernel verification: pending. The index-diagnostic kernel run does not include this change.
+
+2026-10-10: index-diagnostic result and reference-constraint verification
+- Index-diagnostic xtask exit: 1. Full elapsed time: 947.2954446 seconds.
+- Failure: index projection on extern C function arch::x86::scheduling::entry::task_return_trampoline, path FuncId(4996).index.
+- Result: checker panic, not a kernel policy verdict.
+- Reference-constraint scenarios: all five safe and five negative outcomes, plus five cache checks, accepted in 174.1820285 seconds.
+- Scenario evidence: target\scenarios\20261010-073935-9765237.
+- Fresh kernel run uses analysis ID reference-constraint-20261010 and target\kernel-reference-constraint.log.
+- Kernel verdict: pending.
+- Start: 2026-10-10T00:44:30.4169225-07:00. Samples: performance\reference-constraint-samples.jsonl.
+- Source inspection: kernel/src/arch/x86/scheduling/platform_impl.rs:31 stores task_return_trampoline as a pointer, then u64, through state.rsp as *mut u64.
+- This source explains the function-address origin. It does not prove that an indexed data read can reach that address.
+- A brief LLDB attachment paused this run near 400 seconds. The run is not an isolated benchmark.
+- Debugger sample: one active thread in Analysis::build at analysis.rs:1345, HashMap::retain during worker cache invalidation. Other sampled workers waited on condition variables. Detached after the sample.
+
+2026-10-10: parallel cache invalidation, verification pending
+- Invalidate independent worker caches in parallel. Keep the same dependency and havoc rules.
+- Remove changed keys directly when the change set is smaller than the cache.
+- Partition shared-cache changes by shard, then remove each changed key from its shard.
+- Compute the escaped change set once per batch, not once per worker.
+- The active reference-constraint run does not include this change. No measured speed result is available yet.
+- Installation and self-check passed. Driver: target\parallel-invalidation-install\bin\irq-check-driver.exe.
+- Driver SHA256: FCF8B2D7C6BFE3B593162EC47C4EDC6537363508C7ADFF288FBBB8FFCAE6B577.
+- Scenario verification runs at the same time as the reference-constraint kernel run.
+- All five safe and five negative outcomes, plus five cache checks, accepted in 192.3321576 seconds.
+- Scenario evidence: target\scenarios\20261010-075539-5729685.
+- This concurrent run is not a controlled speed comparison with the earlier scenario runs.
+
+2026-10-10: exact flow-queue deduplication, verification pending
+- Keep an exact set of pending MIR location and state pairs. Do not enqueue a second copy of an equal pending pair.
+- Remove the set entry when the state leaves the queue. Keep distinct alternatives and the existing widening rules.
+- Add an opt-in duplicate-pending-states counter.
+- Add opt-in context counts for the eight functions with the most contexts, once per minute.
+- Add retained state, call-site, memory-view cache, and opaque-read cache counts.
+- These changes are not in the active reference-constraint kernel run.
+- cargo +nightly check --locked --bins passed in 10.74 seconds.
+- Optimized installation and self-check passed. Driver: target\pending-dedup-install\bin\irq-check-driver.exe.
+- Driver SHA256: 50B1841B97AE19290524A6194DC4C862C78B15E52BB9726A6A1BE750D3CD76D6.
+- Scenario verification runs during heavy paging in the reference-constraint kernel run. Do not use its elapsed time as an isolated speed measurement.
+- All five safe and five negative outcomes, plus five cache checks, accepted in 373.4175119 seconds.
+- Scenario evidence: target\scenarios\20261010-081143-0779654.
+
+2026-10-10: reference-constraint kernel run stopped for a replacement build
+- Result: manually stopped. No kernel policy verdict. The earlier Rupta index panic did not recur.
+- Last process sample: 2486.9565448 seconds since driver start; 23898.4375 CPU seconds.
+- Peak process commit reported in that sample: 80365314048 bytes.
+- Last complete batch report: analysis elapsed 2164.5 seconds, scans 2497645, contexts 232761, IRQ roots 17, pending 193312.
+- Internal revision counter: 2150629. Block visits: 345633537. Context batches: 1170.
+- Context time: 1812.383 seconds. Publication time: 244.311 seconds.
+- The final large batch did not complete before the stop. Full xtask time was not captured because Ctrl-C interrupted the command.
+- This run included a debugger pause, checker builds, and scenario verification. It was not an isolated benchmark.
+- Windows expanded its page file during this run. Heavy paging reduced throughput. No forced memory limit was applied.
+
+2026-10-10: opaque callback context reuse, verification pending
+- Opaque callback arguments were already unknown. Their context keys also included changing caller havoc memory.
+- Use a separate opaque-callback context mode. Join incoming havoc memory in that context instead of making it part of the key.
+- Keep ordinary contexts separate. Keep all callback targets, unknown inputs, memory facts, and existing rescheduling on changed input.
+- Compile check passed. Optimized installation is in progress.
+- The sample recorder now retains the last batch status when it leaves the log tail and records its age.
+- Optimized installation and self-check passed. Release build time: 56.68 seconds.
+- Driver: target\opaque-context-install\bin\irq-check-driver.exe.
+- Driver SHA256: 01CB11F48A921A7A4C256D3A4E0D517E5BBDFA5983771FEA73969ECEE5AE8EE4.
+- All five safe and five negative outcomes, plus five cache checks, accepted in 155.4235123 seconds.
+- Scenario evidence: target\scenarios\20261010-082836-2785169. No concurrent kernel run.
+- Fresh kernel analysis ID: opaque-context-20261010. Log: target\kernel-opaque-context.log.
+- Kernel verdict: pending.
+- Fresh xtask start: 2026-10-10T01:31:30.5311963-07:00. Samples: performance\opaque-context-samples.jsonl.
+- First complete batch report with 17 IRQ roots: 452.9 seconds, scans 571618, contexts 42713, pending 2133, block visits 82250900.
+- The reference-constraint run first reported 17 IRQ roots at 667.7 seconds, scans 578232, contexts 41829, pending 2128, block visits 161788558.
+- The new root-seeding report is about 32 percent earlier. This is not a controlled benchmark: the earlier run had a debugger pause and concurrent work, and the context counts differ.
+
+2026-10-10: lazy points-to set allocation, installation pending
+- Replace eager DS::new arguments to map entry insertion with or_insert_with(DS::new).
+- Create empty small sets with Vec::new instead of reserving 32 entries.
+- Keep the same set contents, size threshold, and propagation operations.
+- cargo +nightly check --locked --bins passed. This check briefly overlapped the opaque-context kernel run.
+- The active kernel binary does not include this allocation change. No measured speed or memory result is available for it yet.
+- Add opt-in interned storage and fact counts during analysis.
+- Add allocated points-to backing-array byte counts for both the shared storage adapter and the Rupta backend. These counts exclude maps, fact values, and allocator overhead.
+- The counters compile. Optimized installation is in progress while the opaque-context kernel run continues.
+
+2026-10-10: address-only context inputs, verification pending
+- The context counts identify UnsafeCell::get among the largest context groups.
+- Extend the MIR-verified value-only classification to address formation with Ref or RawPtr.
+- Permit only field projections and at most one dereference. Existing body checks still reject calls, branching terminators, indirect assignments, and unsupported operations.
+- Such a body computes an address without reading pointee contents. Keep pointer identity and caller bindings; do not capture unrelated pointee or havoc memory in its context.
+- Compile check passed. The active opaque-context kernel binary does not include this change.
+- Optimized installation and self-check passed. Driver: target\address-only-install\bin\irq-check-driver.exe.
+- Driver SHA256: 947027C4D08A98A13D71394E9A5FB4D005C7ADA4E29EE99512759A0E0DBE537F.
+- All five safe and five negative outcomes, plus five cache checks, accepted in 357.8612248 seconds.
+- Scenario evidence: target\scenarios\20261010-085405-7016577. This run overlapped a memory-heavy kernel run.
+- This build includes lazy set allocation and backing-array storage counters. The intermediate lazy-sets build was superseded without separate scenario verification.
+
+2026-10-10: opaque-context kernel run stopped for address-only verification
+- Result: manually stopped. No kernel policy verdict. No checker panic was reported.
+- Last recorded completed batch: analysis elapsed 1608.7 seconds, scans 2483589, contexts 226305, IRQ roots 17, pending 186756.
+- Internal revision counter: 2190428. Block visits: 190711242. Context batches: 1119.
+- Context time: 1418.662 seconds. Publication time: 176.663 seconds.
+- Process sample at 1673.8286228 seconds: 21730.546875 CPU seconds; peak process commit 68381401088 bytes.
+- The final batch did not finish. Full xtask time was not captured because Ctrl-C interrupted the command.
+- No debugger was attached. Compile checks, optimized builds, and scenario verification overlapped parts of this run.
+
+2026-10-10: address-only kernel run
+- Fresh xtask start: 2026-10-10T02:00:59.2114858-07:00. Analysis ID: address-only-20261010.
+- Log: target\kernel-address-only.log. Samples: performance\address-only-samples.jsonl.
+- Kernel verdict: pending.
+- Initial Rupta points-to backing arrays: 35141968 bytes.
+- At the later retained-state sample: interned storage 79760, interned facts 65579, shared storage set backing arrays 6408176 bytes.
+- These array counts are a small part of process memory at this early stage. No dense-set representation replacement has been made.
+
+2026-10-10: transitive address-only classification, verification pending
+- Atomic::as_ptr remained in the largest context groups after UnsafeCell::get left them.
+- Extend the value-only proof through direct, resolved calls within the same crate.
+- Verify each reached MIR body. Reject unknown calls, all cross-crate calls, memory loads, indirect stores, branching terminators, and unsupported operations.
+- Keep all normal policy edges and argument/address bindings. Only omit pointee memory from contexts proven not to read it.
+- Compile check passed. Optimized installation is in progress.
+- Transitive wrapper build installed and passed self-check: target\address-wrappers-install\bin\irq-check-driver.exe.
+- Driver SHA256: C7787E8C637321D5DC73DC11342BA6B284E04A7D6B257D5FCC941DCAB10D0955.
+- All five safe and five negative outcomes, plus five cache checks, accepted in 194.5479378 seconds.
+- Scenario evidence: target\scenarios\20261010-090838-3406215. Kernel analysis and a build ran at the same time.
+- Add a proof-walk guard: a repeated definition with different generic arguments declines the optimization. Normal analysis remains responsible for it.
+- Guarded build compiled and installed. Its exact-binary scenario verification is in progress.
+- Guarded driver: target\address-wrapper-guard-install\bin\irq-check-driver.exe.
+- Driver SHA256: DDB63D2AAF0B309E817F7DAAC1451359BE5B5B10B4856A840F4CE2445639E0F0.
+- All five safe and five negative outcomes, plus five cache checks, accepted in 217.8801141 seconds.
+- Scenario evidence: target\scenarios\20261010-091337-9500748. The address-only kernel run was active at the same time.
+
+2026-10-10: address-only kernel run stopped for guarded wrapper verification
+- Result: manually stopped. No kernel policy verdict and no checker panic reported.
+- Sample at driver age 1007.4716696 seconds: CPU time 10592.140625 seconds; peak process commit 29506998272 bytes.
+- Last batch in that sample: analysis elapsed 992.9 seconds, scans 1333321, contexts 117174, IRQ roots 17, pending 11464.
+- Internal revision counter: 1232714. Block visits: 149063913. Context batches: 1135.
+- Context time: 931.362 seconds. Publication time: 57.267 seconds.
+- This run included concurrent checker builds and scenario verification. It is not an isolated benchmark.
+
+2026-10-10: guarded address-wrapper kernel run
+- Fresh xtask start: 2026-10-10T02:19:05.2627128-07:00. Analysis ID: address-wrapper-guard-20261010.
+- Command: cargo +nightly run -p xtask -- build --platform x86_64-uefi --release.
+- Launcher: target\address-wrapper-guard-install\bin\irq-check.exe.
+- Driver SHA256: DDB63D2AAF0B309E817F7DAAC1451359BE5B5B10B4856A840F4CE2445639E0F0.
+- Driver PID: 32956. Log: target\kernel-address-wrapper-guard.log.
+- Samples: performance\address-wrapper-guard-samples.jsonl.
+- At analysis elapsed 183.1 seconds: contexts 25122, scans 282538, pending 2667, block visits 30896755. IRQ root discovery was not complete.
+- Kernel verdict: pending. No concurrent build or scenario run is planned during this measurement.
+- At analysis elapsed 1675.6 seconds: contexts 200245, scans 2165670, IRQ roots 17, pending 35842, block visits 201189269.
+- At driver age 1733.8423882 seconds: private memory 56116879360 bytes; CPU time 21337.765625 seconds.
+- A subsequent system sample reported 952 MiB available RAM, 35450 pages input per second, 14413 pages output per second, committed bytes 87174320128, and commit limit 101318213632. These are system-wide counters, not checker-only counters.
+- At analysis elapsed 3479.7 seconds: contexts 266548, scans 2972842, IRQ roots 17, pending 206286, block visits 233277052, context batches 1132.
+- Context time was 2861.680 seconds; publication time was 585.754 seconds.
+- At driver age 3564.4241121 seconds: CPU time 30447.84375 seconds; private memory 82345811968 bytes; peak process commit 83176964096 bytes.
+- The run was still active at one hour. No kernel verdict or checker error had been reported. The pending count rose again after a completed batch; it is not a completion estimate.
+- Final result: failed from resource exhaustion, not a kernel policy verdict.
+- The driver stopped after 5216.4 analysis seconds. The final monitor sample was at driver age 5215.2175116 seconds with CPU time 36768.390625 seconds, private memory 105775403008 bytes, and 40856 KiB free system commit.
+- The error was `memory allocation of 1515536 bytes failed`.
+- The backtrace shows `hashbrown::raw::RawTable::reserve_rehash`, `HashMap::insert`, `irq_check_driver::analysis::Analysis::context`, and `Analysis::process_node`.
+- The last completed batch before failure reported 328109 contexts, 3549765 scans, 17 IRQ roots, 63166 pending entries, 3238640 revision facts, 246397642 block visits, and 1137 context batches.
+- This run did not produce a correct kernel verdict and does not satisfy acceptance.
+
+2026-10-10: Havoc context-key merge
+- Measured failure analysis showed ordinary context keys included the complete evolving Base::Havoc tree. This made each unknown-state revision a new context identity, including for atomic wrappers.
+- Base::Havoc remains in ContextInput memory and is joined into the existing context. It no longer distinguishes context identities. Unknown effects still reschedule readers and remain conservative.
+- Release compile and installed self-check passed.
+- Installed launcher: target\havoc-merge-install\bin\irq-check.exe.
+- Driver SHA256: 32E931572662E4DF674743B6049C8060E2E577394719E2A047B1014CF1477C54.
+- All five safe configurations, five expected forbidden negative configurations, and five cache checks accepted in 201.5190159 seconds.
+- Scenario evidence: target\scenarios\20261010-183352-0080370.
+- First xtask attempt exited 101 after 1.532885 seconds because access to rustOS\target\debug\.cargo-build-lock was denied in the restricted session.
+- After filesystem access was restored, no Cargo or checker process remained. No lock file was removed.
+- Fresh xtask retry started at 2026-10-10T11:40:20.4827006-07:00 and passed the Cargo lock.
+- Analysis ID: havoc-merge-access-restored-20261010. Log: target\kernel-havoc-merge-restored.log.
+- Kernel verdict is pending. The effect of removing Havoc from context keys on kernel cost is not yet measured.
+- Regression observed: at 364.7 analysis seconds, the Havoc-merge run had 267078 contexts, 890154 scans, no IRQ roots yet, 65556 pending entries, and revision counter 7164473.
+- At driver age 381.2430974 seconds: private memory 34295971840 bytes, peak commit 34345590784 bytes, CPU time 3749.796875 seconds.
+- The prior guarded run had 32711 contexts at 382.6 analysis seconds. These are diagnostic comparisons, not controlled throughput benchmarks.
+- The Havoc-merge run was stopped for this context-growth regression. It produced no kernel verdict.
+- Reverted the ordinary-context Havoc-key removal. Its earlier description as a measured cause overstated the evidence: the allocation stack identified the failure site, not the dominant owner of memory or a proven cause of context growth.
+- Samples: performance\havoc-merge-restored-samples.jsonl.
+
+2026-10-10: debugger investigation of context growth
+- Used CodeLLDB's bundled LLDB and the matching driver PDB.
+- The cache insertion breakpoint in src\pointer.rs:238 first stopped in Analysis::record_site at analysis.rs:1944, called by process_node at worker.rs:2490. This cache also stores call-site states, so an unfiltered cache breakpoint does not isolate function contexts.
+- The function-context lookup breakpoint at analysis.rs:5694 stopped through Analysis::context and process_node at worker.rs:1998, the call argument-binding path.
+- The release binary with line tables did not expose local variables. Built the same regression semantics with release debug level 2, O3, and full LTO.
+- Full-symbol diagnostic driver SHA256: 0C35CE827B26D0D7993B205CEDBCBFA4FC5EBBCB8412459B335F0CCD0240718C.
+- Install: target\havoc-debug-symbols-install. Self-check passed. The ordinary-context Havoc-key removal remains reverted in the working source.
+- A scripted LLDB breakpoint filter stopped responding. Closed that diagnostic debugger session and started a fresh xtask diagnostic run with plain source breakpoints.
+- Plain breakpoint at analysis.rs:5741 exposed ContextInput, node.context, callee definition identity, and caller state. First sample was context 1 with one argument and one singleton; it did not explain the later growth.
+- Active diagnostic log: target\kernel-havoc-full-symbols-retry.log. Debugger pauses and concurrent compilation make these runs unsuitable as timing benchmarks.
+- The next breakpoint caught context 718 for core definition 1:56062. The callee name was not resolved in this sample.
+- Its argument was a reference to canonical parameter slot 0. Its context key held two storage cells: parameter slot 0 and constant allocation 2871 at offset 0.
+- The parameter cell held one allocation pointer at byte offset 33 and 26 alternatives at byte offsets 1 through 26. The allocation cell held Unknown.
+- This proves that exact offset sets distinguish this sampled context. It does not establish their share of total memory or total runtime.
+- Disabled the breakpoint and detached LLDB from PID 25152. The diagnostic run resumed.
+
+2026-10-10: isolated storage update change
+- Removed the global Havoc-empty requirement from can_replace. Unique, unescaped local storage can now use a strong update when its address and access type are exact.
+- This uses the same isolation condition as read and storage_value. Escaped storage, non-singleton storage, summary indices, and mismatched views do not qualify.
+- Call-summary effects still use weak updates. This change does not address that separate source of old pointer alternatives.
+- Added the compiler definition identity to existing opt-in context-count output so debugger samples can be matched to function names.
+- Installation and verification are pending. No speed improvement is claimed.
+- Normal call returns replace cells from the callee's saved return state. Thus, weak call effects alone do not prove why offsets remain in normal-return states.
+- Stopped the diagnostic regression driver PID 25152 at 12:06 local time after the debugger sample. The diagnostic xtask exited 1. No kernel verdict was produced.
+- Installed with `cargo +nightly install --locked --force --path . --bins --root target/isolated-update-install`. Exit code 0. Release settings remain O3 and fat LTO.
+- Driver SHA256: F33A879733BDF2EFC5585AC02764D0C479E4AC3936C6CC5738CE12C2F0D4BAD9.
+- Version and self-check commands exited 0 with nightly commit 923c95cdf5ba65cea505aa2ea829f578e1506ed8 and strict-blocks-2.
+- All five safe configurations, five expected forbidden configurations, and five cache checks passed in 176.1529954 seconds.
+- Evidence: target\scenarios\20261010-190655-3319130. The runner confirmed IRQ roots and indirect calls in the graph.
+- Started a fresh actual kernel xtask run with IRQ_CHECK_ANALYSIS_ID=isolated-update-20261010, IRQ_CHECK_STATS=1, and the isolated-update installed launcher.
+- Command: cargo +nightly run -p xtask -- build --platform x86_64-uefi --release.
+- Log: target\kernel-isolated-update.log. Evidence: target\kernel-isolated-update-evidence.
+- Kernel verdict and kernel performance measurements are pending.
+- Context-growth follow-up: shared Registry alone completed with 2059 scans, 10320 blocks, 0.297 compute seconds, and 0.073 publication seconds. It did not reproduce the large growth. Evidence: target/scenarios/20261010-193217-1069702.
+- Moving allocation into register, called before and inside the eight-step setup loop, completed with 7878 scans, 37381 blocks, 0.797 compute seconds, and 0.141 publication seconds. Evidence: target/context-growth-helper.log and target/context-growth-helper-evidence.
+- The next version writes the previous-record pointer through the valid pointer returned by the excluded identity helper. No solver change was made. Trace output shows the returned value as Unknown and the stored heap reference entering Havoc through core::ptr::write.
+- This version reached 6281 contexts at 10.0 analysis seconds and completed propagation with 54697 scans, 144860 blocks, 11.836 compute seconds, and 0.956 publication seconds. Storage objects increased from 3356 to 14129. Evidence: target/context-growth-opaque-return.log.
+- This is 6.94 times as many scans and 13.64 times the combined compute/publication time as the register version without the write. Both ran beside the kernel under memory pressure; these times are not isolated benchmarks.
+- After the analysis counters were printed, the reproduction continued writing its detailed graph. The graph exceeded 1.3 GB. This time is diagnostic export time, not continuing propagation. Do not infer nonconvergence from that delay.
+- The safe unknown-write run exited 0. Cargo reported 1m 09s including the detailed graph export. Final graph size: 1370227714 bytes.
+- A bounded-memory scan of graph site records found 964 distinct caller/context pairs in the allocation-helper control and 4497 in the unknown-write version. These are site-bearing contexts, not all graph nodes. For example, the generic null-pointer runtime helper increased from 11 to 444 contexts.
+- The negative unknown-write version exited 101 for irq_entry -> forbidden_growth, with no compiler error or incomplete-coverage diagnostic. It reported 53883 scans, 142371 blocks, 8.179 compute seconds, and 0.844 publication seconds. Evidence: target/context-growth-opaque-return-negative.log. Detailed graph output was disabled for this run.
+- Tight control: kept the excluded pointer-return call, but changed only the write destination from exposed to record. This is the same runtime address. The checker now knows the storage identity. This run exited 0 with 8482 scans, 40526 blocks, 3865 storage objects, 0.774 compute seconds, and 0.138 publication seconds. Cargo reported 4.37s. Evidence: target/context-growth-known-write-control.log.
+- Restored the unknown destination in the reproduction source. Started a repeat without detailed graph output, to compare analysis rather than export cost.
+- The repeat exited 0: 54068 scans, 143720 blocks, 14014 storage objects, 12.551 compute seconds, and 0.881 publication seconds. Cargo reported 19.16s. Evidence: target/context-growth-unknown-write-repeat.log.
+- Against the tight known-pointer control, this is 6.37 times as many scans, 3.63 times as many storage objects, and 14.73 times the combined compute/publication time. Both runs used the same installed binary and no detailed graph export. Concurrent kernel paging makes wall-time ratios noisy; work counters also confirm the increase.
+- Confirmed mechanism: writes through unknown storage copy pointer facts into Havoc; exposed-object reads include those facts; context construction starts from the whole storage base and follows every reference; the resulting memory snapshot is part of context identity. Thus changes outside a scalar field create more helper contexts. Heap identity also includes the allocating context. The reproduction trace shows this feedback through register and its returned heap records.
+- The live atomic-load context contained the same whole-base/Havoc/heap relationship. This establishes a concrete source of the kernel expansion, but does not measure its share of all kernel memory use. It does not establish that every opaque effect is unnecessary.
+- Latest kernel sample during this investigation: 1908.2 analysis seconds, 175737 contexts, 1767203 scans, 155530080 blocks, and 25387 pending entries. PID 35424 remained active with 54228115456 private bytes. No kernel verdict.
+- No solver correction was applied during these reproduction comparisons. The optional reproduction remains at scenarios/context-growth; the original five default scenarios are unchanged.
+
+2026-10-10: live kernel inspection after reproduction
+- PID 35424 still used target/isolated-update-install/bin/irq-check-driver.exe. At the first sample it held 55089610752 private bytes and 2021421056 working-set bytes.
+- At 2111 analysis seconds, many worker records showed util::panic_common contexts, including contexts 200, 233, 235, 309, 317, 377, 474, 507, 581, 980, 1030, 1049, and 1265. This was repeated flow analysis, not a final graph export.
+- A later 32-worker snapshot showed 20 workers in distinct free_mapping_frame_boot contexts, three in release_reserved_mapping_frame_runtime, two in free_mapping_frame_runtime, two in map_range_inner, two in schedule_next, and three in other functions. Worker snapshots are asynchronous, not a simultaneous CPU profile.
+- map_range_inner contexts 3 and 4 had 4578 and 4411 seen states, with 567 and 568 pending states. The bench_kernel_window_create discovery context had 1170 pending states; kernel_interrupt_bind_wired had 1044. These are flow-state counts, not new IRQ roots.
+- The worker context records included task_return_trampoline exposed-function facts and unknown ArcInner device/DMA storage alongside frame-release work. This supports investigating broad Havoc inputs and whole-object context keys. It does not justify dropping these facts without a dependency proof.
+- Recent memory records showed roughly 140000 cached memory views per worker. This identifies replicated cache retention as another candidate cost; it is not a byte attribution or a proof that all entries are redundant.
+- Windows memory sample: available RAM 3 MiB; committed bytes 93253046272; commit limit 94059261952; pages input/sec 55952; pages output/sec 9797. These are system-wide counters. Heavy paging is established; checker-only disk attribution was not measured in this sample.
+- LLDB attach returned 'The parameter is incorrect'. CheckRemoteDebuggerPresent then succeeded and reported an existing debugger attachment. A CodeLLDB process was present. Did not detach or disturb that existing session. The separate failed-attach LLDB session was told to quit.
+- Latest completed batch read: 2188.6 seconds, 1812637 scans, 180004 contexts, 17 roots, 23142 pending entries, 160980872 block visits. At process age 2264.26 seconds the monitor recorded 56619667456 private bytes and 87269376 working-set bytes. CPU use in that ten-second interval was 19.40 percent of 32 logical processors.
+- No checker or kernel code changed during this inspection. No kernel verdict was available. The run was left active.
+
+2026-10-10: debugger sample after user detached the existing debugger
+- Attached LLDB to PID 35424 and loaded the matching release PDB. Thread 8 was dropping Fact sets, TreeStorage, FlowState maps, and ContextInput values through HashMap::extend -> EpochMap::freeze (pointer.rs:26) -> Analysis::build (analysis.rs:1401, contexts.freeze). The other sampled rustc workers were in condition-variable waits. This is direct evidence of serial context replacement/destruction at an epoch boundary, not proof of its total runtime share.
+- Detached successfully and exited LLDB. No inferior function calls or solver changes were made.
+- Kernel-private-memory samples by process age: 481s 7.66 GiB; 727s 11.70 GiB; 962s 21.35 GiB; 1200s 34.37 GiB; 1449s 45.87 GiB; 1691s 48.39 GiB; 1930s 50.38 GiB; 2167s 52.54 GiB; 2405s 53.39 GiB. This is a rapid growth phase followed by slower growth, not evidence of sustained exponential growth.
+- The sharp rise began before the context-growth reproduction runs. Separate fixture processes can add system paging pressure but cannot directly add contexts to the kernel checker.
+- Recent retained counters reached 1772534 states, 1789372 sites, 4665072 cached views, 1114431 cached opaque reads, and 552689 interned storage objects. The 43008968-byte storage-set counter is not total analysis memory. State maps, tree maps, keys, caches, and allocator retention are not covered by that counter.
+- Latest completed batch after detach: 2479.7 analysis seconds, 181536 contexts, 1857060 scans, 166707467 block visits, 20588 pending entries. Still no kernel verdict.
+
+2026-10-10: context memory correction
+- Stopped kernel driver PID 35424 at the user's request. Its Cargo/xtask parent chain returned failure. This run has no policy verdict.
+- Added parallel retirement of replaced context, return, and effect values at epoch publication. Map replacement stays serial; destruction of the replaced values is parallel.
+- Worker memory-view, effective-view, and opaque-read caches are cleared after a batch on the worker threads. Shared storage and semantic facts remain intact. Cleared entries are rebuilt on demand.
+- Extended the MIR value-only check to constants, local scalar operations, casts, and local branch tests. Unsupported calls or memory access still reject the value-only classification.
+- Added heap storage to the existing parameter-binding scheme. Heap arguments retain caller bindings and do not acquire singleton status merely from canonicalization.
+- cargo +nightly check --locked --bins exited 0. Started an O3/fat-LTO installation at target/context-memory-install. Reproduction and policy validation are pending; no performance improvement is claimed yet.
+- First candidate installed successfully in 1m 20s; version and self-check printed the selected nightly identity. Driver SHA256: 30D68F77A3AEF5A53136E0AA7FBADF7B4629720B7379A6246D016157E1839D89.
+- Its safe reproduction exited 0, but regressed: 25046 scans, 126544 blocks, 30.855 compute seconds, 20.957 publication seconds, 16687 opaque calls, and 4047355 opaque addresses. Cargo reported 1m 51s including dependency rebuild. Evidence: target/context-memory-repro-safe.log.
+- Removed heap canonicalization after this regression. Do not treat it as a completed optimization. Kept the value-only proof and cache retirement. Parallel retirement now uses a serial fallback below the runtime hardware thread count to avoid small-batch dispatch overhead.
+- Started the revised installation at target/value-context-install. The first candidate's original scenario suite is still running and is not validation of the revised binary.
+- Kernel xtask start: 2026-10-10T12:10:02.3196496-07:00. Driver PID 35424 uses the installed isolated-update binary.
+- Samples: performance\isolated-update-samples.jsonl. Runtime worker limit: 32 logical processors.
+- At 21.3 analysis seconds: 11093 contexts, 83252 scans, 1332 pending entries, and 2938361 block visits. IRQ-root discovery was not complete.
+- The new definition-ID output maps the debugger sample 1:56062 to <core::slice::Iter<'_, u8> as core::iter::Iterator>::next.
+- At 51.7 analysis seconds: 14290 contexts, 118752 scans, 444 pending entries, and 6614115 block visits. The earlier guarded run had 13896 contexts and 122708 scans at 52.4 seconds. These early samples do not show a large improvement.
+- Attached LLDB to PID 35424 near 250 elapsed seconds and loaded its matching release PDB. The run was briefly paused during attach and symbol setup. Subsequent wall times include these pauses.
+- Set one-shot source breakpoints at IRQ-root seeding and at the switch to settling_unknowns. Commands print a timestamp and stack, then resume automatically. These checks will distinguish phase changes from ordinary context growth.
+- Correction: LLDB kept only the last repeated -o command, so the first root breakpoint only resumed the target. It fired between the 526.2-second sample (0 roots) and the 538.6-second sample (17 roots). The unknown-phase breakpoint still had zero hits. Replaced its commands with a multiline command list.
+- LLDB caught Analysis::build at analysis.rs:1246 at 2026-10-10T12:20:52.289847 local time. This sets settling_unknowns=true after the queue becomes empty.
+- Before that transition, the 596.8-second sample had 30537 contexts, 473300 scans, 17 roots, and zero pending entries.
+- At 622.4 seconds: 40594 contexts. At 634.8 seconds: 45046 contexts. This is 14509 additional contexts, or 47.5 percent, in 38 analysis seconds. The root count stayed at 17.
+- The first observed large flow-state counts after the transition were in memory::paging::mmio::map_physical_pages_aligned: about 51000 seen state cells and 20000 pending state cells per reported context. These counters count map capacity, not distinct function contexts.
+- A later debugger sample caught ContextCache::get_context_id through Analysis::context at analysis.rs:5690 and process_node at worker.rs:1998. This is normal call binding, not proof of opaque callback creation.
+- Many sampled workers waited on storage-map read locks. The expanded stack was DiffPTData::version -> stored_tree -> write -> write_place -> process_node at worker.rs:2163. This is a measured lock-contention sample, not a full CPU profile.
+- Resumed after the sample. The exact unknown fact that triggers the growth is still under investigation. No kernel verdict is available.
+- At 680.2 seconds: 50808 contexts. atomic_load<u8> increased from 828 to 1622 contexts; Atomic<bool>::load from 707 to 1377; SpinMutex<Vec<&IdMapEntry>>::lock from 576 to 1150.
+- The opaque-callback creation breakpoint at analysis.rs:2896 had zero hits through the 709.4-second sample. This does not exclude opaque memory effects, but it does not support a claim that newly invoked opaque callbacks caused this observed jump.
+- At 709.4 seconds: 52919 contexts, 690424 scans, and 5540 pending entries. The sample at driver age 716.7526485 seconds recorded 12301922304 private bytes and 7117.421875 CPU seconds.
+- A later live debugger inspection found 3276 retained keys for the largest atomic_load instantiation. The first key had one memory cell; sampled later keys had two, six, and seven cells.
+- The last sampled key had two arguments. The first was a reference to static definition 0:7315 with a two-field projection. The second was a scalar ordering value.
+- That key included four heap objects with 13 field paths each, an unknown-storage cell, the static cell, and Havoc. The static and unknown-storage cells each contained references to the four heap objects plus unknown or exposed-pointer facts.
+- The context builder reads whole storage bases and follows their references. It therefore imports these heap objects even for this scalar atomic-load call. The live sample establishes the excess traversal; the safe boundary for a correction still needs verification.
+- Used the earlier full-symbol build's type descriptions to read the current process. The source field definitions and compiler are unchanged. Checked the analysis field offset against the current function's assembly and checked decoded counts against live progress output. Did not execute code in the inferior.
+- Detached LLDB after the inspection. Kernel run remains active.
+
+2026-10-10: authorized context-growth reproduction
+- Added context-growth and its excluded context-growth-boundary helper after explicit user approval for a reproduction scenario.
+- Setup allocates eight linked records and passes them through the excluded helper. The IRQ entry reads an atomic flag and calls a known function pointer. The negative configuration selects forbidden_growth.
+- The original five-scenario default runner remains unchanged. Run the new case with scenarios/run.ps1 -Scenario context-growth.
+- Started baseline verification on the isolated-update installed checker before any solver correction for this issue. The kernel run is concurrent, so wall times are not isolated benchmarks.
+- First reproduction version passed safe and negative checks in 71.3671861 seconds including dependency compilation. Evidence: target\scenarios\20261010-193013-2697695.
+- Safe analysis reported 0.158 compute seconds, 0.049 publication seconds, 1821 scans, 9383 blocks, 995 storage objects, and 993 facts. Opaque traversal visited 1052 addresses. It did not reproduce the large expansion.
+- Changed the same scenario so the atomic flag and heap-list head share one static Registry object. This matches the containing-object relation observed in the live debugger sample. Started a second baseline run without a solver change.
+
+2026-10-10: kernel paging sample near 12:33 local time
+- Driver PID 35424: private commit 45513650176 bytes; working set 20402692096 bytes; CPU time 13407.5 seconds.
+- System counters: committed bytes 81536753664; commit limit 82142105600; available RAM 2107 MiB; pages input per second 5046; pages output per second 23703.
+- The checker process reported zero direct read and write bytes per second in this sample and 2322 page faults per second. Page-fault counts include faults that do not require disk access. System paging counters establish active paging but are not checker-only counters.
+- Kernel log size was 5122080 bytes. The observed disk activity is consistent with memory pressure and paging, not large checker log writes.
+- At 1370.6 analysis seconds: 168475 contexts, 1632609 scans, 17 roots, 18450 pending entries, and 137306676 block visits. The run is active and has no policy verdict.
+
+2026-10-10: bounded batches and context inputs, verification in progress
+- The existing kernel driver PID 31892 remains active on its original binary. No kernel source was changed.
+- Completed batches 679 and 680 reported 385504 and 484289 graph nodes, with 415629 and 440311 pending checks. These graph counts are not the same measure as worker-local known-node counts.
+- The new source limits each batch to 128 contexts per worker. This bounds batch work, not total analysis work or memory.
+- Caller and escape-alias maps now keep worker additions without copying their published sets. Publication unions the additions.
+- Context input updates first check whether the stored input covers the incoming input. This avoids unchanged copy-on-write maps.
+- Storage publication now retains changed field paths. Escape changes retain whole-object notification, and allocation overlap retains the existing conservative notification.
+- Heap inputs use the existing parameter binding mechanism. Distinct heap inputs receive distinct slots; aliases reuse one slot. Allocating contexts are not removed from the global heap model.
+- A conservative scalar-leaf read footprint restricts input snapshots where MIR proves the reads. Calls and unsupported operations retain the full-memory fallback.
+- Added heap-context with separate heap objects, scalar fields, callback fields, repeated calls, and safe and forbidden variants. Existing scenarios cover dynamic dispatch, pointer aliases, formatting, context growth, and writer growth.
+- Build directory: target/batch-fix-build. Baseline checker: target/optimization-build/release/irq-check.exe. Baseline large heap-context evidence: target/scenarios/memory-20261011-001014-1370562.
+- Build and verification are pending. No memory or performance improvement is claimed. Concurrent kernel paging prevents isolated timing comparisons.
+
+2026-10-10: heap binding experiments and scenario controls
+- The unrestricted heap-binding build passed 12 safe and negative checks. Evidence: target/scenarios/20261011-001244-9038072.
+- Its chain-64 run exceeded the previous peak. Stopped only scenario driver PID 23708 after rejecting this source variant. Peak private bytes: 3499294720; peak commit bytes: 3513847808. Evidence: target/scenarios/memory-20261011-001254-6686156. The monitor says completed because the process exited; this was an interrupted run with no checker verdict.
+- A second candidate bound value-only heap inputs and heap inputs without outgoing storage references. It also exceeded the old chain-64 peak. General heap binding is not retained in the source.
+- The next candidate binds heap inputs only for proved scalar leaf reads, excluding untyped byte heaps. Such leaf bodies cannot store through or return pointers, so they do not add escape aliases. General heap inputs retain their identities.
+- The first heap-context form used Box dereference coercion and produced an unresolved callback on the baseline. Simplified it to Box::into_raw with explicit references, retaining heap allocation and object alias checks. The baseline large variant passed: target/scenarios/memory-20261011-001418-0344615; 55.608 seconds, peak private 149467136 bytes, peak commit 185892864 bytes.
+- Added leaf-reads to separate scalar read-footprint behavior from heap behavior. A direct field return was already covered by the projection optimization, so the retained leaf applies XOR to the read value. The scenario has one IRQ entry with known local records, not an arbitrary external record argument.
+- The retained leaf-reads baseline large variant passed with 32 read_value contexts, 889 scans, and 3399 block visits. Evidence: target/scenarios/memory-20261011-002037-8292631 and target/leaf-baseline-v3-evidence. Wall time 33.683 seconds. Peak commit 144289792 bytes; the sampled private peak missed most of this short checker run.
+- Kernel PID 31892 was not stopped, rebuilt, or restarted. Candidate timings remain affected by concurrent work and paging.
+
+2026-10-10: retained candidate and fixed scenario comparisons
+- Retained driver SHA256: 4B5BB9855FA7AB6BB97E2965B6DCCDF5C38675D18569E79EB369D0795CE89916. Path: target/batch-fix-build/release/irq-check-driver.exe. Release build passed.
+- Stopped the second rejected candidate's measurement process tree, rooted at PowerShell PID 37508. This tree did not contain the kernel driver. Its chain-64 run has no verdict. Last sampled peak commit: 2821324800 bytes. Evidence: target/scenarios/memory-20261011-001859-0372665. Its queued kernel-memory and writer-growth runs were also canceled before launch.
+- The retained candidate binds only proved scalar-leaf heap inputs, excluding untyped byte heaps. It does not remove general heap identities or old context IDs. It preserves the full-memory fallback for unsupported MIR and calls.
+- The original kernel run exited with Cargo failure and no completed checker verdict. Its log does not state the termination cause. The monitor recorded 4896.157 seconds and peak private/commit 56084369408 bytes. Evidence: target/scenarios/memory-20261010-225604-2234637. Do not treat this as a successful kernel check.
+- Fourteen retained-build safe and negative checks passed: formatting, mixed-dyn, correlated-dyn, erased-records, pointer-alias, heap-context, and leaf-reads. Evidence: target/scenarios/20261011-002325-5957285.
+- Final leaf-reads source holds the scalar input at 7 and changes only callback identity. Source SHA256: 335CC53D81197A1A548BD4449E379FBAEFBAAE161D7200D803D3F002E119622B. Baseline and fixed snapshots match this hash.
+- Final leaf-reads large baseline: target/scenarios/memory-20261011-002405-8752062; exit 0; 32 read_value contexts; 857 scans; 3391 block visits; 28.772 seconds; peak commit 144281600 bytes.
+- Final leaf-reads large fixed: target/scenarios/memory-20261011-002434-6972398; exit 0; 1 read_value context; 733 scans; 3329 block visits; 25.296 seconds; peak commit 172429312 bytes. This proves context reduction, not lower total peak memory in this small process. Private-memory sampling missed most of the baseline run. Evidence graphs: target/leaf-baseline-final-evidence and target/leaf-fixed-final-evidence.
+- The first batch-frontier used sequential calls. Its 16525 baseline batches did not model a wide pending queue. Replaced that development version before the retained comparison. Earlier source snapshots remain in target/scenarios/memory-20261011-002524-8285189 and memory-20261011-002557-7654416; do not compare them to the final indirect-dispatch case.
+- Final batch-frontier uses one IRQ entry with an indexed table of 4096 function targets. Source SHA256: 5BAC2A2EA3D8A807493BAB395144FEA235D0E4E261853D87F28F1BC6D7B400B8. Baseline and fixed snapshots match this hash.
+- Final batch-frontier large baseline: target/scenarios/memory-20261011-002642-6773259; exit 0; 18 batches; 36949 scans; 98757 block visits; 31.847 seconds; peak private 468602880 bytes; peak commit 483815424 bytes.
+- Final batch-frontier large fixed: target/scenarios/memory-20261011-002714-5726915; exit 0; 21 batches; 36944 scans; 98760 block visits; 29.355 seconds; peak private 453222400 bytes; peak commit 459468800 bytes. Peak commit fell 5.03 percent.
+- Retained heap-context large passed: target/scenarios/memory-20261011-002256-4450301; 27.798 seconds; peak private 186273792 bytes; peak commit 186331136 bytes. Peak commit is nearly unchanged from the matching baseline. Do not infer a speed ratio from the earlier baseline taken under kernel paging.
+- Retained chain-64 passed: target/scenarios/memory-20261011-002217-6458391; 95.697 seconds; peak private 807145472 bytes; peak commit 821108736 bytes; 60384 scans; 272546 block visits.
+- Retained kernel-memory formatting,dispatch passed: target/scenarios/memory-20261011-002353-3915538; 63.804 seconds; peak private 660541440 bytes; peak commit 679956480 bytes; 69622 scans; 2616334 block visits. This is the scenario, not the full kernel.
+- Retained writer-growth large passed: target/scenarios/memory-20261011-002457-2037140; 196.905 seconds; peak private and commit 506961920 bytes; 39353 scans; 7996081 block visits.
+- Fresh baselines for these three existing scenarios and the remaining negative checks are pending. The scenario sources are now fixed. No 20 to 40 percent memory improvement is claimed.
+
+2026-10-10: final verification, fresh baseline results in progress
+- Batch-frontier safe and negative checks passed on the retained build. Evidence: target/scenarios/20261011-002809-9166634. This brings the graph-checked safe and negative suite to 16 checks.
+- Context-growth chain-64,negative exited 101 for forbidden_growth, not an unresolved-call error. Evidence: target/scenarios/memory-20261011-002832-7561816.
+- Writer-growth negative exited 101 for forbidden_write, not an unresolved-call error. Evidence: target/scenarios/memory-20261011-003006-5303087. There are 18 successful correctness checks including these two negative runs.
+- Fresh chain-64 baseline: target/scenarios/memory-20261011-002829-9895277; exit 0; 95.462 seconds; peak private 832937984 bytes; peak commit 836395008 bytes; 60686 scans; 274289 block visits. The retained build used 821108736 peak commit bytes, a 1.83 percent reduction. Wall time was effectively unchanged at 95.697 seconds. Sampled target CPU time fell from 263.703 to 249.094 seconds; these are sampled counters, not final CPU accounting.
+- Fresh kernel-memory formatting,dispatch baseline: target/scenarios/memory-20261011-003005-5129506; exit 0; 65.756 seconds; peak private 677679104 bytes; peak commit 679301120 bytes; 69583 scans; 2614952 block visits. The retained build used 679956480 peak commit bytes. This is no meaningful peak-memory change. Fixed wall time was 63.804 seconds.
+- Source hashes match across current source, baseline snapshots, and retained-build snapshots for context-growth, kernel-memory, and writer-growth. Context-growth hash: 1A1E4915343E872AE01D1C1EB7A4AAD49EBC0DB7281EBE52F234FA26B604244C. Kernel-memory hash: 63B07154873B5CCB045C6FA6A36B6C33E3185A614F8C328C9A0AFB432E260CE3. Writer-growth hash: 76B25216120483358697AC4DA8CFAC9C91C6437A2781233C9BC65000118A9407.
+- Leaf-reads peak-memory qualification: the baseline sampler caught only rustc PID 31968, not the short analysis driver. The fixed run caught analysis driver PID 38220 and rustc PID 33780. Therefore the 144281600 versus 172429312 counters do not establish a memory regression or improvement. Use the graph evidence for the 32-to-1 context reduction, not these process peaks for a memory comparison.
+- The final writer baseline is pending at target/scenarios/memory-20261011-003111-2832982. The original kernel was no longer active during the fresh baseline series. Other scenario processes overlapped some runs, so timings remain non-isolated single-run measurements.
+
+2026-10-10: completed fixed-source comparisons
+- Fresh writer-growth large baseline completed with exit 0: target/scenarios/memory-20261011-003111-2832982. Wall time 204.987 seconds. Peak private 536870912 bytes. Peak commit 551645184 bytes. Scans 39353; block visits 7996081; compute 177.887 seconds; publication 3.579 seconds.
+- The retained writer build completed with the same scan and block-visit counts, peak commit 506961920 bytes, and wall time 196.905 seconds. Peak commit fell 8.10 percent. Compute time was 167.727 seconds and publication time was 3.357 seconds.
+- Summary of peak commit in MiB, baseline to retained: context-growth chain-64 797.65 to 783.07; kernel-memory formatting,dispatch 647.83 to 648.46; writer-growth large 526.09 to 483.48; batch-frontier large 461.40 to 438.18.
+- Summary of wall time in seconds, baseline to retained: context-growth 95.462 to 95.697; kernel-memory 65.756 to 63.804; writer-growth 204.987 to 196.905; batch-frontier 31.847 to 29.355. These single runs do not establish small performance changes. There is no measured large wall-time regression in the retained candidate.
+- All retained-source comparisons use matching scenario source hashes. The heap-context baseline and retained snapshots also match current source hash 7E9CE520FBB0C553EE92E648532AE28EB2D8616308C35F6F4414F3CB972982F7.
+- Eighteen correctness checks passed. The release build and git diff --check passed. No whole-project formatting was run.
+- Retained changes: bounded context batches; delta caller and escape-alias subscriptions; unchanged-input copy avoidance; field-path publication; conservative scalar-leaf read footprints; heap parameter binding only within that proved scalar-leaf case.
+- Rejected changes: general heap parameter binding and binding of general value-only or reference-free heap inputs. Both caused higher memory use in chain-64. Their incomplete measurements remain separate above.
+- Old context identities are not reclaimed, general read footprints retain the conservative fallback, and broad unknown/shared-memory dependencies remain where required. These changes do not establish a complete fix for full-kernel memory growth or eliminate paging.
+- The retained verified binaries are in target/batch-fix-build/release. The original target/release binaries were not replaced. No new full-kernel check was started.
+
+2026-10-10: larger changes, verification in progress
+- Added read-chain and heap-read-chain as separate scenarios. Existing scenario sources were not changed. Read-chain source SHA256: 666C0F42552E6AF93AE73F9AD71FCD621331E3DF001775E0700B25B32BB8B060. Heap-read-chain source SHA256: 4DCF739C545B545C9FC0787ED0A9202AE75218B229C1D05090A0011343003061.
+- Read summaries now follow direct calls, local reference copies, and field borrows. Unsupported calls and memory operations retain the full-input fallback.
+- Added indexed context-key coverage checks. A growing compatible key can replace the old key at the same ID. Old users then use the updated context. This is not a general unused-context collector.
+- Shared-memory changes notify recorded readers. New escaped objects, statics, and allocations retain broad notifications.
+- Intermediate build target/general-fix-build passed 18 safe and negative checks at target/scenarios/20261011-004440-4796877. A concurrent rebuild failed because Windows could not replace its running executable. These checks do not verify the later source.
+- Candidate target/general-final-build driver SHA256: AC575FCE9AB949AC5955675F2EBFF6E0A952A5E841D20D41524681236702FDF8. This candidate is under test, not the retained release.
+- Matched read-chain large graph comparison: target/scenarios/memory-20261011-004711-3620676 and memory-20261011-004814-0550746. Forward contexts fell from 32 to 1. Read_value stayed at 1. Both exited 0. Short sampled process peaks do not establish a useful memory difference.
+- Fresh previous-build chain-64 baseline: target/scenarios/memory-20261011-004634-3876473; exit 0; 79.146 seconds; peak private 815345664 bytes; peak commit 821121024 bytes; 59834 scans; 271411 block visits.
+- The unrestricted context-reuse candidate regressed in chain-64 at target/scenarios/memory-20261011-004803-8611011. It has fewer contexts but more facts and flow-state work. At 152.971 seconds, peak commit was 1507463168 bytes and the run was still active. This is not a completed measurement.
+- Code inspection found that reusing an allocating context also reuses its heap identities. Growing inputs can thus merge formerly separate allocations. The next candidate restricts key replacement to proved non-allocating, non-writing functions. This diagnosis still requires a matched run.
+
+2026-10-10: context-reuse regression correction and collection work
+- The unrestricted reuse run was stopped after its replacement completed chain-64. Exact stopped driver PID: 34668. Final sampled peak commit: 1869631488 bytes; elapsed 400.913 seconds; exit 101 caused by the stop. The monitor's completed label is not a completed checker verdict.
+- The corrected reuse build, SHA256 5885FCF7AACAB6EBD8629F55518F2F7F4968675A1D1C36C854CDCB1E41DA35BB, completed chain-64 at target/scenarios/memory-20261011-005241-1531774: 92.964 seconds; peak commit 821489664 bytes; exit 0. This is close to the previous-build peak of 821121024 bytes. Restricting reuse removed the large memory regression.
+- Read summaries were then extended to scalar and function-pointer setters. These functions can write values but cannot allocate or let storage pointers escape. Unsupported operations keep the full-memory input and original heap identities. This supersedes the earlier non-writing-only restriction.
+- Build target/general-heap-build, SHA256 68DB97CFB90FA4C7FDCF75990CFBD9B38EF73C6786C2233AFEB7FBBB140EF38D, passed 20 graph-checked safe and negative cases at target/scenarios/20261011-005608-5700886. Chain-64 negative and writer-growth negative also found the expected forbidden functions at memory-20261011-005826-4745341 and memory-20261011-005955-4717583. There were 22 successful correctness checks for this build.
+- Its read-chain large evidence at memory-20261011-005816-0862356 has 1 forward context and 1 read_value context. Its heap-read-chain large evidence at memory-20261011-005844-4762578 has 1 read_value context and 1 read_scalar context. The matched previous-build heap scenario at memory-20261011-005121-5847941 had 68 read_value contexts and 1 read_scalar context. All safe runs exited 0. Short sampling can miss the analysis driver; do not use these small-case process peaks as a memory comparison.
+- This build completed chain-64 at memory-20261011-005558-2244591 with 825786368 peak commit bytes and 101.550 seconds. Kernel-memory formatting,dispatch completed at memory-20261011-005618-5952241 with 678010880 peak commit bytes and 77.093 seconds. The fresh previous-build kernel-memory run at memory-20261011-005745-5261117 used 682123264 bytes and 62.710 seconds. Background builds and scenarios overlapped, so these times are not isolated performance comparisons.
+- Writer-growth large previous build: memory-20261011-005640-3974611, exit 0, 531488768 peak commit bytes, 223.652 seconds. The new build: memory-20261011-010024-1520505, exit 0, 539811840 peak commit bytes, 183.867 seconds. The small peak increase needs repeat measurement; neither run shows a large memory reduction.
+- Added context retirement at completed batches. Reachable calls, stored addresses, aliases, parent links, queued work, and unknown-write origins protect contexts. Removed IDs are never reused. Retired keys, input maps, summaries, and reader subscriptions can be released. Diagnostic snapshot mode retains contexts.
+- Initial collection build target/context-collection-build has SHA256 90B618EACCE67350993CBAD7463712EC44A797C562FCF93949D6DF7A17885487. It retained all candidates in chain-64 and kernel-memory. Do not count this as a collection benefit. A broader reachability-based collector and a queue-drain pass are under verification.
+- Added context-retirement as a separate scenario. Frozen source SHA256: 5482DE182AE5D727E5CA7E166B6EA6C5E47BE53CEC63B4B72885C07F16000F9B. Its first development run at memory-20261011-010447-3975017 failed to compile because an insertion was missing. That run is excluded. The corrected fixed-source baseline at memory-20261011-010539-0710576 completed with exit 0, 786804736 peak commit bytes, and 38.858 seconds. The initial narrow collector at memory-20261011-010658-9716297 completed with exit 0, 788992000 bytes, and 37.026 seconds; it retired no contexts.
+
+2026-10-10: larger changes, completed scenario verification
+- Final candidate: target/verified-memory-build/release. Driver SHA256: 82CE3362AB0B2945BCD665C6E43445DA68E754769F186E390CD92D0182C723D1. Original target/release binaries were not replaced. The release build and git diff --check passed.
+- All 24 graph-checked safe and negative cases passed at target/scenarios/20261011-011738-8801036. Normal-mode chain-64 negative found forbidden_growth at memory-20261011-011924-3172253. Normal-mode writer negative found forbidden_write at memory-20261011-012223-9290300.
+- Normal-mode context-retirement large safe and negative passed at memory-20261011-011643-4303223 and memory-20261011-011716-0022769. The safe run used 792936448 peak commit bytes and 32.528 seconds. Collection retained all candidates. No collection memory benefit is established.
+- Final chain-64: memory-20261011-011748-9484961; exit 0; 95.305 seconds; peak private 821506048 bytes; peak commit 822906880 bytes; 59411 scans; 279670 block visits. Matching previous-build baseline: memory-20261011-004634-3876473; 821121024 peak commit bytes; 79.146 seconds; 59834 scans; 271411 block visits. Peak commit rose 0.22 percent. Block visits rose 3.04 percent. The large unrestricted-reuse regression is absent, but this does not establish a speed improvement.
+- Final kernel-memory formatting,dispatch scenario: memory-20261011-011759-0631606; exit 0; 65.639 seconds; peak private 653815808 bytes; peak commit 674086912 bytes; 69238 scans; 2612875 block visits. Matching baseline: memory-20261011-005745-5261117; 682123264 peak commit bytes; 62.710 seconds. Peak commit fell 1.18 percent. This is not the full kernel.
+- Final writer-growth large: memory-20261011-011904-7678781; exit 0; 199.153 seconds; peak private and commit 529895424 bytes. Matching baseline: memory-20261011-005640-3974611; 531488768 peak commit bytes; 223.652 seconds. Peak commit fell 0.30 percent. These runs overlapped other work. Their wall times are not isolated speed comparisons.
+- Final read-chain large graph: memory-20261011-012019-1768217; forward has 1 context, compared with 32 in the matching baseline. Final heap-read-chain large graph: memory-20261011-012045-6392985; read_value has 1 context, compared with 68 in the matching baseline. Read_scalar has 1 context. Both safe runs exited 0. Existing scenario sources remained unchanged.
+- Added separate return-widening scenario. Source SHA256: 7EDDA6B4402C7EDAA25233C8EB31AA7135F71964B393095C2CF9F56425F60918. Baseline memory-20261011-011701-6472354 used 3669 block visits. Final memory-20261011-011728-4894378 used 1806. The negative case at memory-20261011-011755-0570047 found forbidden_return. Short sampling missed the safe analysis driver; no peak-memory benefit is claimed for this case.
+- Return alternatives now remove covered values only when memory effects are equal. Context reuse stays restricted to proved allocation-free cases. Unsupported read summaries keep the full-memory fallback. Heap identities remain distinct outside the proved binding case.
+- Collection runs at completed batches and queue drain. Unescaped internal return slots do not independently keep their owners alive. Reachability marking removes duplicates before queue insertion. Stored pointers, aliases, calls, parent links, pending work, and unknown-write origins still protect contexts. Retired numeric IDs are not reused. Interned memory objects and facts are not collected. Diagnostic snapshot mode does not collect contexts.
+- All measured normal-mode collection passes retired zero contexts. Thus the nonempty retirement path and full-kernel peak reduction remain unverified. More kernel paths alone do not guarantee retirement; old contexts must become unreachable.
+- Started the full kernel with the final candidate at target/scenarios/memory-20261011-012604-6647434. Memory and time limits are both zero (disabled). Diagnostic snapshots are disabled. Build output uses target/verified-kernel-cargo. Results are pending. The first launch at memory-20261011-012553-5327521 failed before compilation because PowerShell split the unquoted build-std list. The corrected launch quotes that list; the failed launch is excluded from measurements.
+- Separate study: memory-growth features=; change=historical; exit=0; peak-commit=185700352 bytes (sampled); seconds=21.291; retained-contexts=; retired=0; scans=1152; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-023026-6032668-848fe4ea\stderr.log
+- Separate study: memory-growth features=; change=baseline; exit=0; peak-commit=187379712 bytes (driver-peak); seconds=20.915; retained-contexts=249; retired=0; scans=1154; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-023047-9690905-011d453e\stderr.log
+- Separate study: memory-growth features=; change=atomic; exit=0; peak-commit=186294272 bytes (driver-peak); seconds=20.896; retained-contexts=248; retired=0; scans=1151; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-023108-8942950-a5bd1717\stderr.log
+- Separate study: memory-growth features=; change=collection; exit=0; peak-commit=187105280 bytes (driver-peak); seconds=20.335; retained-contexts=231; retired=18; scans=1136; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-023129-8008890-a3bf7b3f\stderr.log
+- Separate study: memory-growth features=; change=arguments; exit=0; peak-commit=186601472 bytes (driver-peak); seconds=20.742; retained-contexts=247; retired=0; scans=1143; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-023150-1458457-a3210dd9\stderr.log
+- Separate study: memory-growth features=; change=trees; exit=0; peak-commit=186044416 bytes (driver-peak); seconds=20.730; retained-contexts=249; retired=0; scans=1153; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-023210-8950870-69f57de5\stderr.log
+- Separate study: memory-growth features=; change=combined; exit=0; peak-commit=186327040 bytes (driver-peak); seconds=20.498; retained-contexts=228; retired=18; scans=1121; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-023231-6332743-29d5f0a2\stderr.log
+- Separate study: context-growth features=chain-64; change=historical; exit=0; peak-commit=826912768 bytes (sampled); seconds=86.397; retained-contexts=; retired=0; scans=59329; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-023252-1391450-ac9fcea9\stderr.log
+- Separate study: context-growth features=chain-64; change=baseline; exit=0; peak-commit=834617344 bytes (driver-peak); seconds=88.407; retained-contexts=9393; retired=0; scans=59275; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-023418-5484041-d6bcd531\stderr.log
+- Separate study: context-growth features=chain-64; change=atomic; exit=0; peak-commit=820957184 bytes (driver-peak); seconds=82.702; retained-contexts=9221; retired=0; scans=59250; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-023546-9634305-e8fd9a0c\stderr.log
+- Separate study: context-growth features=chain-64; change=collection; exit=0; peak-commit=781303808 bytes (driver-peak); seconds=80.921; retained-contexts=7921; retired=1433; scans=56772; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-023709-6752929-7c13057f\stderr.log
+- Separate study: context-growth features=chain-64; change=arguments; exit=0; peak-commit=829583360 bytes (driver-peak); seconds=78.665; retained-contexts=9310; retired=0; scans=59086; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-023830-6059013-a3076935\stderr.log
+- Separate study: context-growth features=chain-64; change=trees; exit=0; peak-commit=818495488 bytes (driver-peak); seconds=79.576; retained-contexts=9375; retired=0; scans=59451; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-023949-2793282-a13657b0\stderr.log
+- Separate study: context-growth features=chain-64; change=combined; exit=0; peak-commit=774418432 bytes (driver-peak); seconds=89.170; retained-contexts=7683; retired=1448; scans=56212; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-024108-8633810-e2661eb3\stderr.log
+- Separate study: writer-growth features=large; change=historical; exit=0; peak-commit=515272704 bytes (sampled); seconds=176.321; retained-contexts=; retired=0; scans=39353; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-024238-0437028-b7a4fcca\stderr.log
+- Concurrent change batch started: baseline, mask=0, all 18 workers ready before shared release; default package features; no memory or time limits; evidence=C:\Users\Boden\Documents\irq-check\target\pruning-study\concurrent-20261011-024601\baseline
+- Concurrent change result: change=baseline; scenario=formatting; exit=0; peak-commit=396115968 bytes (driver-peak); seconds=120.9996079; retained=5155; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-024602-3587008-c20a5eac\stderr.log
+- Concurrent change result: change=baseline; scenario=mixed-dyn; exit=0; peak-commit=172457984 bytes (driver-peak); seconds=111.30073189999999; retained=10; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-024602-3627471-35278d5f\stderr.log
+- Concurrent change result: change=baseline; scenario=correlated-dyn; exit=0; peak-commit=171589632 bytes (driver-peak); seconds=111.8774251; retained=8; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-024602-4493034-1accd733\stderr.log
+- Concurrent change result: change=baseline; scenario=erased-records; exit=0; peak-commit=172552192 bytes (driver-peak); seconds=111.9787095; retained=21; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-024602-4351656-2871ee3f\stderr.log
+- Concurrent change result: change=baseline; scenario=pointer-alias; exit=0; peak-commit=173862912 bytes (driver-peak); seconds=113.599128; retained=63; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-024602-3453999-074d8484\stderr.log
+- Concurrent change result: change=baseline; scenario=context-growth; exit=0; peak-commit=403124224 bytes (driver-peak); seconds=122.11471789999999; retained=5742; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-024602-3453999-f39ba9ba\stderr.log
+- Concurrent change result: change=baseline; scenario=context-growth-boundary; exit=0; peak-commit=167493632 bytes (driver-peak); seconds=110.0429977; retained=; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-024602-3706648-2609f481\stderr.log
+- Concurrent change result: change=baseline; scenario=kernel-memory; exit=101; peak-commit=1739075584 bytes (driver-peak); seconds=217.85764799999998; retained=53018; retired=0; incomplete=True; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-024602-3706648-3a9fd944\stderr.log
+- Concurrent change result: change=baseline; scenario=memory-growth; exit=0; peak-commit=184365056 bytes (driver-peak); seconds=112.9237998; retained=249; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-024602-3885315-41e8d1c1\stderr.log
+- Concurrent change result: change=baseline; scenario=memory-growth-roots; exit=0; peak-commit=184590336 bytes (driver-peak); seconds=112.77902209999999; retained=249; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-024602-4083638-846d002d\stderr.log
+- Concurrent change result: change=baseline; scenario=writer-growth; exit=0; peak-commit=172425216 bytes (driver-peak); seconds=114.2173069; retained=566; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-024602-4214905-3aaa8416\stderr.log
+- Concurrent change result: change=baseline; scenario=heap-context; exit=0; peak-commit=184610816 bytes (driver-peak); seconds=112.61731979999999; retained=174; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-024602-4265843-3d5b8be6\stderr.log
+- Concurrent change result: change=baseline; scenario=leaf-reads; exit=0; peak-commit=171139072 bytes (driver-peak); seconds=111.9660474; retained=24; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-024602-4331591-c58ee610\stderr.log
+- Concurrent change result: change=baseline; scenario=batch-frontier; exit=0; peak-commit=171089920 bytes (driver-peak); seconds=111.8687109; retained=146; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-024602-4584298-8e7cfcb3\stderr.log
+- Concurrent change result: change=baseline; scenario=read-chain; exit=0; peak-commit=171220992 bytes (driver-peak); seconds=111.6804981; retained=25; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-024602-4534052-0716282d\stderr.log
+- Concurrent change result: change=baseline; scenario=heap-read-chain; exit=0; peak-commit=185339904 bytes (driver-peak); seconds=112.82291099999999; retained=174; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-024602-4646920-e117d4d6\stderr.log
+- Concurrent change result: change=baseline; scenario=context-retirement; exit=0; peak-commit=171663360 bytes (driver-peak); seconds=111.3707397; retained=279; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-024602-4717621-71c3ab5f\stderr.log
+- Concurrent change result: change=baseline; scenario=return-widening; exit=0; peak-commit=171843584 bytes (driver-peak); seconds=111.2444773; retained=43; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-024602-4584298-e2d64276\stderr.log
+- Concurrent change batch started: atomic, mask=1, all 18 workers ready before shared release; default package features; no memory or time limits; evidence=C:\Users\Boden\Documents\irq-check\target\pruning-study\concurrent-20261011-024601\atomic
+- Concurrent change result: change=atomic; scenario=formatting; exit=0; peak-commit=392654848 bytes (driver-peak); seconds=104.05743389999999; retained=5147; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-024941-3400073-b7bc1ccb\stderr.log
+- Concurrent change result: change=atomic; scenario=mixed-dyn; exit=0; peak-commit=173256704 bytes (driver-peak); seconds=95.6748599; retained=10; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-024941-3636276-0525f52c\stderr.log
+- Concurrent change result: change=atomic; scenario=correlated-dyn; exit=0; peak-commit=172244992 bytes (driver-peak); seconds=95.5195074; retained=8; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-024941-3930584-8c71516e\stderr.log
+- Concurrent change result: change=atomic; scenario=erased-records; exit=0; peak-commit=172638208 bytes (driver-peak); seconds=93.931116199999991; retained=21; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-024941-3852435-224140c5\stderr.log
+- Concurrent change result: change=atomic; scenario=pointer-alias; exit=0; peak-commit=173117440 bytes (driver-peak); seconds=95.867503599999992; retained=63; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-024941-2993305-8fc43b70\stderr.log
+- Concurrent change result: change=atomic; scenario=context-growth; exit=0; peak-commit=407097344 bytes (driver-peak); seconds=104.2949876; retained=5720; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-024941-2993305-bd9b5c54\stderr.log
+- Concurrent change result: change=atomic; scenario=context-growth-boundary; exit=0; peak-commit=167432192 bytes (driver-peak); seconds=93.129188599999992; retained=; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-024941-3009433-89876e8f\stderr.log
+- Concurrent change result: change=atomic; scenario=kernel-memory; exit=101; peak-commit=1727135744 bytes (driver-peak); seconds=207.8260554; retained=53026; retired=0; incomplete=True; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-024941-3163451-e988b6a4\stderr.log
+- Concurrent change result: change=atomic; scenario=memory-growth; exit=0; peak-commit=183693312 bytes (driver-peak); seconds=95.7966429; retained=248; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-024941-3621183-a404e923\stderr.log
+- Concurrent change result: change=atomic; scenario=memory-growth-roots; exit=0; peak-commit=184266752 bytes (driver-peak); seconds=95.809854399999992; retained=248; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-024941-3600913-1069102f\stderr.log
+- Concurrent change result: change=atomic; scenario=writer-growth; exit=0; peak-commit=172756992 bytes (driver-peak); seconds=96.3222291; retained=566; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-024941-3872502-e32408d2\stderr.log
+- Concurrent change result: change=atomic; scenario=heap-context; exit=0; peak-commit=183705600 bytes (driver-peak); seconds=95.614778199999989; retained=174; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-024941-4014917-29d58a74\stderr.log
+- Concurrent change result: change=atomic; scenario=leaf-reads; exit=0; peak-commit=170815488 bytes (driver-peak); seconds=94.9002739; retained=24; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-024941-3977083-8fc1b423\stderr.log
+- Concurrent change result: change=atomic; scenario=batch-frontier; exit=0; peak-commit=170901504 bytes (driver-peak); seconds=96.3417047; retained=146; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-024941-4034964-0410084d\stderr.log
+- Concurrent change result: change=atomic; scenario=read-chain; exit=0; peak-commit=171282432 bytes (driver-peak); seconds=95.7799352; retained=25; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-024941-3997468-ecf0dd38\stderr.log
+- Concurrent change result: change=atomic; scenario=heap-read-chain; exit=0; peak-commit=185331712 bytes (driver-peak); seconds=95.9147423; retained=174; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-024941-4034964-f3a2f91f\stderr.log
+- Concurrent change result: change=atomic; scenario=context-retirement; exit=0; peak-commit=172478464 bytes (driver-peak); seconds=95.5745773; retained=279; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-024941-4180373-d9d5368a\stderr.log
+- Concurrent change result: change=atomic; scenario=return-widening; exit=0; peak-commit=171700224 bytes (driver-peak); seconds=95.0873826; retained=43; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-024941-4296245-1633d93b\stderr.log
+- Concurrent change batch started: collection, mask=2, all 18 workers ready before shared release; default package features; no memory or time limits; evidence=C:\Users\Boden\Documents\irq-check\target\pruning-study\concurrent-20261011-024601\collection
+- Concurrent change result: change=collection; scenario=formatting; exit=0; peak-commit=385167360 bytes (driver-peak); seconds=117.5489056; retained=5001; retired=154; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-025310-9156975-1115857a\stderr.log
+- Concurrent change result: change=collection; scenario=mixed-dyn; exit=0; peak-commit=172277760 bytes (driver-peak); seconds=108.5380089; retained=10; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-025310-9255361-6a700ad1\stderr.log
+- Concurrent change result: change=collection; scenario=correlated-dyn; exit=0; peak-commit=172429312 bytes (driver-peak); seconds=106.4943984; retained=8; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-025310-9358525-f0618e8d\stderr.log
+- Concurrent change result: change=collection; scenario=erased-records; exit=0; peak-commit=172765184 bytes (driver-peak); seconds=107.6801237; retained=21; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-025310-9568161-58c85824\stderr.log
+- Concurrent change result: change=collection; scenario=pointer-alias; exit=0; peak-commit=172871680 bytes (driver-peak); seconds=107.638143; retained=63; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-025310-8987914-32fafaa2\stderr.log
+- Concurrent change result: change=collection; scenario=context-growth; exit=0; peak-commit=349204480 bytes (driver-peak); seconds=117.6555556; retained=3609; retired=2177; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-025310-9106427-036812d9\stderr.log
+- Concurrent change result: change=collection; scenario=context-growth-boundary; exit=0; peak-commit=167731200 bytes (driver-peak); seconds=106.4882571; retained=; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-025310-9182043-c2bcb863\stderr.log
+- Concurrent change result: change=collection; scenario=kernel-memory; exit=101; peak-commit=1690959872 bytes (driver-peak); seconds=217.03797419999998; retained=52733; retired=331; incomplete=True; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-025310-9121664-0560cd76\stderr.log
+- Concurrent change result: change=collection; scenario=memory-growth; exit=0; peak-commit=185692160 bytes (driver-peak); seconds=107.6677574; retained=231; retired=18; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-025310-9358525-e70a6d8d\stderr.log
+- Concurrent change result: change=collection; scenario=memory-growth-roots; exit=0; peak-commit=184557568 bytes (driver-peak); seconds=107.7541036; retained=230; retired=19; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-025310-9691342-46e19b61\stderr.log
+- Concurrent change result: change=collection; scenario=writer-growth; exit=0; peak-commit=172544000 bytes (driver-peak); seconds=109.75336519999999; retained=566; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-025310-9588234-2a91430f\stderr.log
+- Concurrent change result: change=collection; scenario=heap-context; exit=0; peak-commit=183672832 bytes (driver-peak); seconds=107.68934929999999; retained=170; retired=4; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-025310-8438533-9ec13581\stderr.log
+- Concurrent change result: change=collection; scenario=leaf-reads; exit=0; peak-commit=170749952 bytes (driver-peak); seconds=107.7705446; retained=24; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-025310-8438533-146b0521\stderr.log
+- Concurrent change result: change=collection; scenario=batch-frontier; exit=0; peak-commit=171634688 bytes (driver-peak); seconds=107.23081499999999; retained=146; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-025310-8638547-11c11f69\stderr.log
+- Concurrent change result: change=collection; scenario=read-chain; exit=0; peak-commit=172208128 bytes (driver-peak); seconds=107.6001137; retained=25; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-025310-8621871-d7bc77c4\stderr.log
+- Concurrent change result: change=collection; scenario=heap-read-chain; exit=0; peak-commit=185368576 bytes (driver-peak); seconds=107.4823346; retained=170; retired=4; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-025310-9023287-119ed1ce\stderr.log
+- Concurrent change result: change=collection; scenario=context-retirement; exit=0; peak-commit=172298240 bytes (driver-peak); seconds=107.748363; retained=279; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-025310-8835939-3cdbe9a0\stderr.log
+- Concurrent change result: change=collection; scenario=return-widening; exit=0; peak-commit=170553344 bytes (driver-peak); seconds=107.2985961; retained=31; retired=12; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-025310-8881075-622731d6\stderr.log
+- Concurrent change batch started: arguments, mask=4, all 18 workers ready before shared release; default package features; no memory or time limits; evidence=C:\Users\Boden\Documents\irq-check\target\pruning-study\concurrent-20261011-024601\arguments
+- Concurrent change result: change=arguments; scenario=formatting; exit=0; peak-commit=391331840 bytes (driver-peak); seconds=119.67406419999999; retained=5141; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-025649-6488590-f7e14e72\stderr.log
+- Concurrent change result: change=arguments; scenario=mixed-dyn; exit=0; peak-commit=172552192 bytes (driver-peak); seconds=110.5005846; retained=10; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-025649-5356005-2f181df5\stderr.log
+- Concurrent change result: change=arguments; scenario=correlated-dyn; exit=0; peak-commit=172105728 bytes (driver-peak); seconds=110.97687429999999; retained=8; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-025649-5689196-7af2483e\stderr.log
+- Concurrent change result: change=arguments; scenario=erased-records; exit=0; peak-commit=172552192 bytes (driver-peak); seconds=111.2110665; retained=21; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-025649-5929252-55643970\stderr.log
+- Concurrent change result: change=arguments; scenario=pointer-alias; exit=0; peak-commit=172916736 bytes (driver-peak); seconds=112.16662029999999; retained=63; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-025649-6037343-ed0c1c90\stderr.log
+- Concurrent change result: change=arguments; scenario=context-growth; exit=0; peak-commit=408952832 bytes (driver-peak); seconds=121.51894779999999; retained=5721; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-025649-6187679-432fbcef\stderr.log
+- Concurrent change result: change=arguments; scenario=context-growth-boundary; exit=0; peak-commit=167297024 bytes (driver-peak); seconds=111.27761269999999; retained=; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-025649-6187679-cc2bcf82\stderr.log
+- Concurrent change result: change=arguments; scenario=kernel-memory; exit=101; peak-commit=1735204864 bytes (driver-peak); seconds=241.2947672; retained=53105; retired=0; incomplete=True; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-025649-6357417-587cc719\stderr.log
+- Concurrent change result: change=arguments; scenario=memory-growth; exit=0; peak-commit=184180736 bytes (driver-peak); seconds=110.93196879999999; retained=247; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-025649-6547866-f26624f7\stderr.log
+- Concurrent change result: change=arguments; scenario=memory-growth-roots; exit=0; peak-commit=183279616 bytes (driver-peak); seconds=111.0147107; retained=248; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-025649-6664413-4d55473c\stderr.log
+- Concurrent change result: change=arguments; scenario=writer-growth; exit=0; peak-commit=173027328 bytes (driver-peak); seconds=111.82937009999999; retained=566; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-025649-5356005-ead890a7\stderr.log
+- Concurrent change result: change=arguments; scenario=heap-context; exit=0; peak-commit=184020992 bytes (driver-peak); seconds=110.3968708; retained=173; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-025649-5658446-46df3916\stderr.log
+- Concurrent change result: change=arguments; scenario=leaf-reads; exit=0; peak-commit=171048960 bytes (driver-peak); seconds=110.5374385; retained=24; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-025649-5658446-c6b3e650\stderr.log
+- Concurrent change result: change=arguments; scenario=batch-frontier; exit=0; peak-commit=171536384 bytes (driver-peak); seconds=110.80885599999999; retained=146; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-025649-5929252-fc207a3c\stderr.log
+- Concurrent change result: change=arguments; scenario=read-chain; exit=0; peak-commit=170852352 bytes (driver-peak); seconds=111.52253549999999; retained=25; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-025649-5959687-d0d80dd1\stderr.log
+- Concurrent change result: change=arguments; scenario=heap-read-chain; exit=0; peak-commit=184528896 bytes (driver-peak); seconds=112.37788119999999; retained=173; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-025649-5880211-928e64e5\stderr.log
+- Concurrent change result: change=arguments; scenario=context-retirement; exit=0; peak-commit=172789760 bytes (driver-peak); seconds=110.5474205; retained=279; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-025649-6057482-dd146324\stderr.log
+- Concurrent change result: change=arguments; scenario=return-widening; exit=0; peak-commit=170782720 bytes (driver-peak); seconds=111.4349977; retained=43; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-025649-6271187-4d6eea71\stderr.log
+- Concurrent change batch started: trees, mask=8, all 18 workers ready before shared release; default package features; no memory or time limits; evidence=C:\Users\Boden\Documents\irq-check\target\pruning-study\concurrent-20261011-024601\trees
+- Concurrent change result: change=trees; scenario=formatting; exit=0; peak-commit=394219520 bytes (driver-peak); seconds=115.00825859999999; retained=5155; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-030052-1632842-d54725a0\stderr.log
+- Concurrent change result: change=trees; scenario=mixed-dyn; exit=0; peak-commit=172765184 bytes (driver-peak); seconds=105.82703319999999; retained=10; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-030052-1808744-dfa6cbc0\stderr.log
+- Concurrent change result: change=trees; scenario=correlated-dyn; exit=0; peak-commit=171900928 bytes (driver-peak); seconds=105.66748109999999; retained=8; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-030052-2009996-99e294f7\stderr.log
+- Concurrent change result: change=trees; scenario=erased-records; exit=0; peak-commit=173211648 bytes (driver-peak); seconds=105.9758578; retained=21; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-030052-1282778-323799e5\stderr.log
+- Concurrent change result: change=trees; scenario=pointer-alias; exit=0; peak-commit=172892160 bytes (driver-peak); seconds=106.0864209; retained=63; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-030052-1403934-d1136452\stderr.log
+- Concurrent change result: change=trees; scenario=context-growth; exit=0; peak-commit=413331456 bytes (driver-peak); seconds=116.2762125; retained=5783; retired=1; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-030052-1572827-bf4e265c\stderr.log
+- Concurrent change result: change=trees; scenario=context-growth-boundary; exit=0; peak-commit=167403520 bytes (driver-peak); seconds=105.03115059999999; retained=; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-030052-1808744-7a7c318a\stderr.log
+- Concurrent change result: change=trees; scenario=kernel-memory; exit=101; peak-commit=1744457728 bytes (driver-peak); seconds=238.4231729; retained=53009; retired=0; incomplete=True; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-030052-2165859-f8f299d3\stderr.log
+- Concurrent change result: change=trees; scenario=memory-growth; exit=0; peak-commit=184733696 bytes (driver-peak); seconds=106.0077177; retained=250; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-030052-2271227-40ed29cc\stderr.log
+- Concurrent change result: change=trees; scenario=memory-growth-roots; exit=0; peak-commit=185176064 bytes (driver-peak); seconds=106.41192869999999; retained=249; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-030052-1282778-1abc5951\stderr.log
+- Concurrent change result: change=trees; scenario=writer-growth; exit=0; peak-commit=172175360 bytes (driver-peak); seconds=106.1503078; retained=566; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-030052-1348604-ef759c0e\stderr.log
+- Concurrent change result: change=trees; scenario=heap-context; exit=0; peak-commit=185696256 bytes (driver-peak); seconds=105.9780208; retained=174; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-030052-1378818-36a64e4c\stderr.log
+- Concurrent change result: change=trees; scenario=leaf-reads; exit=0; peak-commit=170684416 bytes (driver-peak); seconds=104.9509332; retained=24; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-030052-1622831-68811cad\stderr.log
+- Concurrent change result: change=trees; scenario=batch-frontier; exit=0; peak-commit=170840064 bytes (driver-peak); seconds=106.0772664; retained=146; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-030052-1833800-05caad51\stderr.log
+- Concurrent change result: change=trees; scenario=read-chain; exit=0; peak-commit=171253760 bytes (driver-peak); seconds=104.00275429999999; retained=25; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-030052-1798664-485983f6\stderr.log
+- Concurrent change result: change=trees; scenario=heap-read-chain; exit=0; peak-commit=183898112 bytes (driver-peak); seconds=105.7600578; retained=174; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-030052-2085185-496e0b06\stderr.log
+- Concurrent change result: change=trees; scenario=context-retirement; exit=0; peak-commit=172265472 bytes (driver-peak); seconds=105.0245008; retained=279; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-030052-2029972-b2a21be6\stderr.log
+- Concurrent change result: change=trees; scenario=return-widening; exit=0; peak-commit=171307008 bytes (driver-peak); seconds=104.73543869999999; retained=43; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-030052-2155805-0352a719\stderr.log
+- Concurrent change batch started: combined, mask=15, all 18 workers ready before shared release; default package features; no memory or time limits; evidence=C:\Users\Boden\Documents\irq-check\target\pruning-study\concurrent-20261011-024601\combined
+- Concurrent change result: change=combined; scenario=formatting; exit=0; peak-commit=386031616 bytes (driver-peak); seconds=117.4547027; retained=4979; retired=154; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-030452-4302983-b4f8f82f\stderr.log
+- Concurrent change result: change=combined; scenario=mixed-dyn; exit=0; peak-commit=172294144 bytes (driver-peak); seconds=109.1994059; retained=10; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-030452-4302983-4d12f399\stderr.log
+- Concurrent change result: change=combined; scenario=correlated-dyn; exit=0; peak-commit=172179456 bytes (driver-peak); seconds=107.1339058; retained=8; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-030452-4811581-954ba9a4\stderr.log
+- Concurrent change result: change=combined; scenario=erased-records; exit=0; peak-commit=172097536 bytes (driver-peak); seconds=108.20510979999999; retained=21; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-030452-3846801-1fb7b584\stderr.log
+- Concurrent change result: change=combined; scenario=pointer-alias; exit=0; peak-commit=173588480 bytes (driver-peak); seconds=108.9355782; retained=63; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-030452-3906992-5c129637\stderr.log
+- Concurrent change result: change=combined; scenario=context-growth; exit=0; peak-commit=345223168 bytes (driver-peak); seconds=118.2554548; retained=3531; retired=2182; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-030452-4082065-72131981\stderr.log
+- Concurrent change result: change=combined; scenario=context-growth-boundary; exit=0; peak-commit=167510016 bytes (driver-peak); seconds=108.05261689999999; retained=; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-030452-4277608-e6401397\stderr.log
+- Concurrent change result: change=combined; scenario=kernel-memory; exit=101; peak-commit=1694248960 bytes (driver-peak); seconds=223.1104651; retained=52726; retired=328; incomplete=True; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-030452-4748776-22f5242c\stderr.log
+- Concurrent change result: change=combined; scenario=memory-growth; exit=0; peak-commit=185667584 bytes (driver-peak); seconds=110.14079849999999; retained=228; retired=18; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-030452-4758875-b2968d64\stderr.log
+- Concurrent change result: change=combined; scenario=memory-growth-roots; exit=0; peak-commit=184557568 bytes (driver-peak); seconds=108.78331209999999; retained=228; retired=18; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-030452-4982649-e1d3d77b\stderr.log
+- Concurrent change result: change=combined; scenario=writer-growth; exit=0; peak-commit=172797952 bytes (driver-peak); seconds=110.77756439999999; retained=566; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-030452-4992656-cb54f3e4\stderr.log
+- Concurrent change result: change=combined; scenario=heap-context; exit=0; peak-commit=183951360 bytes (driver-peak); seconds=107.093938; retained=169; retired=3; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-030452-4947096-3fb31458\stderr.log
+- Concurrent change result: change=combined; scenario=leaf-reads; exit=0; peak-commit=170422272 bytes (driver-peak); seconds=107.0815607; retained=24; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-030452-5084578-a7e6782f\stderr.log
+- Concurrent change result: change=combined; scenario=batch-frontier; exit=0; peak-commit=171360256 bytes (driver-peak); seconds=110.1970353; retained=146; retired=0; incomplete=False; compiler-failure=False; log=C:\Users\Boden\Documents\irq-check\target\scenarios\memory-20261011-030452-3846801-335e8acc\stderr.log

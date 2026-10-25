@@ -1,0 +1,2 @@
+{"driver_sha256":"F33A879733BDF2EFC5585AC02764D0C479E4AC3936C6CC5738CE12C2F0D4BAD9","time_utc":"2026-10-10T20:05:13.0429138Z","checker":"C:\\Users\\Boden\\Documents\\irq-check\\target\\isolated-update-install\\bin\\irq-check.exe","negative":false,"event":"start"}
+{"pid":13040,"command":null,"event":"process","crate":null}

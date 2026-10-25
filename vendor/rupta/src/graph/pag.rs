@@ -492,14 +492,16 @@ impl<P: PAGPath> PAG<P> {
             }
         };
 
-        if ty.is_any_ptr() {
+        if ty.is_any_ptr() || crate::util::type_util::is_integer_carrier(acx.tcx, ty) {
             add_new_direct_edge(src, dst);
         } else {
-            let ptr_projs = acx.get_pointer_projections(ty);
+            let ptr_projs = acx.get_value_projections(ty);
             let ptr_projs = unsafe { &*(ptr_projs as *const Vec<(ProjectionElems, Ty<'_>)>) };
-            for (ptr_proj, _ptr_ty) in ptr_projs {
+            for (ptr_proj, ptr_ty) in ptr_projs {
                 let src_field = src.append_projection(ptr_proj);
                 let dst_field = dst.append_projection(ptr_proj);
+                src_field.set_path_rustc_type(acx, *ptr_ty);
+                dst_field.set_path_rustc_type(acx, *ptr_ty);
                 add_new_direct_edge(&src_field, &dst_field);
             }
         }
@@ -643,7 +645,7 @@ impl<P: PAGPath> PAG<P> {
         }
         let static_variable_ty = acx.tcx.type_of(def_id).skip_binder();
         if !static_variable_ty.is_any_ptr()
-            && acx.get_pointer_projections(static_variable_ty).is_empty()
+            && acx.get_value_projections(static_variable_ty).is_empty()
         {
             return None;
         }
@@ -713,7 +715,18 @@ where
         }
 
         // add ret --> dst edge
-        let ret = PAGPath::new_return_value(callee);
+        let ret: P = PAGPath::new_return_value(callee);
+        if !acx.special_functions.contains(&callee.into())
+            && matches!(acx.get_function_reference(callee.into()).kind,
+                rustc_middle::ty::InstanceKind::Intrinsic(_) | rustc_middle::ty::InstanceKind::LlvmIntrinsic(_))
+        {
+            let ty = ret.try_eval_path_type(acx);
+            if !acx.get_value_projections(ty).is_empty() {
+                acx.value_unknown_paths.insert(std::rc::Rc::new(crate::mir::path::Path {
+                    value: ret.value().clone(),
+                }));
+            }
+        }
         let new_edges = self.add_call_value_edges(acx, &ret, &callsite.destination, callsite);
         added_edges.extend(new_edges);
 
@@ -736,6 +749,27 @@ where
         let destination_fields = destination.clone().flatten_fields(acx);
         let mut added = Vec::new();
         for (offset, target, target_ty) in destination_fields {
+            let target_integer = crate::util::type_util::is_integer_carrier(acx.tcx, target_ty);
+            if target_integer || target_ty.is_fn_ptr() {
+                let mut matched = false;
+                for (source_offset, origin, origin_ty) in &source_fields {
+                    if *source_offset != offset { continue; }
+                    if crate::util::type_util::is_integer_carrier(acx.tcx, *origin_ty)
+                        || target_integer && origin_ty.is_fn_ptr()
+                    {
+                        origin.set_path_rustc_type(acx, *origin_ty);
+                        target.set_path_rustc_type(acx, target_ty);
+                        added.extend(self.add_direct_edge(origin, &target));
+                        matched = true;
+                    }
+                }
+                if target_integer && !matched {
+                    acx.value_unknown_paths.insert(std::rc::Rc::new(crate::mir::path::Path {
+                        value: target.value().clone(),
+                    }));
+                }
+                if target_integer || matched { continue; }
+            }
             if !target_ty.is_any_ptr() {
                 if !acx.get_pointer_projections(target_ty).is_empty() {
                     acx.coverage_gaps.insert((callsite.func.into(), Some(callsite.location),

@@ -1,0 +1,84 @@
+{
+  "scope": "Root cause of memory growth in the one-handler case. The same cause has not been confirmed in the kernel run.",
+  "command": ".\\scenarios\\measure-memory.ps1 -Checker .\\target\\release\\irq-check.exe -DumpDirectory target/memory-growth-diagnosis -TraceHavoc",
+  "limits": "No memory limit. No time limit.",
+  "one_handler_run": {
+    "evidence": "target/scenarios/memory-20261010-205700-5830773",
+    "dump": "target/memory-growth-diagnosis/memory_growth.json",
+    "exit_code": 0,
+    "sampled_peak_private_bytes": 6804070400,
+    "peak_commit_bytes": 6807289856,
+    "elapsed_seconds": 118.9558796,
+    "elapsed_note": "Includes dependency compilation and a large diagnostic file write. It is not the solver time.",
+    "incomplete": false,
+    "saved_call_sites": 38785,
+    "graph_edges": 38787
+  },
+  "cause": [
+    "The excluded expose function returns an unknown pointer to the checker. A write through that pointer adds pointer facts to Havoc, the model for writes to unknown storage.",
+    "Reads of exposed storage merge these Havoc facts into the result. The dump shows references to many register heap contexts at the root of each heap record.",
+    "For functions outside the value-only path, context construction reads the full storage object behind each pointer argument. It follows all references from that object. It does not restrict this read to the fields that the callee needs.",
+    "The context key contains the resulting memory shape. A change in reachable memory can therefore create another context even when the operation only checks whether a pointer is null.",
+    "Heap identity includes the caller context. Additional register contexts create additional abstract heap identities at the same allocation site. These identities remain distinct in context keys.",
+    "The context cache retains distinct keys. Context inputs and saved program-point states retain memory facts. The combined increase in context count and state size causes excessive private memory use."
+  ],
+  "source_locations": {
+    "unknown_storage_reads": "src/analysis.rs:4440",
+    "context_construction": "src/analysis.rs:5357",
+    "heap_identity": "src/analysis.rs:3367",
+    "context_cache": "src/pointer.rs:237",
+    "saved_states": "src/analysis.rs:1935"
+  },
+  "dominant_saved_states": [
+    {
+      "function": "core::ptr::mut_ptr::<impl *mut Record>::is_null",
+      "contexts_with_saved_sites": 6956,
+      "sites": 13912,
+      "total_state_text_bytes": 4088238393,
+      "largest_state_text_bytes": 346292
+    },
+    {
+      "function": "core::ptr::const_ptr::<impl *const Record>::is_null",
+      "contexts_with_saved_sites": 7183,
+      "sites": 7183,
+      "total_state_text_bytes": 2443518950,
+      "largest_state_text_bytes": 428426
+    },
+    {
+      "function": "register",
+      "contexts_with_saved_sites": 35,
+      "sites": 210,
+      "total_state_text_bytes": 17267849,
+      "largest_state_text_bytes": 228319
+    }
+  ],
+  "measurement_notes": [
+    "State text sizes are decoded diagnostic text lengths. They are not allocator measurements and must not be reported as private memory attribution.",
+    "The program has two runtime record allocations and one IRQ handler. It is compiled, not executed.",
+    "The existing controls complete with much less memory when the unknown pointer is replaced with the original pointer, or when the unused reference field is removed. See results.json for values and source snapshots.",
+    "Dynamic dispatch, callbacks and formatting are not required for this case.",
+    "More reachable pointers can increase both context-key size and the number of distinct keys. No allocation-count scaling law has been measured.",
+    "No checker source was changed as part of this diagnosis."
+  ],
+  "completed_handler_scaling_runs": [
+    {
+      "handlers": 1,
+      "evidence": "target/scenarios/memory-20261010-205158-1079036",
+      "sampled_peak_private_bytes": 7721689088,
+      "exit_code": 0
+    },
+    {
+      "handlers": 2,
+      "evidence": "target/scenarios/memory-20261010-205422-3227263",
+      "sampled_peak_private_bytes": 7580831744,
+      "exit_code": 0
+    },
+    {
+      "handlers": 17,
+      "evidence": "target/scenarios/memory-20261010-205300-0534199",
+      "sampled_peak_private_bytes": 13468954624,
+      "exit_code": 0
+    }
+  ],
+  "scaling_conclusion": "The 17-handler run used about 1.74 times the peak private memory of the one-handler run, not 17 times. These handlers share the same data. Handler count alone does not explain the kernel's reported 80 GiB."
+}

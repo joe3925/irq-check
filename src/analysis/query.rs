@@ -45,6 +45,7 @@ pub(super) struct Guard {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum QueryStop {
     ContextChanged,
+    ControlMemory,
     TransferLimit,
     RefinementLimit,
     AlternativeLimit,
@@ -78,17 +79,24 @@ pub(super) struct QueryBudget {
     pub limit: usize,
     pub scratch: usize,
     pub refinement_limit: Option<usize>,
+    pub limit_usage: Option<(QueryStop, &'static str, usize, usize, usize)>,
 }
 
 impl QueryBudget {
+    pub fn record_limit(&mut self, reason: QueryStop, resource: &'static str, used: usize, limit: usize) {
+        self.limit_usage = Some((reason, resource, used, limit, self.steps));
+    }
+
     pub fn charge(&mut self, bytes: usize) -> Result<(), QueryStop> {
         if !irq_check_rupta::limits::checkpoint() {
             return Err(QueryStop::ProcessLimit);
         }
         if self.steps >= self.limit {
+            self.record_limit(QueryStop::TransferLimit, "query transfer steps", self.steps, self.limit);
             return Err(QueryStop::TransferLimit);
         }
         if self.refinement_limit.is_some_and(|limit| self.steps >= limit) {
+            self.record_limit(QueryStop::RefinementLimit, "refinement transfer steps", self.steps, self.refinement_limit.unwrap());
             return Err(QueryStop::RefinementLimit);
         }
         self.steps += 1;
@@ -101,6 +109,8 @@ impl QueryBudget {
             .checked_add(bytes)
             .ok_or(QueryStop::ScratchLimit)?;
         if self.scratch > irq_check_rupta::limits::configuration().expect("validated analysis limits").query_scratch_mib * 1024 * 1024 {
+            self.record_limit(QueryStop::ScratchLimit, "query scratch bytes", self.scratch,
+                irq_check_rupta::limits::configuration().expect("validated analysis limits").query_scratch_mib * 1024 * 1024);
             if std::env::var_os("IRQ_CHECK_TRACE").is_some() {
                 eprintln!("irq-check: query scratch limit bytes={} added={bytes} steps={}", self.scratch, self.steps);
             }

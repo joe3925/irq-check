@@ -7,6 +7,7 @@ use crate::Edge;
 use rustc_middle::mir::{self, Location, TerminatorKind};
 use rustc_middle::ty::{self, Instance, InstanceKind, TyCtxt, TypingEnv};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use query::{Guard, QueryStop, ReadOutcome, RequestMode};
 use sparse::{Alternative, Frame, Point, Solver, Value};
 
@@ -88,12 +89,29 @@ pub struct Node<'tcx> {
 
 pub struct CallSite<'tcx> {
     pub caller: Node<'tcx>,
-    pub location: Location,
     pub state: usize,
+    pub source: Arc<CallSiteSource>,
+    pub diagnostics: Option<Arc<[(rustc_span::Span, String)]>>,
+    evidence: QueryEvidence,
+}
+
+pub struct CallSiteSource {
+    pub location: Location,
     pub scope: mir::SourceScope,
     pub normal: Vec<Location>,
     pub unwind: Option<mir::BasicBlock>,
-    evidence: String,
+}
+
+struct QueryEvidence {
+    steps: usize,
+    attempts: usize,
+    cases: usize,
+    loop_entries: Arc<[Point]>,
+    cut_recursive_returns: bool,
+    witness: Option<u128>,
+    result: Result<[usize; 4], QueryStop>,
+    conservative_safe: bool,
+    worker: Option<usize>,
 }
 
 pub struct Analysis<'tcx> {
@@ -103,8 +121,10 @@ pub struct Analysis<'tcx> {
     pub free_sites: HashSet<usize>,
     pub incomplete: bool,
     pub limit_detail: String,
-    pub precision_loss: Vec<String>,
+    pub precision_loss: HashMap<String, usize>,
     pub safe_summaries: HashSet<Instance<'tcx>>,
+    pub specialized_safe: HashSet<Node<'tcx>>,
+    pub covered_calls: HashMap<(Instance<'tcx>, Location, &'static str), usize>,
     pub complete_pointer_coverage: bool,
     pub complete_call_coverage: bool,
     pub diagnostic_cutoff: bool,
@@ -112,12 +132,12 @@ pub struct Analysis<'tcx> {
 
 impl<'tcx> Analysis<'tcx> {
     pub fn build(tcx: TyCtxt<'tcx>, trust: &Trust, instances: &[Instance<'tcx>], roots: &[Instance<'tcx>]) -> Self {
-        let global::GlobalPointers { exported, roots: discovery_roots, candidates, failure, binding_independent, facts } =
+        let global::GlobalPointers { exported, roots: discovery_roots, candidates, failure, binding_independent, diagnostic_independent, facts } =
             global::GlobalPointers::build(tcx, trust, instances, roots);
         let mut output = Self {
             roots: HashMap::new(), graph: HashMap::new(), sites: Vec::new(), free_sites: HashSet::new(),
-            incomplete: failure.is_some(), limit_detail: failure.unwrap_or_default(), precision_loss: Vec::new(),
-            safe_summaries: facts.safe.clone(), complete_pointer_coverage: facts.complete,
+            incomplete: failure.is_some(), limit_detail: failure.unwrap_or_default(), precision_loss: HashMap::new(),
+            safe_summaries: facts.safe.clone(), specialized_safe: HashSet::new(), covered_calls: HashMap::new(), complete_pointer_coverage: facts.complete,
             complete_call_coverage: facts.call_complete,
             diagnostic_cutoff: false,
         };
@@ -130,7 +150,7 @@ impl<'tcx> Analysis<'tcx> {
         let tasks: Vec<_> = (0..workers).collect();
         let results: Vec<_> = rustc_data_structures::sync::par_map(tasks, |worker| {
             let roots: Vec<_> = roots.iter().copied().skip(worker).step_by(workers).collect();
-            Self::check_roots(tcx, trust, &exported, &candidates, &binding_independent, &facts, &discovery_roots, &roots, 1024 * 1024 * 1024 / workers, worker, None)
+            Self::check_roots(tcx, trust, &exported, &candidates, &binding_independent, &diagnostic_independent, &facts, &discovery_roots, &roots, 1024 * 1024 * 1024 / workers, worker, None)
         });
         for (worker, mut result) in results.into_iter().enumerate() {
             let site_offset = output.sites.len();
@@ -142,7 +162,7 @@ impl<'tcx> Analysis<'tcx> {
             for site in &mut result.sites {
                 site.caller = convert(site.caller);
                 site.state += site_offset;
-                site.evidence = format!("worker={worker} {}", site.evidence);
+                site.evidence.worker = Some(worker);
             }
             output.sites.extend(result.sites);
             for (node, mut edges) in result.graph {
@@ -154,9 +174,11 @@ impl<'tcx> Analysis<'tcx> {
             }
             output.incomplete |= result.incomplete;
             if result.incomplete { output.limit_detail = result.limit_detail; }
-            output.precision_loss.extend(result.precision_loss);
+            for (reason, count) in result.precision_loss { *output.precision_loss.entry(reason).or_default() += count; }
             output.diagnostic_cutoff |= result.diagnostic_cutoff;
             output.safe_summaries.extend(result.safe_summaries);
+            output.specialized_safe.extend(result.specialized_safe.into_iter().map(convert));
+            for (key, count) in result.covered_calls { *output.covered_calls.entry(key).or_default() += count; }
         }
         output
     }
@@ -167,6 +189,7 @@ impl<'tcx> Analysis<'tcx> {
         exported: &HashMap<String, Instance<'tcx>>,
         candidates: &HashMap<(Instance<'tcx>, Location), HashSet<Instance<'tcx>>>,
         binding_independent: &HashSet<Instance<'tcx>>,
+        diagnostic_independent: &HashSet<Instance<'tcx>>,
         facts: &global::PointerFacts<'tcx>,
         discovery_roots: &[Instance<'tcx>],
         roots: &[Instance<'tcx>],
@@ -177,8 +200,8 @@ impl<'tcx> Analysis<'tcx> {
         let scalar_witness = witness_value.is_some();
         let mut output = Self {
             roots: HashMap::new(), graph: HashMap::new(), sites: Vec::new(), free_sites: HashSet::new(),
-            incomplete: false, limit_detail: String::new(), precision_loss: Vec::new(),
-            safe_summaries: HashSet::new(), complete_pointer_coverage: facts.complete,
+            incomplete: false, limit_detail: String::new(), precision_loss: HashMap::new(),
+            safe_summaries: HashSet::new(), specialized_safe: HashSet::new(), covered_calls: HashMap::new(), complete_pointer_coverage: facts.complete,
             complete_call_coverage: facts.call_complete,
             diagnostic_cutoff: false,
         };
@@ -190,6 +213,10 @@ impl<'tcx> Analysis<'tcx> {
         let mut deferred = VecDeque::new();
         let mut queued = HashMap::<usize, Vec<Vec<(usize, Guard)>>>::new();
         let mut candidate_sites = HashSet::new();
+        let mut diagnostic_frames = HashMap::new();
+        let mut diagnostic_inputs = HashMap::<Instance<'tcx>, HashMap<Point, usize>>::new();
+        let mut diagnostic_reuse = 0usize;
+        let mut diagnostic_widened = 0usize;
         let mut forbidden_distance = HashMap::new();
         let mut callers = HashMap::<_, HashSet<_>>::new();
         for (&(caller, _), targets) in &facts.safe_candidates {
@@ -222,13 +249,22 @@ impl<'tcx> Analysis<'tcx> {
                 matches!(solver.ty(root.context, index.body.local_decls[local].ty).kind(), ty::Int(_) | ty::Uint(_) | ty::Bool)))
         }) {
             for value in [0, 1] {
-                let witness = Self::check_roots(tcx, trust, exported, candidates, binding_independent, facts,
+                let witness = Self::check_roots(tcx, trust, exported, candidates, binding_independent, diagnostic_independent, facts,
                     discovery_roots, roots, cache_limit, worker, Some(value));
                 if witness.diagnostic_cutoff && !witness.incomplete { return witness; }
             }
         }
         let mut queries = 0usize;
+        let mut skipped_witnesses = 0usize;
         let mut transfers = 0usize;
+        let mut safety_checks = 0usize;
+        let mut safety_hits = 0usize;
+        let mut safety_transfers = 0usize;
+        let trace_time = std::env::var_os("IRQ_CHECK_TRACE_TIME").is_some();
+        let mut query_times = HashMap::<(Instance<'tcx>, Location), (usize, u128, u128, u128, usize)>::new();
+        let mut safety_time = 0u128;
+        let mut site_sources = HashMap::<(Instance<'tcx>, Location), Arc<CallSiteSource>>::new();
+        let mut evidence_loops = HashSet::<Arc<[Point]>>::new();
         let mut generation = solver.flow.generation;
         loop {
         while let Some((frame, inherited, next_call, mut resume)) = queue.pop_front().or_else(|| deferred.pop_front()) {
@@ -254,6 +290,20 @@ impl<'tcx> Analysis<'tcx> {
                 || crate::known_intrinsic(tcx, instance)
                 || matches!(instance.def, InstanceKind::Shim(ty::ShimKind::DropGlue(_, None)))
             { continue; }
+            if next_call == 0 && resume.is_none() && !scalar_witness {
+                let watch = trace_time.then(std::time::Instant::now);
+                solver.begin_query(limits.query_steps.min(4096));
+                safety_checks += 1;
+                let safe = matches!(solver.scalar_summary(Point { frame, location: Location::START }), Ok((_, true)));
+                safety_transfers += solver.budget.steps;
+                transfers += solver.budget.steps;
+                if let Some(watch) = watch { safety_time += watch.elapsed().as_nanos(); }
+                if safe {
+                    output.specialized_safe.insert(caller);
+                    safety_hits += 1;
+                    continue;
+                }
+            }
             let unsupported = if matches!(instance.def, InstanceKind::Intrinsic(_)) {
                 !LEAF_INTRINSICS.contains(&tcx.item_name(instance.def_id()).as_str())
             } else {
@@ -264,7 +314,7 @@ impl<'tcx> Analysis<'tcx> {
             if unsupported {
                 output.graph.entry(caller).or_default().push(Edge {
                     candidate: false, site: None, target: None, span: tcx.def_span(instance.def_id()),
-                    kind: "unsupported body", detail: format!("the callable has no checked body: {instance}"), trusted: false,
+                    kind: "unsupported body", detail: format!("the callable has no checked body: {instance}").into(), trusted: false,
                     allow_incomplete: false, path_proven: false, uncertainty: Vec::new(),
                 });
                 continue;
@@ -323,32 +373,15 @@ impl<'tcx> Analysis<'tcx> {
                 let context_safe = solver.context_call_safe(frame, location);
                 if context_contract || context_safe || facts.covered_calls.contains(&(instance, location)) && facts.safe_candidates.get(&(instance, location)).is_some_and(|targets|
                     !targets.is_empty() && targets.iter().all(|target| facts.safe.contains(target))) {
-                    let id = output.sites.len();
-                    output.sites.push(CallSite {
-                        caller, location, state: id, scope: terminator.source_info.scope,
-                        normal: terminator.successors().filter(|block| {
-                            !matches!(terminator.unwind(), Some(mir::UnwindAction::Cleanup(cleanup)) if cleanup == block)
-                        }).map(|block| Location { block, statement_index: 0 }).collect(),
-                        unwind: terminator.unwind().and_then(|unwind| match unwind { mir::UnwindAction::Cleanup(block) => Some(*block), _ => None }),
-                        evidence: if context_contract {
-                            "trait call uses irq::context; its concrete implementations are separate required roots"
-                        } else if context_safe {
-                            "complete context-sensitive call coverage; every matching context has an IRQ-safe closure"
-                        } else { "complete call-target coverage; every candidate has an IRQ-safe summary" }.into(),
-                    });
-                    for &target in facts.safe_candidates.get(&(instance, location)).into_iter().flatten() {
-                        output.graph.entry(caller).or_default().push(Edge {
-                            candidate: true, site: Some(id), target: Some(Node { instance: target, context: usize::MAX }),
-                            span, kind, detail: if context_contract {
-                                "the trait implementation is a separate IRQ proof obligation"
-                            } else if context_safe {
-                                "global candidate; the matching call contexts have a separate IRQ-safe closure"
-                            } else { "covered by the IRQ-safe candidate closure" }.into(), trusted: false,
-                            allow_incomplete, path_proven: false, uncertainty: Vec::new(),
-                        });
-                    }
+                    let proof = if context_contract {
+                        "trait call uses irq::context; its concrete implementations are separate required roots"
+                    } else if context_safe {
+                        "complete context-sensitive call coverage; every matching context has an IRQ-safe closure"
+                    } else { "complete call-target coverage; every candidate has an IRQ-safe summary" };
+                    *output.covered_calls.entry((instance, location, proof)).or_default() += 1;
                     continue;
                 }
+                let query_watch = trace_time.then(std::time::Instant::now);
                 solver.begin_query(limits.query_steps);
                 let mut attempts = 0;
                 let mut cases = 0usize;
@@ -393,6 +426,10 @@ impl<'tcx> Analysis<'tcx> {
                             pending.push(QueryCase { indexes: pending[0].indexes.clone(), loop_entries: loop_entries.into_boxed_slice(), cut_recursive_returns: true });
                         }
                     }
+                    if inherited.iter().any(|(_, guard)| guard.proof == query::GuardProof::Widened && !guard.phi) {
+                        skipped_witnesses += pending.iter().filter(|case| case.cut_recursive_returns).count();
+                        pending.retain(|case| !case.cut_recursive_returns);
+                    }
                     pending
                 };
                 solver.budget.scratch = pending.iter().map(|choices|
@@ -408,8 +445,38 @@ impl<'tcx> Analysis<'tcx> {
                         let _ = std::fs::write(path, format!("queries={queries} transfers={transfers} frames={} nodes={} pending={} instance={instance}", solver.frames.len(), output.graph.len(), queue.len()));
                     }
                 }
+                if queries % 10000 == 0 && std::env::var_os("IRQ_CHECK_TRACE_MEMORY").is_some() {
+                    let edges = output.graph.values().map(Vec::len).sum::<usize>();
+                    let edge_storage = output.graph.values().map(|edges| edges.capacity() * std::mem::size_of::<Edge<'tcx>>()).sum::<usize>();
+                    let details = output.graph.values().flatten().map(|edge| match &edge.detail {
+                        std::borrow::Cow::Owned(detail) => detail.capacity(),
+                        std::borrow::Cow::Borrowed(_) => 0,
+                    }).sum::<usize>();
+                    let uncertainty = output.graph.values().flatten().map(|edge|
+                        edge.uncertainty.capacity() * std::mem::size_of::<(rustc_span::Span, &'static str)>()).sum::<usize>();
+                    let sites = output.sites.capacity() * std::mem::size_of::<CallSite<'tcx>>()
+                        + evidence_loops.capacity() * std::mem::size_of::<Arc<[Point]>>()
+                        + evidence_loops.iter().map(|entries| entries.len() * std::mem::size_of::<Point>()
+                            + std::mem::size_of::<usize>() * 2).sum::<usize>()
+                        + site_sources.capacity() * std::mem::size_of::<((Instance<'tcx>, Location), Arc<CallSiteSource>)>()
+                        + site_sources.values().map(|source| std::mem::size_of::<CallSiteSource>()
+                            + std::mem::size_of::<usize>() * 2
+                            + source.normal.capacity() * std::mem::size_of::<Location>()).sum::<usize>();
+                    let precision = output.precision_loss.capacity() * std::mem::size_of::<(String, usize)>()
+                        + output.precision_loss.keys().map(String::capacity).sum::<usize>();
+                    let mut frame_counts = HashMap::<_, usize>::new();
+                    for frame in &solver.frames { *frame_counts.entry(frame.instance).or_default() += 1; }
+                    let mut frame_counts: Vec<_> = frame_counts.into_iter().collect();
+                    frame_counts.sort_unstable_by_key(|(_, count)| std::cmp::Reverse(*count));
+                    eprintln!("irq-check: retained worker={worker} queries={queries} frames={} edges={edges} edge-bytes={edge_storage} detail-bytes={details} uncertainty-bytes={uncertainty} site-bytes={sites} precision-bytes={precision} control-bytes={} effect-bytes={}",
+                        solver.frames.len(), solver.controls.bytes, solver.effects.bytes);
+                    for (instance, count) in frame_counts.into_iter().take(12) {
+                        eprintln!("irq-check: retained-frame worker={worker} count={count} instance={instance}");
+                    }
+                }
                 let mut established = HashSet::new();
                 let mut control_stop = None;
+                let setup_time = query_watch.map_or(0, |watch| watch.elapsed().as_nanos());
                 let answer = loop {
                     let answer = (|| {
                         let mut complete = Vec::new();
@@ -437,6 +504,12 @@ impl<'tcx> Analysis<'tcx> {
                             if let Some(guards) = solver.merge(&path.guards, &inherited)? {
                                 reaching.push(guards);
                             }
+                        }
+                        if solver.cut_recursive_returns {
+                            let before = reaching.len();
+                            reaching.retain(|guards| !guards.iter().any(|(_, guard)|
+                                guard.proof == query::GuardProof::Widened && !guard.phi));
+                            skipped_witnesses += usize::from(before != 0 && reaching.is_empty());
                         }
                         if reaching.is_empty() { return Ok(Vec::new()); }
                         solver.controls.dependency_stop = None;
@@ -503,7 +576,7 @@ impl<'tcx> Analysis<'tcx> {
                                 });
                                 solver.retain_completed();
                             }
-                            Err(QueryStop::RefinementLimit | QueryStop::AlternativeLimit | QueryStop::ScratchLimit)
+                            Err(QueryStop::RefinementLimit | QueryStop::AlternativeLimit | QueryStop::ScratchLimit | QueryStop::ControlMemory)
                                 if solver.cut_recursive_returns =>
                             {
                                 pending.retain(|case| !case.cut_recursive_returns);
@@ -530,6 +603,14 @@ impl<'tcx> Analysis<'tcx> {
                 };
                 solver.index_choices.clear();
                 let precise_steps = solver.budget.steps;
+                let dependency_stop = solver.controls.dependency_stop;
+                let diagnostics = match &answer {
+                    Err(reason) => solver.explain_read(Some(*reason)),
+                    Ok(values) if values.iter().any(|value| matches!(value.value, Value::Unknown(_))) => solver.explain_read(None),
+                    _ => Vec::new(),
+                };
+                let diagnostics = (!diagnostics.is_empty()).then(|| Arc::from(diagnostics));
+                let fallback_start = query_watch.map_or(0, |watch| watch.elapsed().as_nanos());
                 let fallback = if !scalar_witness && fallback_steps < limits.query_steps
                     && !answer.as_ref().is_ok_and(|values| values.iter()
                     .all(|value| matches!(value.value, Value::Function(_))))
@@ -540,6 +621,23 @@ impl<'tcx> Analysis<'tcx> {
                 let fallback_used = solver.budget.steps.saturating_sub(precise_steps);
                 fallback_steps += fallback_used;
                 transfers += precise_steps.saturating_sub(starting_steps) + fallback_used;
+                if let Some(watch) = query_watch {
+                    let elapsed = watch.elapsed().as_nanos();
+                    let time = query_times.entry((instance, location)).or_default();
+                    time.0 += 1;
+                    time.1 += elapsed;
+                    time.2 += setup_time;
+                    time.3 += elapsed.saturating_sub(fallback_start);
+                    time.4 += precise_steps.saturating_sub(starting_steps) + fallback_used;
+                    if queries % 10000 == 0 {
+                        let mut ranked: Vec<_> = query_times.iter().collect();
+                        ranked.sort_unstable_by_key(|(_, time)| std::cmp::Reverse(time.1));
+                        eprintln!("irq-check: timing worker={worker} queries={queries} safety-checks={safety_checks} safety-hits={safety_hits} safety-ms={} safety-transfers={safety_transfers}", safety_time / 1000000);
+                        for ((instance, location), (count, total, setup, fallback, steps)) in ranked.into_iter().take(16) {
+                            eprintln!("irq-check: timing-site worker={worker} count={count} total-ms={} setup-ms={} fallback-ms={} steps={steps} {instance} at={location:?}", total / 1000000, setup / 1000000, fallback / 1000000);
+                        }
+                    }
+                }
                 solver.budget.steps = precise_steps;
                 if fallback == Err(QueryStop::ProcessLimit) {
                     output.incomplete = true;
@@ -552,31 +650,42 @@ impl<'tcx> Analysis<'tcx> {
                     break;
                 }
                 let result = match &answer {
-                    Ok(values) => format!("values={} function_values={} proven_paths={} guard_entries={}",
+                    Ok(values) => Ok([
                         values.len(), values.iter().filter(|value| matches!(value.value, Value::Function(_))).count(),
                         values.iter().filter(|value| value.path_proven()).count(),
-                        values.iter().map(|value| value.guards.len()).sum::<usize>()),
-                    Err(reason) => format!("stopped={reason:?}"),
+                        values.iter().map(|value| value.guards.len()).sum::<usize>()]),
+                    Err(reason) => Err(*reason),
                 };
-                let evidence = format!("steps={} attempts={} cases={cases} loop_entries={:?} cut_recursive_returns={} root_scalar_witness={witness_value:?} {result}",
-                    precise_steps + fallback_steps, attempts + 1, solver.loop_entries, solver.cut_recursive_returns);
-                if std::env::var_os("IRQ_CHECK_TRACE").is_some() {
-                    eprintln!("irq-check: query frame={frame} {instance} at={location:?} {evidence}");
-                }
+                let loop_entries = if let Some(entries) = evidence_loops.get(solver.loop_entries.as_ref()) {
+                    entries.clone()
+                } else {
+                    let entries: Arc<[Point]> = Arc::from(solver.loop_entries.as_ref());
+                    evidence_loops.insert(entries.clone());
+                    entries
+                };
+                let evidence = QueryEvidence {
+                    steps: precise_steps + fallback_steps, attempts: attempts + 1, cases,
+                    loop_entries, cut_recursive_returns: solver.cut_recursive_returns,
+                    witness: witness_value, result, conservative_safe: false, worker: None,
+                };
                 if std::env::var_os("IRQ_CHECK_TRACE_FLOW_VALUES").is_some() {
                     eprintln!("irq-check: query values frame={frame} at={location:?} result={answer:?}");
                 }
                 let id = output.sites.len();
-                output.sites.push(CallSite {
-                    caller, location, state: id, scope: terminator.source_info.scope,
+                let source = site_sources.entry((instance, location)).or_insert_with(|| Arc::new(CallSiteSource {
+                    location, scope: terminator.source_info.scope,
                     normal: terminator.successors().filter(|block| {
                         !matches!(terminator.unwind(), Some(mir::UnwindAction::Cleanup(cleanup)) if cleanup == block)
                     }).map(|block| Location { block, statement_index: 0 }).collect(),
-                    unwind: terminator.unwind().and_then(|unwind| match unwind { mir::UnwindAction::Cleanup(block) => Some(*block), _ => None }), evidence,
-                });
+                    unwind: terminator.unwind().and_then(|unwind| match unwind { mir::UnwindAction::Cleanup(block) => Some(*block), _ => None }),
+                })).clone();
+                output.sites.push(CallSite { caller, state: id, source, evidence, diagnostics });
+                if std::env::var_os("IRQ_CHECK_TRACE").is_some() {
+                    eprintln!("irq-check: query frame={frame} {instance} at={location:?} {}", output.site_state(id));
+                }
                 if let Ok(targets) = fallback {
                     if !targets.is_empty() && targets.iter().all(|target| facts.safe.contains(target)) {
-                        output.sites[id].evidence.push_str("; complete conservative target closure is IRQ-safe");
+                        output.sites[id].evidence.conservative_safe = true;
                         for target in targets {
                             output.graph.entry(caller).or_default().push(Edge {
                                 candidate: true, site: Some(id), target: Some(Node { instance: target, context: usize::MAX }),
@@ -592,9 +701,9 @@ impl<'tcx> Analysis<'tcx> {
                     Ok(values) => values,
                     Err(reason) => {
                         let detail = format!("the pointer query has no complete binding: {reason:?}");
-                        output.precision_loss.push(format!("{instance} at {location:?}: {detail}"));
+                        *output.precision_loss.entry(format!("{instance} at {location:?}: {detail}")).or_default() += 1;
                         let mut uncertainty = Vec::new();
-                        if let Some((cause, stop)) = solver.controls.dependency_stop
+                        if let Some((cause, stop)) = dependency_stop
                             && stop == reason
                             && let Ok(index) = solver.index(cause.frame)
                         {
@@ -602,22 +711,23 @@ impl<'tcx> Analysis<'tcx> {
                             let source = block.statements.get(cause.location.statement_index)
                                 .map_or(block.terminator().source_info.span, |statement| statement.source_info.span);
                             let reason = match stop {
+                                QueryStop::ControlMemory => "a possible write to entry storage prevents a control-flow proof here",
                                 QueryStop::TransferLimit | QueryStop::RefinementLimit => "analysis step limit reached here",
                                 QueryStop::ScratchLimit => "analysis storage limit reached here",
                                 QueryStop::AlternativeLimit => "analysis alternative limit reached here",
                                 _ => "analysis could not determine this dependency",
                             };
-                            uncertainty.push((source.source_callsite(), reason.to_string()));
+                            uncertainty.push((source.source_callsite(), reason));
                         }
                         output.graph.entry(caller).or_default().push(Edge {
-                            candidate: false, site: Some(id), target: None, span, kind, detail, trusted,
+                            candidate: false, site: Some(id), target: None, span, kind, detail: detail.into(), trusted,
                             allow_incomplete, path_proven: false, uncertainty,
                         });
                         established.into_iter().collect()
                     }
                 };
                 if let Some(reason) = control_stop {
-                    output.precision_loss.push(format!("{instance} at {location:?}: control refinement stopped after {reason:?}"));
+                    *output.precision_loss.entry(format!("{instance} at {location:?}: control refinement stopped after {reason:?}")).or_default() += 1;
                 }
                 for value in values {
                     let mut uncertainty = Vec::new();
@@ -629,6 +739,7 @@ impl<'tcx> Analysis<'tcx> {
                         let point = Point { frame, location: guard.branch };
                         let (cause, reason) = if let Some(&(cause, stop)) = solver.controls.causes.get(&point) {
                             (cause, match stop {
+                                QueryStop::ControlMemory => "a possible write to entry storage prevents a control-flow proof here",
                                 QueryStop::TransferLimit | QueryStop::RefinementLimit => "analysis step limit reached here",
                                 QueryStop::ScratchLimit => "analysis storage limit reached here",
                                 QueryStop::AlternativeLimit => "analysis alternative limit reached here",
@@ -643,7 +754,7 @@ impl<'tcx> Analysis<'tcx> {
                             let block = &index.body.basic_blocks[cause.location.block];
                             let source = block.statements.get(cause.location.statement_index)
                                 .map_or(block.terminator().source_info.span, |statement| statement.source_info.span);
-                            let cause = (source.source_callsite(), reason.to_string());
+                            let cause = (source.source_callsite(), reason);
                             if !uncertainty.contains(&cause) { uncertainty.push(cause); }
                         }
                     }
@@ -673,7 +784,29 @@ impl<'tcx> Analysis<'tcx> {
                         || matches!(target.def, InstanceKind::Intrinsic(_) | InstanceKind::LlvmIntrinsic(_) | InstanceKind::Virtual(..))
                         || !irq_check_rupta::util::type_util::has_instance_mir(tcx, target.def));
                     let dependent = !leaf || !binding_independent.contains(&target);
-                    let context = solver.frame(Frame { instance: target, caller: (dependent || opaque).then_some(point), irq: true, unknown_entry: false });
+                    let registered = diagnostic_inputs.get(&target).and_then(|inputs| inputs.get(&point)).copied();
+                    let widened = !leaf && !opaque && !diagnostic_independent.contains(&target)
+                        && registered.is_none() && diagnostic_inputs.get(&target)
+                            .is_some_and(|inputs| inputs.len() >= limits.alternatives.clamp(1, 16));
+                    let shared = !leaf && !opaque && (diagnostic_independent.contains(&target) || widened);
+                    let context = if shared {
+                        if let Some(&context) = diagnostic_frames.get(&target) {
+                            diagnostic_reuse += 1;
+                            context
+                        } else {
+                            let context = solver.frame(Frame { instance: target, caller: None, irq: true, unknown_entry: true });
+                            diagnostic_frames.insert(target, context);
+                            context
+                        }
+                    } else if let Some(context) = registered { context } else {
+                        let context = solver.frame(Frame { instance: target, caller: (dependent || opaque).then_some(point), irq: true, unknown_entry: false });
+                        if !leaf && !opaque { diagnostic_inputs.entry(target).or_default().insert(point, context); }
+                        context
+                    };
+                    if widened {
+                        diagnostic_widened += 1;
+                        uncertainty.push((span.source_callsite(), "caller inputs were discarded at this call because the function reached its retained-caller limit"));
+                    }
                     let node = Node { instance: target, context };
                     output.graph.entry(caller).or_default().push(Edge {
                         candidate: false, site: Some(id), target: Some(node), span, kind,
@@ -693,11 +826,11 @@ impl<'tcx> Analysis<'tcx> {
                     if opaque {
                         output.graph.entry(node).or_default().push(Edge {
                             candidate: false, site: Some(id), target: None, span, kind: "unsupported body",
-                            detail: format!("the target has no checked call model: {target}"), trusted,
+                            detail: format!("the target has no checked call model: {target}").into(), trusted,
                             allow_incomplete: false, path_proven: false, uncertainty: Vec::new(),
                         });
                     } else if !leaf {
-                        let mut ancestor = Some(frame);
+                        let mut ancestor = (!shared).then_some(frame);
                         let mut depth = 0usize;
                         while let Some(parent) = ancestor {
                             depth += 1;
@@ -711,7 +844,7 @@ impl<'tcx> Analysis<'tcx> {
                                 allow_incomplete: false, path_proven: false, uncertainty: Vec::new(),
                             });
                         } else {
-                            let guards = if dependent {
+                            let guards = if dependent && !shared {
                                 vec![solver.entry_guard(context, point)]
                             } else { Vec::new() };
                             queue.push_back((context, guards, 0, None));
@@ -752,7 +885,10 @@ impl<'tcx> Analysis<'tcx> {
         generation = solver.flow.generation;
         output.graph.clear();
         output.sites.clear();
+        evidence_loops.clear();
         output.precision_loss.clear();
+        output.specialized_safe.clear();
+        output.covered_calls.clear();
         queued.clear();
         candidate_sites.clear();
         for &instance in roots {
@@ -767,22 +903,42 @@ impl<'tcx> Analysis<'tcx> {
             output.safe_summaries.extend(roots.iter().copied());
         }
         if std::env::var_os("IRQ_CHECK_STATS").is_some() {
+            eprintln!("irq-check: shared diagnostic summaries functions={} reuse={diagnostic_reuse} widened={diagnostic_widened}", diagnostic_frames.len());
+            eprintln!("irq-check: specialized safety checks={safety_checks} hits={safety_hits} transfers={safety_transfers}");
+            eprintln!("irq-check: covered call summaries sites={} observations={}", output.covered_calls.len(), output.covered_calls.values().sum::<usize>());
             eprintln!("irq-check: effect summaries hits={} returned={} writes={} loads={} bytes={} cycles={} iterations={}",
                 solver.effects.hits, solver.effects.returned, solver.effects.writes, solver.effects.loads, solver.effects.bytes,
                 solver.effects.cycles, solver.effects.iterations);
+            eprintln!("irq-check: storage impact queries={} hits={} preserved={} unresolved={} stops={} bytes={} local-hits={} local-bytes={}",
+                solver.impacts.queries, solver.impacts.hits, solver.impacts.preserved,
+                solver.impacts.unresolved, solver.impacts.stops, solver.impacts.bytes,
+                solver.impacts.local_hits, solver.impacts.local_bytes);
             eprintln!("irq-check: control summaries evaluations={} hits={} widened={} refinement-stops={} bytes={} condition-hits={}",
                 solver.controls.evaluations, solver.controls.hits, solver.controls.widened,
                 solver.controls.refinement_stops, solver.controls.bytes, solver.controls.condition_hits);
             eprintln!("irq-check: value-flow evaluations={} changes={} revisions={} caller-locations={} static-allocations={}",
                 solver.flow.evaluations, solver.flow.changes, solver.flow.generation,
                 solver.caller_locations.len(), solver.static_allocations.len());
-            eprintln!("irq-check: IRQ queries={queries} transfers={transfers} frames={} sites={} unknown_coverage={} diagnostic_cutoff={} root_scalar_witness={witness_value:?}",
-                solver.frames.len(), output.sites.len(), output.precision_loss.len(), output.diagnostic_cutoff);
+            eprintln!("irq-check: value-flow requirements visits={} repairs={} full-nodes={} affected-nodes={} repair-visits={}",
+                solver.flow.requirement_visits, solver.flow.requirement_repairs,
+                solver.flow.requirement_repair_full, solver.flow.requirement_repair_affected,
+                solver.flow.requirement_repair_visits);
+            eprintln!("irq-check: IRQ queries={queries} transfers={transfers} frames={} sites={} unknown_coverage={} diagnostic_cutoff={} root_scalar_witness={witness_value:?} skipped_witnesses={skipped_witnesses}",
+                solver.frames.len(), output.sites.len(), output.precision_loss.values().sum::<usize>(), output.diagnostic_cutoff);
         }
         output
     }
 
     pub fn site_state(&self, id: usize) -> String {
-        self.sites[id].evidence.clone()
+        let evidence = &self.sites[id].evidence;
+        let result = match evidence.result {
+            Ok([values, functions, proven, guards]) => format!(
+                "values={values} function_values={functions} proven_paths={proven} guard_entries={guards}"),
+            Err(reason) => format!("stopped={reason:?}"),
+        };
+        let worker = evidence.worker.map_or_else(String::new, |worker| format!("worker={worker} "));
+        let suffix = if evidence.conservative_safe { "; complete conservative target closure is IRQ-safe" } else { "" };
+        format!("{worker}steps={} attempts={} cases={} loop_entries={:?} cut_recursive_returns={} root_scalar_witness={:?} {result}{suffix}",
+            evidence.steps, evidence.attempts, evidence.cases, evidence.loop_entries, evidence.cut_recursive_returns, evidence.witness)
     }
 }

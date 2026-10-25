@@ -43,11 +43,11 @@ struct Edge<'tcx> {
     target: Option<analysis::Node<'tcx>>,
     span: Span,
     kind: &'static str,
-    detail: String,
+    detail: std::borrow::Cow<'static, str>,
     trusted: bool,
     allow_incomplete: bool,
     path_proven: bool,
-    uncertainty: Vec<(Span, String)>,
+    uncertainty: Vec<(Span, &'static str)>,
 }
 
 fn marked(tcx: TyCtxt<'_>, def: DefId, name: &str) -> bool {
@@ -209,10 +209,18 @@ impl Callbacks for Checker {
                 "incomplete": analysis.incomplete,
                 "diagnostics_complete": !analysis.incomplete && !analysis.diagnostic_cutoff,
                 "detail": analysis.limit_detail,
-                "precision_loss": analysis.precision_loss,
+                "precision_loss": analysis.precision_loss.keys().collect::<Vec<_>>(),
+                "precision_loss_observations": analysis.precision_loss,
                 "complete_pointer_coverage": analysis.complete_pointer_coverage,
                 "complete_call_coverage": analysis.complete_call_coverage,
-                "safe_summaries": analysis.safe_summaries.iter().map(ToString::to_string).collect::<Vec<_>>()
+                "safe_summaries": analysis.safe_summaries.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "specialized_safe_summaries": analysis.specialized_safe.iter().map(|node| serde_json::json!({
+                    "instance": node.instance.to_string(), "context": node.context
+                })).collect::<Vec<_>>(),
+                "covered_call_summaries": analysis.covered_calls.iter().map(|((instance, location, proof), count)| serde_json::json!({
+                    "caller": instance.to_string(), "location": format!("{location:?}"),
+                    "proof": proof, "observations": count, "evidence": "coverage summary; not an established binding"
+                })).collect::<Vec<_>>()
             });
             let result = std::fs::create_dir_all(&directory).and_then(|_| {
                 use std::io::Write;
@@ -241,9 +249,12 @@ impl Callbacks for Checker {
                     first = false;
                     writer.write_all(&serde_json::to_vec(&serde_json::json!({
                         "id": id, "caller": site.caller.instance.to_string(), "context": site.caller.context,
-                        "location": format!("{:?}", site.location), "state_id": site.state,
-                        "source_scope": format!("{:?}", site.scope), "normal": format!("{:?}", site.normal),
-                        "unwind": format!("{:?}", site.unwind), "state": analysis.site_state(id)
+                        "location": format!("{:?}", site.source.location), "state_id": site.state,
+                        "source_scope": format!("{:?}", site.source.scope), "normal": format!("{:?}", site.source.normal),
+                        "unwind": format!("{:?}", site.source.unwind), "state": analysis.site_state(id),
+                        "diagnostics": site.diagnostics.iter().flat_map(|notes| notes.iter()).map(|(span, message)| serde_json::json!({
+                            "span": (!span.is_dummy()).then(|| format!("{span:?}")), "message": message,
+                        })).collect::<Vec<_>>()
                     })).map_err(std::io::Error::other)?)?;
                 }
                 writer.write_all(b"],\"edges\":[")?;
@@ -362,7 +373,7 @@ impl Callbacks for Checker {
                             "mark_site": permission.or(edge.site), "kind": edge.kind, "detail": edge.detail,
                             "mark": if permission.is_some() { "allow_incomplete" } else { "trusted" }}));
                     } else {
-                        failures.push((edge.span, edge.detail.clone(), true, edge.kind, edge.site));
+                        failures.push((edge.span, edge.detail.to_string(), true, edge.kind, edge.site));
                     }
                 }
                 for (span, reason, unknown, operation, site) in failures {
@@ -429,6 +440,12 @@ impl Callbacks for Checker {
                         );
                     }
                     diagnostic.note(reason);
+                    if unknown && let Some(id) = site {
+                        for (at, message) in analysis.sites[id].diagnostics.iter().flat_map(|notes| notes.iter()) {
+                            if at.is_dummy() { diagnostic.note(message.clone()); }
+                            else { diagnostic.span_note(*at, message.clone()); }
+                        }
+                    }
                     if !unknown && !path_proven {
                         diagnostic.note("reachability is uncertain: analysis could not determine whether execution reaches this forbidden call");
                     }
@@ -452,9 +469,9 @@ impl Callbacks for Checker {
                             "analysis site {id}: {} [context {}], {:?}, state {}, scope {:?}",
                             site.caller.instance,
                             site.caller.context,
-                            site.location,
+                            site.source.location,
                             site.state,
-                            site.scope
+                            site.source.scope
                         ));
                         if std::env::var_os("IRQ_CHECK_EXPLAIN").is_some() {
                             diagnostic.note(format!(

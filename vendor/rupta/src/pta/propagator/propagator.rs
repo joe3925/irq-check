@@ -794,6 +794,42 @@ where
             // check the type of src and dst
             let (src_path, src_type) = self.node_path_and_ty(src);
             let (dst_path, dst_type) = self.node_path_and_ty(dst);
+            let source_integer = type_util::is_integer_carrier(self.tcx(), src_type);
+            let destination_integer = type_util::is_integer_carrier(self.tcx(), dst_type);
+            if source_integer || destination_integer {
+                let compatible = (source_integer || src_type.is_fn_ptr())
+                    && (destination_integer || dst_type.is_fn_ptr());
+                let points = self.get_cloned_pts(src, propa_diff);
+                for pointee in &points {
+                    let path = self.pag.node_path(pointee).clone().remove_cast();
+                    let function_type = path.try_eval_path_type(self.acx);
+                    let valid = compatible && match (path.value(), function_type.kind()) {
+                        (PathEnum::Function(function), TyKind::FnDef(_, args)) => {
+                            if destination_integer { true } else {
+                                let signature = dst_type.fn_sig(self.tcx());
+                                let original = function_type.fn_sig(self.tcx());
+                                let reference = self.acx.get_function_reference(*function);
+                                let target = rustc_middle::ty::Instance {
+                                    def: reference.kind,
+                                    args: self.tcx().instantiate_bound_regions_with_erased(*args),
+                                };
+                                self.tcx().erase_and_anonymize_regions(signature.inputs_and_output())
+                                    == self.tcx().erase_and_anonymize_regions(original.inputs_and_output())
+                                    && type_util::call_abi_compatible(self.tcx(), signature, target)
+                            }
+                        }
+                        _ => false,
+                    };
+                    if valid {
+                        let origin = self.pag.get_or_insert_node(&path);
+                        changed |= self.add_pts(dst, origin);
+                    } else {
+                        self.acx.value_unknown_paths.insert(Rc::new(Path { value: dst_path.value().clone() }));
+                    }
+                }
+                if changed { self.worklist.push_back(dst); }
+                return;
+            }
             // debug!("Propagating from {:?}({:?}) -> {:?}({:?})", src_path, src_type, dst_path, dst_type);
 
             let type_filter_pred = Self::type_filter_pred();
@@ -1025,6 +1061,37 @@ where
         src_flattened_fields: Vec<(usize, P, Ty<'tcx>)>,
         tgt_flattened_fields: Vec<(usize, P, Ty<'tcx>)>,
     ) {
+        for (fields, other) in [(&src_flattened_fields, &tgt_flattened_fields),
+            (&tgt_flattened_fields, &src_flattened_fields)]
+        {
+            let mut ranges: Vec<_> = other.iter().filter_map(|(offset, _, ty)| {
+                let size = self.tcx().layout_of(rustc_middle::ty::TypingEnv::fully_monomorphized()
+                    .as_query_input(*ty)).ok().map(|layout| layout.size.bytes_usize());
+                if size == Some(0) { return None; }
+                Some((*offset, size.map_or(usize::MAX, |size| offset.saturating_add(size)), *ty))
+            }).collect();
+            ranges.sort_unstable_by_key(|(offset, _, _)| *offset);
+            let mut maximum_end = 0;
+            let ends: Vec<_> = ranges.iter().map(|(_, end, _)| {
+                maximum_end = maximum_end.max(*end);
+                maximum_end
+            }).collect();
+            for (offset, path, ty) in fields {
+                if !crate::limits::checkpoint() { return; }
+                if !type_util::is_integer_carrier(self.tcx(), *ty) { continue; }
+                let end = offset.saturating_add(self.tcx().data_layout.pointer_size().bytes_usize());
+                let first = ends.partition_point(|end| *end <= *offset);
+                for (other_offset, other_end, other_ty) in ranges[first..].iter()
+                    .take_while(|(start, _, _)| *start < end)
+                {
+                    if *offset < *other_end && (offset != other_offset
+                        || !type_util::is_integer_carrier(self.tcx(), *other_ty) && !other_ty.is_fn_ptr())
+                    {
+                        self.acx.value_unknown_paths.insert(Rc::new(Path { value: path.value().clone() }));
+                    }
+                }
+            }
+        }
         let src_len = src_flattened_fields.len();
         let tgt_len = tgt_flattened_fields.len();
         let mut src_field_index = 0;
@@ -1042,7 +1109,21 @@ where
             }
 
             // if source type and target type are any kind of primitive pointer type (reference, raw pointer, fn pointer).
-            if src_type.is_any_ptr() && tgt_type.is_any_ptr() {
+            let source_integer = type_util::is_integer_carrier(self.tcx(), *src_type);
+            let target_integer = type_util::is_integer_carrier(self.tcx(), *tgt_type);
+            if (source_integer || target_integer)
+                && (source_integer || src_type.is_fn_ptr())
+                && (target_integer || tgt_type.is_fn_ptr())
+            {
+                src_field.set_path_rustc_type(self.acx, *src_type);
+                tgt_field.set_path_rustc_type(self.acx, *tgt_type);
+                if let Some(edge_id) = self.add_direct_edge(src_field, tgt_field) {
+                    self.propagate(edge_id, false);
+                }
+                if let Some(edge_id) = self.add_direct_edge(tgt_field, src_field) {
+                    self.propagate(edge_id, false);
+                }
+            } else if src_type.is_any_ptr() && tgt_type.is_any_ptr() {
                 src_field.set_path_rustc_type(self.acx, *src_type);
                 tgt_field.set_path_rustc_type(self.acx, *tgt_type);
                 if type_util::equivalent_ptr_types(self.tcx(), *src_type, *tgt_type) {
@@ -1068,7 +1149,7 @@ where
                 if src_type.is_enum() && src_type == tgt_type {
                     // We do not flatten fields for enum type, therefore if src_type and tgt_type are the same enum types,
                     // we add direct edges between their pointer fields.
-                    let ptr_projs = self.acx.get_pointer_projections(*src_type);
+                    let ptr_projs = self.acx.get_value_projections(*src_type);
                     let ptr_projs = ptr_projs.clone();
                     for (ptr_proj, ptr_ty) in ptr_projs {
                         let src_field = src_field.append_projection(&ptr_proj);

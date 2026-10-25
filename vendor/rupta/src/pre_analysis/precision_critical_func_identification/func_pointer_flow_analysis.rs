@@ -64,6 +64,9 @@ pub struct FuncPFG {
     pub cs_callsites: HashSet<Location>, 
     // parameter with flow to return
     pub param_with_flow: HashSet<usize>,
+    pub memory_outputs: HashSet<Rc<Path>>,
+    pub param_with_memory_flow: HashSet<usize>,
+    pub atomic_relations: bool,
 }
 
 
@@ -80,6 +83,9 @@ impl FuncPFG {
             closure_dyn_callsites: HashSet::new(),
             cs_callsites: HashSet::new(),
             param_with_flow: HashSet::new(),
+            memory_outputs: HashSet::new(),
+            param_with_memory_flow: HashSet::new(),
+            atomic_relations: false,
         }
     }
 
@@ -128,6 +134,7 @@ impl FuncPFG {
         self.has_arg_to_return_flow = false;
         self.cs_callsites.clear();
         self.param_with_flow.clear();
+        self.param_with_memory_flow.clear();
        
         let param_nodes: Vec<NodeIndex> = self
             .graph
@@ -136,6 +143,22 @@ impl FuncPFG {
             .collect();
         
         let return_idx = self.get_or_insert_node(Path::new_return_value(self.func_id));
+        let memory_outputs: Vec<_> = self.memory_outputs.iter().cloned().collect();
+        let mut reaches_memory = HashSet::new();
+        let mut memory_queue: VecDeque<_> = memory_outputs.into_iter()
+            .map(|path| self.get_or_insert_node(path)).collect();
+        while let Some(node) = memory_queue.pop_front() {
+            if !reaches_memory.insert(node) { continue; }
+            for edge in self.graph.edges_directed(node, petgraph::Direction::Incoming) {
+                memory_queue.push_back(edge.source());
+            }
+        }
+        for &parameter in &param_nodes {
+            if reaches_memory.contains(&parameter)
+                && let PathEnum::Parameter { ordinal, .. } = self.graph[parameter].path.value {
+                self.param_with_memory_flow.insert(ordinal);
+            }
+        }
 
         // --- nodes that can reach return (reverse BFS) ---
         let mut reaches_ret: HashSet<NodeIndex> = HashSet::new();
@@ -167,7 +190,7 @@ impl FuncPFG {
         let has_arg_to_return_flow = param_nodes.iter().any(|p| reaches_ret.contains(p));
         self.has_arg_to_return_flow = has_arg_to_return_flow;
 
-        if !has_arg_to_return_flow {
+        if !has_arg_to_return_flow && self.param_with_memory_flow.is_empty() {
             self.cs_callsites.clear();
             return;
         }
@@ -189,7 +212,7 @@ impl FuncPFG {
         for e in self.graph.edge_references() {
             let u = e.source();
             let v = e.target();
-            if from_param.contains(&u) && reaches_ret.contains(&v) {
+            if from_param.contains(&u) && (reaches_ret.contains(&v) || reaches_memory.contains(&v)) {
                 if let PFGEdgeEnum::CallPFGEdge(loc) = &e.weight().kind {
                     self.cs_callsites.insert(*loc);
                 }
@@ -265,11 +288,8 @@ impl<'a, 'rta, 'tcx, 'compilation> FuncPointerFlowAnalysis<'a, 'rta, 'tcx, 'comp
                 break;
             }
         }
-        let return_local =  &self.mir.local_decls[mir::Local::from_u32(0)];
-        let return_ty = self.substs_specializer.specialize_generic_argument_type(return_local.ty);
-        let return_has_ptr = self.type_contains_pointer_or_ref(return_ty);
-        // we construct the pointer flow graph only if there exist pointer/ref in args and return type
-        if arg_has_ptr && return_has_ptr {
+        let return_ty = self.substs_specializer.specialize_generic_argument_type(self.mir.local_decls[mir::RETURN_PLACE].ty);
+        if arg_has_ptr && (self.pfg.atomic_relations || self.type_contains_pointer_or_ref(return_ty)) {
             self.visit_body();
             self.solve_graph_initial();
         } else {
@@ -330,6 +350,11 @@ impl<'a, 'rta, 'tcx, 'compilation> FuncPointerFlowAnalysis<'a, 'rta, 'tcx, 'comp
                 
                 if self.type_contains_pointer_or_ref(place_ty) {
                     self.visit_assign(place, rvalue);
+                    if self.pfg.atomic_relations && place.projection.iter().any(|element| matches!(element, mir::ProjectionElem::Deref)) {
+                        let path = Path::new_local_parameter_or_result(self.func_id, place.local.as_usize(), self.mir.arg_count);
+                        self.pfg.get_or_insert_node(path.clone());
+                        self.pfg.memory_outputs.insert(path);
+                    }
                 }
                 
             }
@@ -443,12 +468,12 @@ impl<'a, 'rta, 'tcx, 'compilation> FuncPointerFlowAnalysis<'a, 'rta, 'tcx, 'comp
         let destination_ty = self.substs_specializer.specialize_generic_argument_type(
             self.mir.local_decls[destination.local].ty
         );
-        if !self.type_contains_pointer_or_ref(destination_ty) {
+        let args_paths = self.visit_args(args);
+        if !self.type_contains_pointer_or_ref(destination_ty) && (!self.pfg.atomic_relations || args_paths.is_empty()) {
             return;
         }
         // collect callsite information
         let destination_path = Path::new_local_parameter_or_result(self.func_id, destination.local.as_usize(), self.mir.arg_count);
-        let args_paths = self.visit_args(args).into_iter().collect();
 
         self.pfg.callsite_to_locals.insert(location, (args_paths, destination_path.clone()));
         match func {
@@ -559,10 +584,11 @@ let gen_args = &self.acx().tcx.instantiate_bound_regions_with_erased(*gen_args);
     }
  
     fn type_contains_pointer_or_ref(&mut self, ty: Ty<'tcx>) -> bool {
-        if ty.is_any_ptr() {
+        if ty.is_any_ptr() || self.pfg.atomic_relations && crate::util::type_util::is_integer_carrier(self.acx().tcx, ty) {
             return true;
         } else {
-            let ptr_projs = self.acx().get_pointer_projections(ty);
+            let ptr_projs = if self.pfg.atomic_relations { self.acx().get_value_projections(ty) }
+                else { self.acx().get_pointer_projections(ty) };
             if !ptr_projs.is_empty() {
                 return true;
             } else {

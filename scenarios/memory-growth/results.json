@@ -1,0 +1,88 @@
+{
+  "date_utc": "2026-10-10",
+  "command": ".\\scenarios\\measure-memory.ps1 -Checker .\\target\\release\\irq-check.exe",
+  "plain_command": ".\\scenarios\\measure-memory.ps1 -Checker .\\target\\release\\irq-check.exe -Plain",
+  "kernel_command": ".\\scenarios\\measure-memory.ps1 -Checker .\\target\\release\\irq-check.exe -Scenario kernel-memory -Features escape,formatting,dispatch",
+  "source_sha256": "6E399C28F05B9EBE4AC7BFA8322AA8C4E6870A5A44B392753173EB8F353DFD10",
+  "driver_sha256": "4F45B89C2A2AD49E44DF8C47C7C871512FB91752A212F7F2BD3C7AA14B9C73B9",
+  "compiler_commit": "923c95cdf5ba65cea505aa2ea829f578e1506ed8",
+  "target": "x86_64-unknown-none",
+  "irq_entries": 1,
+  "runtime_records": 2,
+  "allocator_bytes": 128,
+  "source_lines": 89,
+  "notes": [
+    "The commands now have no memory or time limit. Older runs below that report memory-limit were stopped at 5.25 GiB. See diagnosis.json for completed runs without limits.",
+    "The scenario is compiled. It is not executed.",
+    "Memory values are samples from the compiler process for the scenario crate. They exclude dependency compiler processes.",
+    "Short peaks can occur between samples. The JSONL files also contain the process peak commit counters.",
+    "Elapsed times include dependency compilation. These are not isolated speed benchmarks.",
+    "The memory limit stops the launched process tree. A stopped run has no policy verdict.",
+    "The anchor field is not read by the IRQ loop. Its effect on analysis memory is the reason it remains in the source.",
+    "The helper returns its input pointer at runtime. Its crate is excluded from analysis, so the checker cannot use that body to resolve the returned pointer.",
+    "The controls without the field and without the walk used an earlier version with an empty Serial type in place of (). Each evidence directory contains its source snapshot.",
+    "No checker implementation was changed for these runs. The exact cause of the kernel failure is not established."
+  ],
+  "runs": [
+    {
+      "case": "final minimal source",
+      "evidence": "target/scenarios/memory-20261010-204030-0716743",
+      "sampled_peak_private_bytes": 5773381632,
+      "first_5_gib_seconds": 39.4698957,
+      "elapsed_seconds": 40.7965731,
+      "exit_code": 1,
+      "stop_reason": "memory-limit"
+    },
+    {
+      "case": "repeat of final minimal source",
+      "evidence": "target/scenarios/memory-20261010-204225-3623621",
+      "sampled_peak_private_bytes": 5638553600,
+      "first_5_gib_seconds": 38.9473733,
+      "elapsed_seconds": 40.2506348,
+      "exit_code": 1,
+      "stop_reason": "memory-limit"
+    },
+    {
+      "case": "replace excluded helper call with the original pointer",
+      "evidence": "target/scenarios/memory-20261010-204126-8327056",
+      "sampled_peak_private_bytes": 10514432,
+      "elapsed_seconds": 23.0302297,
+      "exit_code": 0,
+      "stop_reason": "completed"
+    },
+    {
+      "case": "remove the extra reference field and its argument",
+      "evidence": "target/scenarios/memory-20261010-203924-9067440",
+      "sampled_peak_private_bytes": 137789440,
+      "elapsed_seconds": 23.1874327,
+      "exit_code": 0,
+      "stop_reason": "completed"
+    },
+    {
+      "case": "remove the IRQ list walk",
+      "evidence": "target/scenarios/memory-20261010-203726-9559564",
+      "sampled_peak_private_bytes": 1179164672,
+      "elapsed_seconds": 24.4790743,
+      "exit_code": 0,
+      "stop_reason": "completed"
+    },
+    {
+      "case": "normal compilation of final minimal source",
+      "evidence": "target/scenarios/memory-20261010-204331-2696473",
+      "sampled_peak_private_bytes": 11886592,
+      "elapsed_seconds": 1.0832643,
+      "exit_code": 0,
+      "stop_reason": "completed"
+    },
+    {
+      "case": "separate kernel-memory scenario with callbacks and formatting",
+      "evidence": "target/scenarios/memory-20261010-201711-8006426",
+      "source_sha256": "63B07154873B5CCB045C6FA6A36B6C33E3185A614F8C328C9A0AFB432E260CE3",
+      "sampled_peak_private_bytes": 5638967296,
+      "first_5_gib_seconds": 38.4806661,
+      "elapsed_seconds": 40.2203009,
+      "exit_code": 1,
+      "stop_reason": "memory-limit"
+    }
+  ]
+}

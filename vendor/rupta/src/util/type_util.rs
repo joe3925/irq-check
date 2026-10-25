@@ -948,13 +948,31 @@ pub fn get_pointer_projections<'tcx>(
     tcx: TyCtxt<'tcx>,
     ty: Ty<'tcx>,
 ) -> Vec<(ProjectionElems, Ty<'tcx>)> {
+    get_value_projections(tcx, ty, false)
+}
+
+pub fn is_integer_carrier<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
+    ty.is_integral()
+        && tcx.layout_of(TypingEnv::fully_monomorphized().as_query_input(ty))
+            .is_ok_and(|layout| layout.size == tcx.data_layout.pointer_size())
+}
+
+pub fn get_value_projections<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: Ty<'tcx>,
+    integer_carriers: bool,
+) -> Vec<(ProjectionElems, Ty<'tcx>)> {
     let mut ptr_projs = Vec::new();
+    if integer_carriers && is_integer_carrier(tcx, ty) {
+        ptr_projs.push((Vec::new(), ty));
+        return ptr_projs;
+    }
     match ty.kind() {
         TyKind::Pat(base, _) => {
             if base.is_any_ptr() {
                 ptr_projs.push((Vec::new(), *base));
             } else {
-                ptr_projs.extend(get_pointer_projections(tcx, *base));
+                ptr_projs.extend(get_value_projections(tcx, *base, integer_carriers));
             }
         }
         TyKind::Adt(adt_def, args) if adt_def.is_struct() || adt_def.is_union() => {
@@ -971,7 +989,7 @@ pub fn get_pointer_projections<'tcx>(
                     ptr_projs.push((vec![field], field_ty));
                 } else {
                     // recursively get the pointer type subfields of this field
-                    for (mut subfield, subfield_ty) in get_pointer_projections(tcx, field_ty) {
+                    for (mut subfield, subfield_ty) in get_value_projections(tcx, field_ty, integer_carriers) {
                         subfield.insert(0, field);
                         ptr_projs.push((subfield, subfield_ty));
                     }
@@ -993,7 +1011,7 @@ pub fn get_pointer_projections<'tcx>(
                                 ptr_projs.push((vec![downcast, field], field_ty));
                             } else {
                                 // recursively get the pointer type subfields of this field
-                                for (mut subfield, subfield_ty) in get_pointer_projections(tcx, field_ty) {
+                                for (mut subfield, subfield_ty) in get_value_projections(tcx, field_ty, integer_carriers) {
                                     let mut projection = vec![downcast, field];
                                     projection.append(&mut subfield);
                                     ptr_projs.push((projection, subfield_ty));
@@ -1010,7 +1028,7 @@ pub fn get_pointer_projections<'tcx>(
                 ptr_projs.push((vec![PathSelector::Index], *elem_ty));
             } else {
                 // recursively get the pointer type subfields of the array element
-                for (mut subfield, subfield_ty) in get_pointer_projections(tcx, *elem_ty) {
+                for (mut subfield, subfield_ty) in get_value_projections(tcx, *elem_ty, integer_carriers) {
                     subfield.insert(0, PathSelector::Index);
                     ptr_projs.push((subfield, subfield_ty));
                 }
@@ -1026,7 +1044,7 @@ pub fn get_pointer_projections<'tcx>(
                     ptr_projs.push((vec![field], *field_ty));
                 } else {
                     // recursively get the pointer type subfields of this field
-                    for (mut subfield, subfield_ty) in get_pointer_projections(tcx, *field_ty) {
+                    for (mut subfield, subfield_ty) in get_value_projections(tcx, *field_ty, integer_carriers) {
                         subfield.insert(0, field);
                         ptr_projs.push((subfield, subfield_ty));
                     }
@@ -1039,7 +1057,7 @@ pub fn get_pointer_projections<'tcx>(
                     ptr_projs.push((vec![PathSelector::Field(i)], field_ty));
                 } else {
                     // recursively get the pointer type subfields of this field
-                    for (mut subfield, subfield_ty) in get_pointer_projections(tcx, field_ty) {
+                    for (mut subfield, subfield_ty) in get_value_projections(tcx, field_ty, integer_carriers) {
                         subfield.insert(0, PathSelector::Field(i));
                         ptr_projs.push((subfield, subfield_ty));
                     }

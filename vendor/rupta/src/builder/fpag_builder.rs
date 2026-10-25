@@ -216,7 +216,7 @@ impl<'pta, 'tcx, 'compilation> FuncPAGBuilder<'pta, 'tcx, 'compilation> {
         // contain pointer type fields. 
         // The lh type maybe a opaque type, we need to determine the actual type 
         // according to the rh type.
-        if !lh_type.is_any_ptr() && self.acx.get_pointer_projections(lh_type).is_empty() {
+        if !lh_type.is_any_ptr() && self.acx.get_value_projections(lh_type).is_empty() {
             if let PathEnum::QualifiedPath { base, projection } = &lh_path.value {
                 if matches!(projection.first(), Some(PathSelector::Deref))
                     && !self.tcx().layout_of(ty::TypingEnv::fully_monomorphized().as_query_input(lh_type))
@@ -231,10 +231,19 @@ impl<'pta, 'tcx, 'compilation> FuncPAGBuilder<'pta, 'tcx, 'compilation> {
                         "pointer bits are converted to non-pointer storage".into()));
                 }
             }
+            self.cast_between_union_fields(&lh_path);
             return;
         }
 
-        self.visit_rvalue(lh_path.clone(), rvalue);
+        if !self.acx.get_value_projections(lh_type).is_empty()
+            && matches!(rvalue, mir::Rvalue::BinaryOp(..) | mir::Rvalue::UnaryOp(..) | mir::Rvalue::Discriminant(..))
+        {
+            let unknown = self.create_aux_local(lh_type);
+            self.acx.value_unknown_paths.insert(unknown.clone());
+            self.add_internal_edges(unknown, lh_type, lh_path.clone(), lh_type);
+        } else {
+            self.visit_rvalue(lh_path.clone(), rvalue);
+        }
 
         // If this assignment writes to a field or subfield of a union, add edges 
         // between the union fields that share the same memory offset.
@@ -277,7 +286,7 @@ impl<'pta, 'tcx, 'compilation> FuncPAGBuilder<'pta, 'tcx, 'compilation> {
 
         // convert it to `` let aux = *src_ptr; *dst_ptr = aux ``
         let deref_ty = type_util::get_dereferenced_type(self.acx.get_path_rustc_type(&src_ptr).unwrap());
-        if !deref_ty.is_any_ptr() {
+        if !deref_ty.is_any_ptr() && !type_util::is_integer_carrier(self.tcx(), deref_ty) {
             self.acx.scalar_writes.insert((dst_ptr.clone(), Vec::new()));
         }
         let aux = self.create_aux_local(deref_ty);
@@ -598,7 +607,7 @@ let gen_args = &self.tcx().instantiate_bound_regions_with_erased(*gen_args);
             .acx
             .get_path_rustc_type(&lh_path)
             .expect("Unresolved lh type.");
-        if !lh_type.is_any_ptr() && self.acx.get_pointer_projections(lh_type).is_empty() {
+        if !lh_type.is_any_ptr() && self.acx.get_value_projections(lh_type).is_empty() {
             return;
         }
         let rh_path = self.visit_const_operand(const_op);
@@ -632,7 +641,7 @@ let gen_args = &self.tcx().instantiate_bound_regions_with_erased(*gen_args);
     fn visit_const(&mut self, ty: Ty<'tcx>, c: &ty::Const<'tcx>) -> Rc<Path> {
         debug!("Visiting constant came from the type system: {c:?}");
         let ty = self.substs_specializer.specialize_generic_argument_type(ty);
-        if !ty.is_any_ptr() && type_util::get_pointer_projections(self.tcx(), ty).is_empty() {
+        if !ty.is_any_ptr() && self.acx.get_value_projections(ty).is_empty() {
             return Path::new_constant();
         }
         let c = ty::EarlyBinder::bind(self.tcx(), *c).instantiate(self.tcx(), self.substs_specializer.generic_args);
@@ -643,7 +652,9 @@ let gen_args = &self.tcx().instantiate_bound_regions_with_erased(*gen_args);
         }
         self.acx.coverage_gaps.insert((self.func_id, Some(self.location),
             "type-system constant could not be evaluated".into()));
-        Path::new_constant()
+        let unknown = self.create_aux_local(ty);
+        self.acx.value_unknown_paths.insert(unknown.clone());
+        unknown
     }
 
     /// Synthesizes a constant value from an unevaluated mir constant which is not part of the type system.
@@ -674,7 +685,9 @@ let gen_args = &self.tcx().instantiate_bound_regions_with_erased(*gen_args);
             }
             self.acx.coverage_gaps.insert((self.func_id, Some(self.location),
                 "generic constant could not be evaluated".into()));
-            return Path::new_constant();
+            let unknown = self.create_aux_local(ty);
+            self.acx.value_unknown_paths.insert(unknown.clone());
+            return unknown;
         }
         if self.tcx().is_mir_available(def_id) {
             let static_variable = Path::new_static_variable(def_id);
@@ -683,7 +696,9 @@ let gen_args = &self.tcx().instantiate_bound_regions_with_erased(*gen_args);
             self.fpag.add_static_variables_involved(static_variable.clone());
             return static_variable;
         }
-        Path::new_constant()
+        let unknown = self.create_aux_local(ty);
+        self.acx.value_unknown_paths.insert(unknown.clone());
+        unknown
     }
 
     /// This represents things the type system cannot handle (e.g. pointers), as well as
@@ -712,6 +727,9 @@ let gen_args = &self.tcx().instantiate_bound_regions_with_erased(*gen_args);
                         if let Some(pointee) = ty.builtin_deref(true).filter(|pointee|
                             !pointee.is_any_ptr() && type_util::get_pointer_projections(self.tcx(), *pointee).is_empty()) {
                             let storage = self.create_aux_local(pointee);
+                            if !self.acx.get_value_projections(pointee).is_empty() {
+                                self.acx.value_unknown_paths.insert(storage.clone());
+                            }
                             self.add_addr_edge(storage, aux.clone());
                         } else {
                             self.acx.coverage_gaps.insert((self.func_id, Some(self.location),
@@ -761,7 +779,8 @@ let args = &self.tcx().instantiate_bound_regions_with_erased(*args);
             mir::ConstValue::Indirect { alloc_id, offset } => {
                 let value = self.create_aux_local(ty);
                 let fields = type_util::flatten_fields(self.tcx(), ty::TypingEnv::fully_monomorphized(), value.clone(), ty);
-                let pointers: Vec<_> = fields.iter().filter(|(_, _, ty)| ty.is_any_ptr()).collect();
+                let pointers: Vec<_> = fields.iter().filter(|(_, _, ty)| ty.is_any_ptr()
+                    || type_util::is_integer_carrier(self.tcx(), *ty)).collect();
                 let null_pointers = !pointers.is_empty()
                     && matches!(self.tcx().try_get_global_alloc(alloc_id), Some(GlobalAlloc::Memory(memory))
                         if pointers.iter().all(|(field, _, _)| {
@@ -775,6 +794,16 @@ let args = &self.tcx().instantiate_bound_regions_with_erased(*args);
                 if !null_pointers && (ty.is_any_ptr() || !type_util::get_pointer_projections(self.tcx(), ty).is_empty()) {
                     self.acx.coverage_gaps.insert((self.func_id, Some(self.location),
                         "constant pointer bytes require flow refinement".into()));
+                }
+                if !null_pointers && !self.acx.get_value_projections(ty).is_empty() {
+                    self.acx.value_unknown_paths.insert(value.clone());
+                }
+                value
+            }
+            mir::ConstValue::Scalar(Scalar::Int(bits)) if type_util::is_integer_carrier(self.tcx(), ty) => {
+                let value = self.create_aux_local(ty);
+                if bits.to_bits(bits.size()) != 0 {
+                    self.acx.value_unknown_paths.insert(value.clone());
                 }
                 value
             }
@@ -908,14 +937,43 @@ let args = &self.tcx().instantiate_bound_regions_with_erased(*args);
             // An address-to-pointer cast that picks up an exposed provenance.
             // See the docs on from_exposed_addr for more details.
             | mir::CastKind::PointerWithExposedProvenance => {
-                self.acx.coverage_gaps.insert((self.func_id, Some(self.location),
-                    "pointer/integer provenance requires flow refinement".into()));
+                let source_ty = self.substs_specializer.specialize_generic_argument_type(operand.ty(self.mir, self.tcx()));
+                if source_ty.is_fn_ptr() && type_util::is_integer_carrier(self.tcx(), lh_type) {
+                    let source = match operand {
+                        mir::Operand::Copy(place) | mir::Operand::Move(place) => self.get_path_for_place(place),
+                        mir::Operand::Constant(value) => self.visit_const_operand(value),
+                        mir::Operand::RuntimeChecks(_) => unreachable!(),
+                    };
+                    self.add_edge_between_ptrs(source, lh_path);
+                } else {
+                    self.acx.value_unknown_paths.insert(lh_path);
+                    self.acx.coverage_gaps.insert((self.func_id, Some(self.location),
+                        if source_ty.is_any_ptr() && lh_type.is_integral() {
+                            "pointer bits are converted to non-pointer storage"
+                        } else {
+                            "pointer/integer provenance requires flow refinement"
+                        }.into()));
+                }
             }
             // Primitive casts
-            mir::CastKind::IntToInt
-            | mir::CastKind::FloatToInt
+            mir::CastKind::IntToInt => {
+                let source_ty = self.substs_specializer.specialize_generic_argument_type(operand.ty(self.mir, self.tcx()));
+                if type_util::is_integer_carrier(self.tcx(), source_ty)
+                    && type_util::is_integer_carrier(self.tcx(), lh_type)
+                {
+                    let source = match operand {
+                        mir::Operand::Copy(place) | mir::Operand::Move(place) => self.get_path_for_place(place),
+                        mir::Operand::Constant(value) => self.visit_const_operand(value),
+                        mir::Operand::RuntimeChecks(_) => unreachable!(),
+                    };
+                    self.add_edge_between_ptrs(source, lh_path);
+                } else {
+                    self.acx.value_unknown_paths.insert(lh_path);
+                }
+            }
+            mir::CastKind::FloatToInt
             | mir::CastKind::FloatToFloat
-            | mir::CastKind::IntToFloat => {}
+            | mir::CastKind::IntToFloat => { self.acx.value_unknown_paths.insert(lh_path); }
             // Go from a mut raw pointer to a const raw pointer.
             mir::CastKind::PointerCoercion(PointerCoercion::MutToConstPointer, _)
             // Go from a safe fn pointer to an unsafe fn pointer.
@@ -1316,7 +1374,7 @@ let substs = &self.tcx().instantiate_bound_regions_with_erased(*substs);
                     if let Some(argument) = store {
                         let value_ty = self.acx.get_path_rustc_type(&args[argument]).unwrap();
                         self.add_internal_edges(args[argument].clone(), value_ty, storage, pointee);
-                        if !pointee.is_any_ptr() && type_util::get_pointer_projections(self.tcx(), pointee).is_empty() {
+                        if !pointee.is_any_ptr() && self.acx.get_value_projections(pointee).is_empty() {
                             self.acx.scalar_writes.insert((args[0].clone(), Vec::new()));
                         }
                     }
@@ -1344,7 +1402,7 @@ let substs = &self.tcx().instantiate_bound_regions_with_erased(*substs);
                     let target_path = self.create_dereference(args[target].clone(), target_ty);
                     self.add_internal_edges(source_path, source_pointee, temporary.clone(), source_pointee);
                     self.add_internal_edges(temporary, source_pointee, target_path, target_pointee);
-                    if !source_pointee.is_any_ptr() {
+                    if !source_pointee.is_any_ptr() && !type_util::is_integer_carrier(self.tcx(), source_pointee) {
                         self.acx.scalar_writes.insert((args[target].clone(), Vec::new()));
                     }
                     copied += 1;
@@ -1665,11 +1723,11 @@ let substs = &self.tcx().instantiate_bound_regions_with_erased(*substs);
         dst_type: Ty<'tcx>,
     ) {
         if type_util::equal_types(self.tcx(), src_type, dst_type) {
-            if src_type.is_any_ptr() {
+            if src_type.is_any_ptr() || type_util::is_integer_carrier(self.tcx(), src_type) {
                 self.add_edge_between_ptrs(src_path, dst_path);
             } else {
                 let ptr_projs = unsafe {
-                    &*(self.acx.get_pointer_projections(src_type) as *const Vec<(ProjectionElems, Ty<'tcx>)>)
+                    &*(self.acx.get_value_projections(src_type) as *const Vec<(ProjectionElems, Ty<'tcx>)>)
                 };
                 for (ptr_proj, ptr_ty) in ptr_projs {
                     let src_field = Path::append_projection(&src_path, ptr_proj);
@@ -1842,6 +1900,34 @@ let substs = &self.tcx().instantiate_bound_regions_with_erased(*substs);
         src_flattened_fields: Vec<(usize, Rc<Path>, Ty<'tcx>)>,
         tgt_flattened_fields: Vec<(usize, Rc<Path>, Ty<'tcx>)>,
     ) {
+        let mut source_fields = HashMap::<_, Vec<_>>::new();
+        for (offset, path, ty) in &src_flattened_fields {
+            source_fields.entry(*offset).or_default().push((path, *ty));
+        }
+        for (offset, target, target_ty) in &tgt_flattened_fields {
+            if !crate::limits::checkpoint() { return; }
+            let target_integer = type_util::is_integer_carrier(self.tcx(), *target_ty);
+            if !target_integer && !target_ty.is_fn_ptr() { continue; }
+            let mut matched = false;
+            for &(source, source_ty) in source_fields.get(offset).into_iter().flatten() {
+                let source_integer = type_util::is_integer_carrier(self.tcx(), source_ty);
+                if source_integer || target_integer && source_ty.is_fn_ptr() {
+                    self.acx.set_path_rustc_type(source.clone(), source_ty);
+                    self.acx.set_path_rustc_type(target.clone(), *target_ty);
+                    if source.is_deref_path() && target.is_deref_path() {
+                        let temporary = self.create_aux_local(source_ty);
+                        self.add_load_edge(source.clone(), temporary.clone());
+                        self.add_store_edge(temporary, target.clone());
+                    } else {
+                        self.add_edge_between_ptrs(source.clone(), target.clone());
+                    }
+                    matched = true;
+                }
+            }
+            if target_integer && !matched {
+                self.acx.value_unknown_paths.insert(target.clone());
+            }
+        }
         for (offset, target, ty) in &tgt_flattened_fields {
             if ty.is_raw_ptr()
                 && src_flattened_fields.iter().any(|(source_offset, _, source_ty)| {
@@ -1857,7 +1943,8 @@ let substs = &self.tcx().instantiate_bound_regions_with_erased(*substs);
             }
             if (ty.is_any_ptr() || !type_util::get_pointer_projections(self.tcx(), *ty).is_empty())
                 && !src_flattened_fields.iter().any(|(source_offset, _, source_ty)| source_offset == offset
-                    && (source_ty.is_any_ptr() || source_ty == ty)) {
+                    && (source_ty.is_any_ptr() || source_ty == ty
+                        || ty.is_fn_ptr() && type_util::is_integer_carrier(self.tcx(), *source_ty))) {
                 self.acx.coverage_gaps.insert((self.func_id, Some(self.location),
                     "transmute does not establish all pointer fields".into()));
             }

@@ -1,0 +1,65 @@
+Concurrent pruning comparison
+
+Completed: 18 packages for each of six settings, 108 measured runs.
+Evidence: target/pruning-study/concurrent-20261011-024601
+Driver SHA256: E9B1EFCCA87DA49988C0BE9271EDA92E6A3E44C93D698E96ED0301386117491E
+
+Method
+- Each setting released all 18 ready workers together. Settings ran as separate batches.
+- All packages used default features. These are not chain-64 or writer-growth large runs.
+- No memory or time limits were used.
+- Each individual setting enabled only its named change. The baseline disabled all four changes but retained shared storage-ID and empty cache infrastructure. It is not the historical binary.
+- Values below are individual driver peak commit in decimal MB, read from Windows before driver exit. They are not simultaneous whole-machine memory peaks. Do not add them to infer a batch peak.
+- Each cell is one run. Concurrent scheduling and allocation can affect results. Small differences need repeat runs.
+- Retained context counts are not total-ever-created context counts.
+
+Outcomes
+- All 108 result files are present.
+- Each setting passed 16 IRQ scenarios and built the helper library: 102 exit-zero runs.
+- Default kernel-memory returned incomplete analysis in all six settings: six exit-101 runs. It produced 19 to 21 incomplete-analysis errors per run. No setting established a policy verdict for that case.
+- No compiler-error or panic marker was found by the runner.
+- The command exited 1 during the last report append because performance/results.txt was locked. Analysis results were already saved. This report recovers the complete matrix; the append failure is not an analysis failure.
+
+Peak commit, MB
+Scenario                  Baseline   Atomic   Collection   Arguments   Trees    Combined
+batch-frontier              171.09   170.90       171.63      171.54   170.84      171.36
+context-growth              403.12   407.10       349.20      408.95   413.33      345.22
+context-growth-boundary     167.49   167.43       167.73      167.30   167.40      167.51
+context-retirement          171.66   172.48       172.30      172.79   172.27      171.96
+correlated-dyn              171.59   172.24       172.43      172.11   171.90      172.18
+erased-records              172.55   172.64       172.77      172.55   173.21      172.10
+formatting                  396.12   392.65       385.17      391.33   394.22      386.03
+heap-context                184.61   183.71       183.67      184.02   185.70      183.95
+heap-read-chain             185.34   185.33       185.37      184.53   183.90      183.31
+kernel-memory              1739.08  1727.14      1690.96     1735.20  1744.46     1694.25
+leaf-reads                  171.14   170.82       170.75      171.05   170.68      170.42
+memory-growth               184.37   183.69       185.69      184.18   184.73      185.67
+memory-growth-roots          184.59   184.27       184.56      183.28   185.18      184.56
+mixed-dyn                   172.46   173.26       172.28      172.55   172.77      172.29
+pointer-alias               173.86   173.12       172.87      172.92   172.89      173.59
+read-chain                  171.22   171.28       172.21      170.85   171.25      170.85
+return-widening              171.84   171.70       170.55      170.78   171.31      170.99
+writer-growth               172.43   172.76       172.54      173.03   172.18      172.80
+
+Changes against baseline, across the 16 passing IRQ scenarios
+Change       Median peak change   Largest decrease                Largest increase
+Atomic                   -0.04%   formatting -0.87%                context-growth +0.99%
+Collection                0.00%   context-growth -13.38%            memory-growth +0.72%
+Arguments                -0.08%   formatting -1.21%                context-growth +1.45%
+Trees                    +0.10%   heap-read-chain -0.78%           context-growth +2.53%
+Combined                 -0.19%   context-growth -14.36%           memory-growth +0.71%
+
+Context-growth detail
+Setting       Retained contexts   Retired contexts   Peak commit bytes
+Baseline                   5742                  0           403124224
+Atomic                     5720                  0           407097344
+Collection                 3609               2177           349204480
+Arguments                  5721                  0           408952832
+Trees                      5783                  1           413331456
+Combined                   3531               2182           345223168
+
+Conclusion
+- Collection has the largest measured individual benefit. It also reduced formatting peak commit from 396115968 to 385167360 bytes and retired 154 contexts there.
+- Atomic, argument, and tree changes do not show a broad peak-memory benefit in this batch. Each had a higher peak in some cases. The largest observed increase was tree cleanup on context-growth, at 2.53 percent.
+- These single-run increases are candidates for repeat measurement, not proof of a stable regression.
+- Combined context-growth peak fell 14.36 percent. Most other passing cases changed little. This does not establish a full-kernel memory reduction or removal of paging.

@@ -15,6 +15,7 @@ mod flow;
 mod control;
 mod scalar;
 mod effects;
+mod impact;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) struct Point {
@@ -110,6 +111,7 @@ struct ReadKey<'tcx> {
     inputs: Box<[(usize, usize)]>,
     alias_object: Option<Object>,
     refinement_origin: Option<Point>,
+    condition_origin: Option<Arc<control::ConditionKey>>,
     control: bool,
 }
 
@@ -118,6 +120,7 @@ pub(super) struct Solver<'a, 'tcx> {
     pub(super) controls: control::ControlCache<'tcx>,
     scalars: scalar::ScalarCache<'tcx>,
     pub(super) effects: effects::EffectCache<'tcx>,
+    pub(super) impacts: impact::ImpactCache<'tcx>,
     pub tcx: TyCtxt<'tcx>,
     pub trust: &'a Trust,
     facts: &'a super::global::PointerFacts<'tcx>,
@@ -129,6 +132,7 @@ pub(super) struct Solver<'a, 'tcx> {
     pub indexes: HashMap<(Instance<'tcx>, bool), Arc<BodyIndex<'tcx>>>,
     alias_object: Option<Object>,
     refinement_origin: Option<Point>,
+    condition_origin: Option<Arc<control::ConditionKey>>,
     pub cache_limit: usize,
     pub budget: QueryBudget,
     pub exported: &'a HashMap<String, Instance<'tcx>>,
@@ -153,12 +157,12 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
         facts: &'a super::global::PointerFacts<'tcx>,
     ) -> Self {
         Self {
-            flow: flow::Flow::default(), controls: control::ControlCache::default(), scalars: scalar::ScalarCache::default(), effects: effects::EffectCache::default(), tcx, trust, exported, facts,
+            flow: flow::Flow::default(), controls: control::ControlCache::default(), scalars: scalar::ScalarCache::default(), effects: effects::EffectCache::default(), impacts: impact::ImpactCache::default(), tcx, trust, exported, facts,
             frames: Vec::new(), frame_contexts: Vec::new(), frame_ids: HashMap::new(), context_frames: HashMap::new(),
             indexes: HashMap::new(), frame_depth: Vec::new(),
             cache_limit: 1024 * 1024 * 1024,
-            alias_object: None, refinement_origin: None,
-            budget: QueryBudget { steps: 0, limit: 0, scratch: 0, refinement_limit: None },
+            alias_object: None, refinement_origin: None, condition_origin: None,
+            budget: QueryBudget { steps: 0, limit: 0, scratch: 0, refinement_limit: None, limit_usage: None },
             discovery_roots: Vec::new(), readonly: HashMap::new(),
             caller_locations: HashMap::new(), static_allocations: HashMap::new(),
             index_choices: HashMap::new(), loop_entries: Box::new([]), cut_recursive_returns: false, input_choices: HashMap::new(), choice_values: HashMap::new(), split_index: None,
@@ -475,6 +479,7 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
             let distinct: HashSet<_> = result.iter().map(|value| value.value).collect();
             if distinct.len() == result.len() && !result.iter().any(|value| matches!(value.value, Value::Unknown(_))) {
                 if result.len() > limit {
+                    self.budget.record_limit(QueryStop::AlternativeLimit, "value alternatives", result.len(), limit);
                     if std::env::var_os("IRQ_CHECK_TRACE_FLOW_VALUES").is_some() {
                         eprintln!("irq-check: alternative limit values={result:?}");
                     }
@@ -483,29 +488,53 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                 break;
             }
             let mut remove = HashSet::new();
+            let guard_key = |&(frame, guard): &(usize, Guard)| (
+                frame, guard.branch.block, guard.branch.statement_index, guard.successor,
+                guard.index, guard.input, guard.phi, guard.iteration, guard.choice,
+            );
+            self.budget.reserve(result.len() * (std::mem::size_of::<Option<Vec<(usize, Guard)>>>() + 1) * 2
+                + result.iter().filter(|value| value.guards.len() >= 16)
+                    .map(|value| value.guards.len() * std::mem::size_of::<(usize, Guard)>() * 2).sum::<usize>())?;
+            let indexed_guards: Vec<_> = result.iter().map(|value| {
+                if value.guards.len() < 16 { return None; }
+                let mut guards = value.guards.clone();
+                guards.sort_unstable_by_key(|entry| (guard_key(entry), entry.1.proof as u8, entry.1.required));
+                Some(guards)
+            }).collect();
+            let proven: Vec<_> = result.iter().map(Alternative::path_proven).collect();
+            let contains_guard = |ordinal: usize, needle: (usize, Guard), relaxed: bool| {
+                if let Some(guards) = &indexed_guards[ordinal] {
+                    if relaxed {
+                        guards.binary_search_by_key(&guard_key(&needle), guard_key).is_ok()
+                    } else {
+                        guards.binary_search_by_key(&(guard_key(&needle), needle.1.proof as u8, needle.1.required),
+                            |entry| (guard_key(entry), entry.1.proof as u8, entry.1.required)).is_ok()
+                    }
+                } else if relaxed {
+                    result[ordinal].guards.iter().any(|&(owner, other)| owner == needle.0
+                        && Guard { proof: needle.1.proof, required: needle.1.required, ..other } == needle.1)
+                } else {
+                    result[ordinal].guards.contains(&needle)
+                }
+            };
             for (index, value) in result.iter().enumerate() {
                 self.budget.charge(0)?;
                 if result.iter().enumerate().any(|(other, cover)| {
                     other != index
                         && !remove.contains(&other)
                         && (cover.value == value.value || matches!(cover.value, Value::Unknown(_)))
-                        && !(value.path_proven() && !cover.path_proven())
-                        && !(matches!(value.value, Value::Function(_)) && value.path_proven()
-                            && (matches!(cover.value, Value::Unknown(_)) || !cover.path_proven()))
+                        && !(proven[index] && !proven[other])
+                        && !(matches!(value.value, Value::Function(_)) && proven[index]
+                            && (matches!(cover.value, Value::Unknown(_)) || !proven[other]))
                         && (other < index || !((cover.value == value.value
                             || matches!((cover.value, value.value), (Value::Unknown(_), Value::Unknown(_))))
                             && value.guards.iter().all(|&(frame, guard)| guard.proof == GuardProof::Widened
-                                || cover.guards.contains(&(frame, guard))
-                                || matches!(value.value, Value::Unknown(_)) && cover.guards.iter().any(|&(owner, other)|
-                                    owner == frame && Guard { proof: guard.proof, required: guard.required, ..other } == guard))))
+                                || contains_guard(other, (frame, guard), matches!(value.value, Value::Unknown(_))))))
                         && cover
                             .guards
                             .iter()
                             .all(|&(frame, guard)| guard.proof == GuardProof::Widened
-                                || value.guards.contains(&(frame, guard))
-                                || matches!(cover.value, Value::Unknown(_))
-                                    && (guard.proof == GuardProof::Widened || value.guards.iter().any(|&(owner, other)|
-                                        owner == frame && Guard { proof: guard.proof, required: guard.required, ..other } == guard)))
+                                || contains_guard(index, (frame, guard), matches!(cover.value, Value::Unknown(_))))
                 }) {
                     remove.insert(index);
                 }
@@ -519,7 +548,10 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                 continue;
             }
             if distinct.len() == result.len() {
-                if result.len() > limit { return Err(QueryStop::AlternativeLimit); }
+                if result.len() > limit {
+                    self.budget.record_limit(QueryStop::AlternativeLimit, "value alternatives", result.len(), limit);
+                    return Err(QueryStop::AlternativeLimit);
+                }
                 break;
             }
             let branches: HashSet<_> = result
@@ -582,6 +614,7 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
             }
             if !reduced {
                 if result.len() > limit {
+                    self.budget.record_limit(QueryStop::AlternativeLimit, "value and guard alternatives", result.len(), limit);
                     if std::env::var_os("IRQ_CHECK_TRACE_FLOW_VALUES").is_some() {
                         eprintln!("irq-check: alternative limit values={result:?}");
                     }
@@ -639,6 +672,10 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                 let mut values = Vec::new();
                 for address in addresses {
                     let Value::Pointer(mut address_value, _) = address.value else {
+                        self.record_value_loss(point, "the storage address is unknown", match address.value {
+                            Value::Unknown(reason) => reason,
+                            _ => "the address calculation did not produce an established pointer",
+                        });
                         if std::env::var_os("IRQ_CHECK_TRACE_UNINITIALIZED").is_some() {
                             eprintln!("irq-check: unknown-address {} frame={} at={:?} place={place:?} type={requested} value={:?}",
                                 frame.instance, point.frame, point.location, address.value);
@@ -920,6 +957,12 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                                             && combinations.saturating_mul(length as usize) <= 32 {
                                             choices = (0..length).map(Value::Bits).collect();
                                         } else {
+                                            if (self.controls.solving || self.controls.proving_assertion || self.cut_recursive_returns)
+                                                && length > irq_check_rupta::limits::configuration().expect("validated analysis limits").alternatives as u128
+                                            {
+                                                self.controls.dependency_stop.get_or_insert((point, QueryStop::AlternativeLimit));
+                                                return Err(QueryStop::AlternativeLimit);
+                                            }
                                             self.split_index = Some((point, local, length));
                                             return Err(QueryStop::SplitIndex);
                                         }
@@ -1094,6 +1137,14 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
         &mut self,
         values: Vec<Alternative<'tcx>>,
     ) -> Result<Vec<Alternative<'tcx>>, QueryStop> {
+        self.feasible_with_paths(values, &HashSet::new())
+    }
+
+    fn feasible_with_paths(
+        &mut self,
+        values: Vec<Alternative<'tcx>>,
+        path_conditions: &HashSet<Point>,
+    ) -> Result<Vec<Alternative<'tcx>>, QueryStop> {
         let scratch = self.budget.scratch;
         let stored = self.flow.bytes;
         let input_bytes = values.capacity() * std::mem::size_of::<Alternative<'tcx>>() * 4
@@ -1163,7 +1214,9 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                 let accepts = |bits| targets.map_or(bits == u128::from(expected),
                     |targets| targets.target_for_value(bits) == guard.successor);
                 let ty = self.ty(frame, discr.ty(index.body, self.tcx));
-                let condition_key = self.controls.solving.then(|| {
+                let condition_key = (self.controls.solving || self.controls.proving_assertion
+                    || self.cut_recursive_returns || matches!(value.value, Value::Function(_))
+                    || path_conditions.contains(&Point { frame, location: guard.branch })).then(|| {
                     let mut choices: Vec<_> = self.index_choices.iter().map(|(key, value)| (*key, *value)).collect();
                     choices.sort_unstable_by_key(|((point, local), _)| (point.frame, point.location, *local));
                     let mut inputs: Vec<_> = self.input_choices.iter().filter(|(frame, _)| !self.flow.single_input(**frame))
@@ -1173,6 +1226,7 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                     witnesses.sort_unstable();
                     control::ConditionKey {
                         point: Point { frame, location: guard.branch }, generation: self.flow.generation,
+                        required_binding: !self.controls.solving && !self.controls.proving_assertion && !self.cut_recursive_returns,
                         choices, inputs, witnesses, loop_entries: self.loop_entries.clone(),
                         cut_recursive_returns: self.cut_recursive_returns,
                     }
@@ -1201,12 +1255,17 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                     self.refinement_origin.get_or_insert(Point { frame, location: guard.branch });
                     let inputs = std::mem::take(&mut self.flow.current_inputs);
                     let point = Point { frame, location: guard.branch };
-                    let scalar = if self.controls.solving { self.scalar_condition(point) } else { Ok(None) };
+                    let saved_condition = self.condition_origin.clone();
+                    if self.condition_origin.is_none() {
+                        self.condition_origin = condition_key.clone().map(Arc::new);
+                    }
+                    let scalar = self.scalar_condition(point);
                     let answer = match scalar {
                         Ok(Some(bits)) => Ok(vec![Alternative { value: Value::Bits(bits), guards: Vec::new() }]),
                         Ok(None) => self.operand(point, discr, 0, ty),
                         Err(reason) => Err(reason),
                     };
+                    self.condition_origin = saved_condition;
                     let complete = self.flow.current.is_none() || self.flow.inputs_complete(&self.flow.current_inputs);
                     self.flow.current_inputs.extend(inputs);
                     self.refinement_origin = refinement_origin;
@@ -1232,7 +1291,7 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                         guards: Vec::new(),
                     }],
                     Err(reason) => {
-                        if matches!(reason, QueryStop::RefinementLimit | QueryStop::TransferLimit
+                        if matches!(reason, QueryStop::ControlMemory | QueryStop::RefinementLimit | QueryStop::TransferLimit
                             | QueryStop::ScratchLimit | QueryStop::AlternativeLimit)
                             && let Some(key) = condition_key
                         {
@@ -2560,19 +2619,50 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                         .get(item)
                         .map(|def| Instance::mono(self.tcx, def));
                     let mut targets = Vec::new();
+                    let optional = self.flow.current.is_none() && !self.controls.solving;
+                    let refinement_limit = self.budget.refinement_limit;
+                    let scratch = self.budget.scratch;
+                    let proving_assertion = self.controls.proving_assertion;
+                    if optional {
+                        self.controls.proving_assertion = true;
+                        let allowance = irq_check_rupta::limits::configuration().expect("validated analysis limits").scalar_steps;
+                        let allowance = if self.facts.exclusions.contains(&self.frames[point.frame].instance) {
+                            allowance
+                        } else { allowance.min(4096) };
+                        let allowance = allowance.min(self.budget.limit.saturating_sub(self.budget.steps) / 2);
+                        self.budget.refinement_limit = Some(refinement_limit.unwrap_or(usize::MAX)
+                            .min(self.budget.steps.saturating_add(allowance)));
+                    }
                     let answer = {
                         let refinement_origin = self.refinement_origin;
                         self.refinement_origin.get_or_insert(point);
-                        let answer = self.operand(point, cond, 0, condition_ty);
+                        let scalar = if optional { self.scalar_condition(point) } else { Ok(None) };
+                        let answer = match scalar {
+                            Ok(Some(bits)) => Ok(vec![Alternative { value: Value::Bits(bits), guards: Vec::new() }]),
+                            Ok(None) => self.operand(point, cond, 0, condition_ty),
+                            Err(reason) => Err(reason),
+                        };
                         self.refinement_origin = refinement_origin;
                         answer
                     };
+                    self.budget.refinement_limit = refinement_limit;
+                    self.budget.scratch = scratch;
+                    self.controls.proving_assertion = proving_assertion;
                     let conditions = match answer {
                         Ok(conditions) => conditions,
                         Err(QueryStop::Unsupported | QueryStop::MissingArgument) => vec![Alternative {
                             value: Value::Unknown("the assertion condition is not proved"),
                             guards: Vec::new(),
                         }],
+                        Err(reason @ (QueryStop::RefinementLimit | QueryStop::ScratchLimit | QueryStop::AlternativeLimit | QueryStop::ControlMemory))
+                            if optional =>
+                        {
+                            self.controls.causes.insert(point, self.controls.dependency_stop.unwrap_or((point, reason)));
+                            self.retain_completed();
+                            vec![Alternative {
+                                value: Value::Unknown("the assertion condition is not proved"), guards: Vec::new(),
+                            }]
+                        }
                         Err(reason) => return Err(reason),
                     };
                     for condition in conditions {
@@ -2580,12 +2670,20 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                         {
                             continue;
                         }
+                        let proof = if matches!(condition.value, Value::Bits(_)) { GuardProof::Established }
+                            else { GuardProof::Unresolved };
+                        let guard = (point.frame, Guard {
+                            required: true, proof, iteration: None, branch: point.location,
+                            successor: mir::BasicBlock::from_usize(index.body.basic_blocks.len()),
+                            index: None, input: false, phi: false, choice: None,
+                        });
+                        let Some(guards) = self.merge(&condition.guards, &[guard])? else { continue; };
                         targets.push(Alternative {
                             value: target.map_or(
                                 Value::Unknown("the compiler panic entry is absent"),
                                 Value::Function,
                             ),
-                            guards: condition.guards,
+                            guards,
                         });
                     }
                     return self.bounded(targets);
@@ -2720,7 +2818,7 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
             let Some(&cause) = self.controls.loop_fallbacks.get(&(instance, self.frames[point.frame].irq))
                 else { return Ok(None); };
             if let Some(address) = effect
-                && address.object != Object::Heap(point) && self.preserves_storage(instance, address, requested)
+                && address.object != Object::Heap(point) && self.preserves_storage(instance, address, requested)?
             { return Ok(Some(vec![Alternative { value: Value::Unchanged, guards: Vec::new() }])); }
             (point, cause)
         } else {
@@ -2735,6 +2833,10 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
             (point, cause)
         };
         self.controls.causes.insert(at, cause);
+        if effect.is_some() {
+            self.record_value_loss(cause.0, "the bounded loop summary cannot exclude a change to this storage",
+                "the loop summary cannot exclude a write to the requested storage");
+        }
         Ok(Some(vec![Alternative {
             value: Value::Unknown(if effect.is_some() {
                 "the bounded loop summary cannot exclude a change to this storage"
@@ -3304,22 +3406,22 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
     }
 
 
-    fn preserves_storage(&self, instance: Instance<'tcx>, address: Address, requested: Ty<'tcx>) -> bool {
+    fn preserves_storage(&mut self, instance: Instance<'tcx>, address: Address, requested: Ty<'tcx>) -> Result<bool, QueryStop> {
         let objects = self.pointer_objects(address.object);
         let read_range = self.tcx.layout_of(TypingEnv::fully_monomorphized().as_query_input(requested))
-            .ok().and_then(|layout| {
+            .ok().filter(|layout| layout.is_sized()).and_then(|layout| {
                 let start = u64::try_from(address.offset).ok()?;
                 Some((start, start.checked_add(layout.size.bytes())?))
             });
-        !objects.is_empty() && self.facts.writes.get(&instance).is_some_and(|writes| {
-            objects.iter().all(|object| writes.iter().all(|write| {
-                write.object != *object || match (write.bytes, read_range) {
-                    (Some((write_start, write_end)), Some((read_start, read_end))) =>
-                        write_end <= read_start || read_end <= write_start,
-                    _ => false,
-                }
-            }))
-        })
+        if objects.is_empty() { return Ok(false); }
+        for object in objects {
+            match self.write_impact(instance, object, read_range) {
+                Ok(impact::WriteImpact::Preserved) => {}
+                Ok(_) | Err(QueryStop::RefinementLimit) => return Ok(false),
+                Err(stop) => return Err(stop),
+            }
+        }
+        Ok(true)
     }
 
     fn call_effect(
@@ -3361,8 +3463,23 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
         let mut result = Vec::new();
         let site = (self.frames[point.frame].instance, point.location);
         if !self.cut_recursive_returns && address.object != Object::Heap(point) && self.facts.covered_calls.contains(&site)
-            && self.facts.safe_candidates.get(&site).is_some_and(|targets|
-                !targets.is_empty() && targets.iter().all(|target| self.preserves_storage(*target, address, requested)))
+            && let Some(targets) = self.facts.safe_candidates.get(&site).cloned().filter(|targets| !targets.is_empty())
+        {
+            let mut preserved = true;
+            for target in targets {
+                if !self.preserves_storage(target, address, requested)? { preserved = false; break; }
+            }
+            if preserved { return Ok(vec![Alternative { value: Value::Unchanged, guards: Vec::new() }]); }
+        }
+        if !self.cut_recursive_returns && address.object != Object::Heap(point)
+            && let TerminatorKind::Call { func, .. } | TerminatorKind::TailCall { func, .. } =
+                &index.body.basic_blocks[point.location.block].terminator().kind
+            && let ty::FnDef(def, substitutions) = *self.ty(point.frame, func.ty(index.body, self.tcx)).kind()
+            && let Ok(Some(instance)) = Instance::try_resolve(self.tcx, TypingEnv::fully_monomorphized(), def,
+                self.tcx.instantiate_bound_regions_with_erased(substitutions))
+            && let Some(instance) = self.linked_target(instance)
+            && (unwind || !self.excludes_return(point, instance))
+            && self.read_only(instance, !unwind)?
         {
             return Ok(vec![Alternative { value: Value::Unchanged, guards: Vec::new() }]);
         }
@@ -3385,7 +3502,7 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                 continue;
             };
             if !unwind && self.excludes_return(point, instance) { continue; }
-            if address.object != Object::Heap(point) && self.preserves_storage(instance, address, requested) {
+            if address.object != Object::Heap(point) && self.preserves_storage(instance, address, requested)? {
                 result.push(Alternative { value: Value::Unchanged, guards: target.guards });
                 continue;
             }
@@ -3871,6 +3988,8 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                 if let Some(&cause) = solver.controls.loop_fallbacks.get(&(instance, solver.frames[child].irq)) {
                     let at = Point { frame: child, location: Location { block: mir::START_BLOCK, statement_index: 0 } };
                     solver.controls.causes.insert(at, cause);
+                    solver.record_value_loss(cause.0, "the bounded loop summary cannot exclude a change to this storage",
+                        "the loop summary cannot exclude a write to the requested storage");
                     return Ok(vec![Alternative {
                         value: Value::Unknown("the bounded loop summary cannot exclude a change to this storage"),
                         guards: vec![(child, Guard { required: false, proof: GuardProof::Widened,

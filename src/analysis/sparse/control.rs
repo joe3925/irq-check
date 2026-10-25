@@ -23,6 +23,7 @@ struct ControlKey {
 pub(super) struct ConditionKey {
     pub(super) point: Point,
     pub(super) generation: usize,
+    pub(super) required_binding: bool,
     pub(super) choices: Vec<((Point, mir::Local), u128)>,
     pub(super) inputs: Vec<(usize, usize)>,
     pub(super) witnesses: Vec<(usize, u128)>,
@@ -42,6 +43,7 @@ pub(crate) struct ControlCache<'tcx> {
     pending: HashMap<ControlKey, (Vec<Alternative<'tcx>>, usize)>,
     evaluated: HashSet<ControlKey>,
     pub(super) solving: bool,
+    pub(super) proving_assertion: bool,
     changed: bool,
     pending_bytes: usize,
     witnesses: Vec<Alternative<'tcx>>,
@@ -395,7 +397,10 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
         if coarse.is_empty() { return Ok(coarse); }
         let before = self.budget.steps;
         let saved_refinement_limit = self.budget.refinement_limit;
-        let allowance = limits.scalar_steps.min(self.budget.limit.saturating_sub(before) / 2);
+        let allowance = if self.facts.exclusions.contains(&self.frames[point.frame].instance) {
+            limits.scalar_steps
+        } else { limits.scalar_steps.min(4096) };
+        let allowance = allowance.min(self.budget.limit.saturating_sub(before) / 2);
         self.budget.refinement_limit = Some(saved_refinement_limit.unwrap_or(usize::MAX)
             .min(before.saturating_add(allowance)));
         self.controls.solving = true;
@@ -436,6 +441,7 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                 self.controls.causes.insert(point, cause);
                 let mut changed = false;
                 for frame in self.controls.attempted_loops.drain() {
+                    if reason == QueryStop::ControlMemory { continue; }
                     let frame = self.frames[frame];
                     if self.controls.loop_fallbacks.insert((frame.instance, frame.irq), cause).is_none() {
                         changed = true;
