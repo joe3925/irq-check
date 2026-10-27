@@ -15,6 +15,7 @@ extern crate rustc_symbol_mangling;
 
 mod analysis;
 mod policy;
+mod reporting;
 mod trust;
 
 use rustc_driver::{Callbacks, Compilation};
@@ -100,21 +101,7 @@ fn known_intrinsic<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> bool {
 
 impl Callbacks for Checker {
     fn after_analysis<'tcx>(&mut self, _: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
-        let callback_started = std::time::Instant::now();
-        let phase_file = std::env::var_os("IRQ_CHECK_DUMP_DIR").map(|directory| {
-            let directory = std::path::PathBuf::from(directory);
-            let _ = std::fs::create_dir_all(&directory);
-            directory.join(format!("{}-phase.txt", tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE)))
-        });
-        if let Some(path) = &phase_file { let _ = std::fs::write(path, "compiler analysis callback"); }
-        if std::env::var_os("IRQ_CHECK_STATS").is_some() {
-            eprintln!("irq-check: compiler analysis callback");
-        }
         let trust = trust::Trust::collect(tcx);
-        if let Some(path) = &phase_file { let _ = std::fs::write(path, "annotations collected; concrete instance collection"); }
-        if std::env::var_os("IRQ_CHECK_STATS").is_some() {
-            eprintln!("irq-check: annotation collection {:.3}s", callback_started.elapsed().as_secs_f64());
-        }
         if trust.invalid {
             return Compilation::Stop;
         }
@@ -146,9 +133,6 @@ impl Callbacks for Checker {
             return Compilation::Continue;
         }
         let partitions = tcx.collect_and_partition_mono_items(());
-        if std::env::var_os("IRQ_CHECK_STATS").is_some() {
-            eprintln!("irq-check: concrete instance collection {:.3}s", callback_started.elapsed().as_secs_f64());
-        }
         let mut instances = HashSet::new();
         for cgu in partitions.codegen_units {
             for item in cgu.items().keys() {
@@ -169,7 +153,7 @@ impl Callbacks for Checker {
         }
         roots.sort_by_key(ToString::to_string);
         roots.dedup();
-        if std::env::var_os("IRQ_CHECK_STATS").is_some() {
+        if crate::reporting::configuration().stats {
             let mut checked: Vec<_> = trust
                 .checked
                 .iter()
@@ -187,10 +171,8 @@ impl Callbacks for Checker {
             }
         }
         irq_check_rupta::limits::begin_analysis();
-        if let Some(path) = &phase_file { let _ = std::fs::write(path, "global pointer analysis"); }
         let analysis = analysis::Analysis::build(tcx, &trust, &instances, &roots);
-        if let Some(path) = &phase_file { let _ = std::fs::write(path, "IRQ queries complete; diagnostics"); }
-        if let Some(directory) = std::env::var_os("IRQ_CHECK_DUMP_DIR") {
+        if let Some(directory) = crate::reporting::configuration().directory.as_ref() {
             let directory = std::path::PathBuf::from(directory);
             let limits = irq_check_rupta::limits::configuration().expect("validated analysis limits");
             let graph = serde_json::json!({
@@ -408,7 +390,11 @@ impl Callbacks for Checker {
                     }
                     let mut chain = vec![tcx.def_path_str(root.instance.def_id())];
                     for (_, target, _) in hops {
-                        chain.push(format!("{} [context {}]", target.0.instance, target.0.context));
+                        chain.push(if crate::reporting::configuration().explain {
+                            format!("{} [context {}]", target.0.instance, target.0.context)
+                        } else {
+                            target.0.instance.to_string()
+                        });
                     }
                     let message = if unknown {
                         "interrupt call path cannot be fully checked".to_string()
@@ -463,7 +449,7 @@ impl Callbacks for Checker {
                         }
                         diagnostic.note("irq::unreachable(unsafe) can exclude a reviewed fatal IRQ path only in an explicit block that cannot return");
                     }
-                    if let Some(id) = site {
+                    if let Some(id) = site && crate::reporting::configuration().explain {
                         let site = &analysis.sites[id];
                         diagnostic.note(format!(
                             "analysis site {id}: {} [context {}], {:?}, state {}, scope {:?}",
@@ -473,12 +459,10 @@ impl Callbacks for Checker {
                             site.state,
                             site.source.scope
                         ));
-                        if std::env::var_os("IRQ_CHECK_EXPLAIN").is_some() {
-                            diagnostic.note(format!(
-                                "argument and storage state:\n{}",
-                                analysis.site_state(id)
-                            ));
-                        }
+                        diagnostic.note(format!(
+                            "argument and storage state:\n{}",
+                            analysis.site_state(id)
+                        ));
                     }
                     diagnostic.note(format!(
                         "call path:\n{}",
@@ -503,7 +487,7 @@ impl Callbacks for Checker {
                 }
             }
         }
-        if let Some(directory) = std::env::var_os("IRQ_CHECK_DUMP_DIR") {
+        if let Some(directory) = crate::reporting::configuration().directory.as_ref() {
             let path = std::path::PathBuf::from(directory).join(format!("{}-accepted-gaps.json",
                 tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE)));
             let result = serde_json::to_vec_pretty(&accepted_gaps).map_err(std::io::Error::other)
@@ -601,7 +585,7 @@ fn main() -> std::process::ExitCode {
         format!("--jobs={workers}"),
         format!("--jobs-frontend={workers}"),
     ]);
-    if std::env::var_os("IRQ_CHECK_STATS").is_some() {
+    if crate::reporting::configuration().stats {
         eprintln!("irq-check: worker-limit={workers}");
     }
     args.extend([

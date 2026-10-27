@@ -36,12 +36,9 @@ enum DemandState {
 
 struct Request {
     root: usize,
-    mode: RequestMode,
-    state: RequestState,
     required: HashSet<usize>,
     pending: VecDeque<usize>,
     stopped_at: Option<usize>,
-    steps: usize,
 }
 
 #[derive(Default)]
@@ -195,11 +192,6 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                 self.controls.epoch += 1;
                 self.retain_completed();
                 self.budget.scratch = scratch.saturating_add(self.flow.bytes.saturating_sub(stored));
-                if std::env::var_os("IRQ_CHECK_TRACE_FLOW_COST").is_some() {
-                    eprintln!("irq-check: binding loop fallback {} at={:?} stop={reason:?} loops={} steps={} limit={}",
-                        self.frames[point.frame].instance, point.location, self.controls.loop_fallbacks.len(),
-                        self.budget.steps, self.budget.limit);
-                }
                 if self.budget.steps >= self.budget.limit { return ReadOutcome::Stopped(QueryStop::TransferLimit); }
                 self.controls.dependency_stop = None;
             }
@@ -899,10 +891,6 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                         StatementKind::StorageLive(local) | StatementKind::StorageDead(local)
                             if address.object == Object::Local(point.frame, *local) =>
                         {
-                            if std::env::var_os("IRQ_CHECK_TRACE_UNINITIALIZED").is_some() {
-                                eprintln!("irq-check: uninitialized {} frame={} at={:?} address={address:?} type={requested} statement={:?}",
-                                    frame.instance, point.frame, at.location, data.statements[ordinal]);
-                            }
                             result.push(Alternative {
                                 value: Value::Unknown("the local storage is not initialized"),
                                 guards: Vec::new(),
@@ -1055,19 +1043,6 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                                                 guards: Vec::new(),
                                             }]
                                         };
-                                        if std::env::var("IRQ_CHECK_TRACE_TRANSFER").is_ok_and(
-                                            |filter| frame.instance.to_string().contains(&filter),
-                                        ) && values
-                                            .iter()
-                                            .any(|value| matches!(value.value, Value::Unknown(_)))
-                                        {
-                                            eprintln!(
-                                                "irq-check: transfer {} at {:?} assignment={assignment:?} offset={} type={requested} values={values:?}",
-                                                frame.instance,
-                                                at.location,
-                                                address.offset - target.offset
-                                            );
-                                        }
                                         let paths = vec![Alternative { value: Value::Bits(1), guards: Vec::new() }];
                                         for value in values {
                                             if let Some(guards) =
@@ -1466,7 +1441,6 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
         let exposed = local.is_none_or(|local| index.address_taken.contains(&local));
         let mut definitions = vec![Vec::new(); index.body.basic_blocks.len()];
         let mut versions = HashMap::new();
-        let mut excluded = 0usize;
         for &block in &index.reachable {
             self.budget.charge(0)?;
             let entries = &mut definitions[block.as_usize()];
@@ -1488,8 +1462,7 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                                 .is_some_and(|(read_end, write_end)| read_end <= target.offset || write_end <= offset)
                         });
                     }
-                    if disjoint { excluded += 1; }
-                    else { entries.push(definition.location.statement_index); }
+                    if !disjoint { entries.push(definition.location.statement_index); }
                 }
             }
             if exposed {
@@ -1592,8 +1565,7 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                             }) { preserved = false; break; }
                         }
                     }
-                    if preserved { excluded += 1; }
-                    else { entries.push(definition.location.statement_index); }
+                    if !preserved { entries.push(definition.location.statement_index); }
                 }
             }
             entries.extend(index.clobbers.get(&block).into_iter().flatten()
@@ -1607,9 +1579,6 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                 versions.insert(after, Version::Definition { at, previous });
                 previous = after;
             }
-        }
-        if excluded != 0 && std::env::var_os("IRQ_CHECK_TRACE").is_some() {
-            eprintln!("irq-check: field memory SSA {} local={local:?} range={range:?} excluded={excluded}", self.frames[frame].instance);
         }
         for &block in &index.reachable {
             self.budget.charge(0)?;
@@ -1689,16 +1658,10 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
         if id.saturating_add(1).saturating_mul(bytes) > self.cache_limit / 16 {
             self.budget.record_limit(QueryStop::ScratchLimit, "choice cache bytes",
                 id.saturating_add(1).saturating_mul(bytes), self.cache_limit / 16);
-            if std::env::var_os("IRQ_CHECK_TRACE").is_some() {
-                eprintln!("irq-check: choice storage limit entries={id} bytes={} limit={}", id * bytes, self.cache_limit / 16);
-            }
             return Err(QueryStop::ScratchLimit);
         }
         self.budget.charge(bytes)?;
         self.choice_values.insert(key, id);
-        if id < 128 && std::env::var_os("IRQ_CHECK_TRACE_SUMMARY_CHOICES").is_some() {
-            eprintln!("irq-check: summary choice id={id} value={value:?} type={ty}");
-        }
         Ok(id)
     }
 
@@ -1883,24 +1846,6 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                 self.budget.record_limit(QueryStop::ScratchLimit, "function demand bytes",
                     self.flow.function_bytes.get(&function).copied().unwrap_or(0).saturating_add(bytes),
                     irq_check_rupta::limits::configuration().expect("validated analysis limits").function_scratch_mib * 1024 * 1024);
-                if std::env::var_os("IRQ_CHECK_TRACE").is_some() {
-                    eprintln!("irq-check: value-flow demand storage limit function={function} bytes={} total={} demands={}",
-                        self.flow.function_bytes[&function], self.flow.bytes, self.flow.demands.len());
-                    let mut states = HashMap::<_, usize>::new();
-                    let mut input_sets = HashSet::new();
-                    let mut index_sets = HashSet::new();
-                    for demand in &self.flow.demands {
-                        if self.frames[demand.key.point.frame].instance != function { continue; }
-                        let mut state = demand.key.clone();
-                        input_sets.insert(state.inputs.clone());
-                        index_sets.insert(state.choices.clone());
-                        state.inputs = Box::new([]);
-                        state.choices = Box::new([]);
-                        *states.entry(state).or_default() += 1;
-                    }
-                    eprintln!("irq-check: value-flow key dimensions states={} input-environments={} index-environments={} largest-environment-count={}",
-                        states.len(), input_sets.len(), index_sets.len(), states.values().copied().max().unwrap_or(0));
-                }
                 return Err(QueryStop::ScratchLimit);
             }
             self.budget.charge(bytes)?;
@@ -1931,10 +1876,6 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                         self.budget.record_limit(QueryStop::ScratchLimit, "function dependency bytes",
                             self.flow.function_bytes.get(&function).copied().unwrap_or(0).saturating_add(bytes),
                             irq_check_rupta::limits::configuration().expect("validated analysis limits").function_scratch_mib * 1024 * 1024);
-                        if std::env::var_os("IRQ_CHECK_TRACE").is_some() {
-                            eprintln!("irq-check: value-flow dependency storage limit function={function} bytes={} total={} demands={}",
-                                self.flow.function_bytes[&function], self.flow.bytes, self.flow.demands.len());
-                        }
                         return Err(QueryStop::ScratchLimit);
                     }
                 }
@@ -1957,12 +1898,9 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
         let saved_condition = self.condition_origin.clone();
         let scratch = self.budget.scratch;
         let initial_bytes = self.flow.bytes;
-        let before_request = self.budget.steps;
         self.flow.active = Some(Request {
             root: id,
-            mode: if self.budget.refinement_limit.is_some() { RequestMode::OptionalRefinement } else { RequestMode::RequiredBinding },
-            state: RequestState::Pending,
-            required: HashSet::new(), pending: VecDeque::new(), stopped_at: None, steps: 0,
+            required: HashSet::new(), pending: VecDeque::new(), stopped_at: None,
         });
         let result = (|| {
             self.require(id, true)?;
@@ -1990,18 +1928,12 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                 self.flow.current = Some(current);
                 self.flow.current_inputs.clear();
                 self.flow.evaluations += 1;
-                let before = self.budget.steps;
                 let generation = self.flow.generation;
                 let mut widen = self.flow.demands[current].abstract_top || self.flow.demands[current].loop_updates.is_some_and(|updates|
                     updates >= irq_check_rupta::limits::configuration().expect("validated analysis limits").alternatives.max(1));
                 let step = if self.flow.demands[current].abstract_top {
                     Ok(self.flow.demands[current].values.clone())
                 } else if widen {
-                    if !self.flow.demands[current].loop_widened && std::env::var_os("IRQ_CHECK_TRACE").is_some() {
-                        eprintln!("irq-check: loop state widened {} at={:?} address={:?} type={} updates={:?}",
-                            self.frames[key.point.frame].instance, key.point.location, key.address, key.ty,
-                            self.flow.demands[current].loop_updates);
-                    }
                     self.flow.demands[current].loop_widened = true;
                     Ok(vec![Alternative { value: Value::Unknown("the loop changes the requested value beyond the bounded summary"), guards: Vec::new() }])
                 } else {
@@ -2010,29 +1942,7 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                 let step = if generation != self.flow.generation
                     && step != Err(QueryStop::ProcessLimit)
                 { Err(QueryStop::ContextChanged) } else { step };
-                if std::env::var_os("IRQ_CHECK_TRACE_FLOW_COST").is_some()
-                    && (self.budget.steps.saturating_sub(before) >= 4096 || step.is_err())
-                {
-                    eprintln!("irq-check: flow cost demand={current} steps={} stop={:?} {} frame={} at={:?} address={:?} type={} control={} inputs={} values={} pending={} guards={} max-guards={}",
-                        self.budget.steps.saturating_sub(before), step.as_ref().err(),
-                        self.frames[key.point.frame].instance, key.point.frame, key.point.location,
-                        key.address, key.ty, key.control, self.flow.demands[current].inputs.len(),
-                        self.flow.demands[current].values.len(), self.flow.queued.len(),
-                        self.flow.demands[current].values.iter().map(|value| value.guards.len()).sum::<usize>(),
-                        self.flow.demands[current].values.iter().map(|value| value.guards.len()).max().unwrap_or(0));
-                }
                 self.flow.current = None;
-                if step.is_err() && std::env::var_os("IRQ_CHECK_TRACE_FLOW_VALUES").is_some() {
-                    let values: HashSet<_> = self.flow.demands[current].values.iter().map(|value| value.value).collect();
-                    eprintln!("irq-check: stopped demand={current} key={key:?} distinct-values={values:?}");
-                    if step == Err(QueryStop::AlternativeLimit) {
-                        let mut choices: Vec<_> = self.choice_values.iter().collect();
-                        choices.sort_unstable_by_key(|(_, id)| **id);
-                        for ((value, ty), id) in choices {
-                            eprintln!("irq-check: choice={id} value={value:?} type={ty}");
-                        }
-                    }
-                }
                 let mut values = match step {
                     Ok(values) => values,
                     Err(QueryStop::Unsupported | QueryStop::MissingArgument) => {
@@ -2081,10 +1991,6 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                         if matches!(value.value, Value::Function(_)) && value.path_proven()
                             && !grouped.contains(&value) { grouped.push(value); }
                     }
-                    if !self.flow.demands[current].loop_widened && std::env::var_os("IRQ_CHECK_TRACE").is_some() {
-                        eprintln!("irq-check: loop relation summarized demand={current} {} key={key:?} values={:?}",
-                            self.frames[key.point.frame].instance, grouped.iter().map(|value| value.value).collect::<Vec<_>>());
-                    }
                     self.flow.demands[current].loop_widened = true;
                     values = grouped;
                 }
@@ -2113,16 +2019,6 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                     }
                     self.flow.demands[current].abstract_top = true;
                     self.flow.current_inputs.clear();
-                }
-                if std::env::var_os("IRQ_CHECK_TRACE_UNKNOWN").is_some() {
-                    for value in &values {
-                        if let Value::Unknown(reason) = value.value
-                            && !self.flow.demands[current].values.iter().any(|previous| previous.value == value.value)
-                        {
-                            eprintln!("irq-check: unknown value demand={current} reason={reason} {} key={key:?} dependencies={:?} guards={:?}",
-                                self.frames[key.point.frame].instance, self.flow.current_inputs, value.guards);
-                        }
-                    }
                 }
                 if self.flow.demands[current].values.is_empty() || widen {
                     let removed: Vec<_> = self.flow.demands[current].inputs.difference(&self.flow.current_inputs).copied().collect();
@@ -2202,22 +2098,9 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                         value: Value::Unknown("the scalar value is not proved"), guards: Vec::new(),
                     }];
                 }
-                let joined_count = joined.len();
                 let joined = match self.bounded(joined) {
                     Ok(values) => values,
                     Err(reason) => {
-                        if std::env::var_os("IRQ_CHECK_TRACE").is_some() {
-                            eprintln!("irq-check: value-flow stop={reason:?} alternatives={joined_count} {} {:?} address={:?} type={}",
-                                self.frames[key.point.frame].instance, key.point.location, key.address, key.ty);
-                            let mut values: HashMap<_, usize> = HashMap::new();
-                            for value in &self.flow.demands[current].values {
-                                *values.entry(value.value).or_default() += 1;
-                            }
-                            eprintln!("irq-check: value-flow existing-values={values:?}");
-                            if std::env::var_os("IRQ_CHECK_TRACE_FLOW_VALUES").is_some() {
-                                eprintln!("irq-check: limited alternatives key={key:?} values={:?}", self.flow.demands[current].values);
-                            }
-                        }
                         self.flow.enqueue(current);
                         return Err(reason);
                     }
@@ -2235,24 +2118,6 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                     if function_bytes > irq_check_rupta::limits::configuration().expect("validated analysis limits").function_scratch_mib * 1024 * 1024 {
                         self.budget.record_limit(QueryStop::ScratchLimit, "function alternative bytes", function_bytes,
                             irq_check_rupta::limits::configuration().expect("validated analysis limits").function_scratch_mib * 1024 * 1024);
-                        if std::env::var_os("IRQ_CHECK_TRACE").is_some() {
-                            eprintln!("irq-check: value-flow alternative storage limit function={function} bytes={function_bytes} total={} demands={}",
-                                self.flow.bytes, self.flow.demands.len());
-                            let mut retained: Vec<_> = self.flow.demands.iter().enumerate()
-                                .filter(|(_, demand)| self.frames[demand.key.point.frame].instance == function)
-                                .map(|(id, demand)| (demand.values.iter().map(|value| value.guards.len()).sum::<usize>(), id))
-                                .collect();
-                            retained.sort_unstable_by(|left, right| right.cmp(left));
-                            for (guards, id) in retained.into_iter().take(6) {
-                                let demand = &self.flow.demands[id];
-                                let proof = demand.values.iter().flat_map(|value| &value.guards)
-                                    .filter(|(_, guard)| guard.proof == GuardProof::Established).count();
-                                let choices = demand.values.iter().flat_map(|value| &value.guards)
-                                    .filter(|(_, guard)| guard.choice.is_some()).count();
-                                eprintln!("irq-check: retained demand={id} alternatives={} guards={guards} established={proof} choices={choices} key={:?}",
-                                    demand.values.len(), demand.key);
-                            }
-                        }
                         self.flow.enqueue(current);
                         return Err(QueryStop::ScratchLimit);
                     }
@@ -2282,10 +2147,6 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                 if self.budget.scratch > irq_check_rupta::limits::configuration().expect("validated analysis limits").query_scratch_mib * 1024 * 1024 {
                     self.budget.record_limit(QueryStop::ScratchLimit, "query worklist bytes", self.budget.scratch,
                         irq_check_rupta::limits::configuration().expect("validated analysis limits").query_scratch_mib * 1024 * 1024);
-                    if std::env::var_os("IRQ_CHECK_TRACE").is_some() {
-                        eprintln!("irq-check: worklist scratch limit bytes={} initial={initial_bytes} stored={}",
-                            self.budget.scratch, self.flow.bytes);
-                    }
                     return Err(QueryStop::ScratchLimit);
                 }
             }
@@ -2310,7 +2171,7 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
         if result.is_err() && let Some(current) = self.flow.active.as_ref().unwrap().stopped_at {
             self.flow.enqueue(current);
         }
-        let mut active = self.flow.active.take().unwrap();
+        let active = self.flow.active.take().unwrap();
         if let Err(reason) = &result {
             let demand = &self.flow.demands[active.stopped_at.unwrap_or(active.root)];
             self.flow.diagnostic_stop = Some((demand.key.point, demand.key.address, *reason));
@@ -2336,49 +2197,6 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
         {
             let stopped = active.stopped_at.unwrap_or(active.root);
             self.controls.dependency_stop = Some((self.flow.demands[stopped].key.point, *reason));
-        }
-        active.steps = self.budget.steps.saturating_sub(before_request);
-        active.state = match &result { Ok(_) => RequestState::Complete, Err(reason) => RequestState::Stopped(*reason) };
-        if std::env::var_os("IRQ_CHECK_TRACE_FLOW_COST").is_some() && result.is_err() {
-            eprintln!("irq-check: request root={} mode={:?} state={:?} steps={} required={} pending={} stopped-at={:?}",
-                active.root, active.mode, active.state, active.steps, active.required.len(), self.flow.queued.len(), active.stopped_at);
-            let mut states = HashSet::new();
-            let mut origins = HashSet::new();
-            for &id in &active.required {
-                let mut key = self.flow.demands[id].key.clone();
-                origins.extend(key.refinement_origin.take());
-                states.insert(key);
-            }
-            eprintln!("irq-check: request key dimensions without-owner={} owners={}", states.len(), origins.len());
-            let mut pending = VecDeque::from([active.root]);
-            let mut parents = HashMap::from([(active.root, active.root)]);
-            while let Some(current) = pending.pop_front() {
-                if Some(current) == active.stopped_at { break; }
-                let mut inputs: Vec<_> = self.flow.demands[current].inputs.iter().copied().collect();
-                inputs.sort_unstable();
-                for input in inputs {
-                    if let std::collections::hash_map::Entry::Vacant(entry) = parents.entry(input) {
-                        entry.insert(current);
-                        pending.push_back(input);
-                    }
-                }
-            }
-            let mut chain = Vec::new();
-            if let Some(mut current) = active.stopped_at.filter(|id| parents.contains_key(id)) {
-                loop {
-                    chain.push(current);
-                    if current == active.root { break; }
-                    current = parents[&current];
-                }
-            }
-            let length = chain.len();
-            eprintln!("irq-check: request dependency chain length={length}");
-            for (ordinal, id) in chain.into_iter().rev().enumerate() {
-                if ordinal >= 6 && ordinal + 40 < length { continue; }
-                let demand = &self.flow.demands[id];
-                eprintln!("irq-check: request dependency demand={id} {} key={:?} values={}",
-                    self.frames[demand.key.point.frame].instance, demand.key, demand.values.len());
-            }
         }
         self.budget.scratch = scratch;
         result

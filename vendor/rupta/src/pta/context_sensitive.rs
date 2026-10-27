@@ -401,7 +401,7 @@ impl<'tcx, 'compilation, S: ContextStrategy> PointerAnalysis<'tcx, 'compilation>
             return;
         }
         info!("Start pre-analysis");
-        println!("Starting Rapid Type Analysis...");
+        log::info!("Starting Rapid Type Analysis...");
         let mut rta = RapidTypeAnalysis::new(&mut self.acx);
         rta.analyze();
         self.pre_analysis_time += rta.analysis_time;
@@ -423,7 +423,7 @@ impl<'tcx, 'compilation, S: ContextStrategy> PointerAnalysis<'tcx, 'compilation>
             self.pre_analysis_time += self.stack_filter.as_ref().unwrap().fra_time();
         }
 
-        println!(
+        log::info!(
             "Pre-analysis time {}",
             humantime::format_duration(self.pre_analysis_time).to_string()
         );

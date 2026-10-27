@@ -48,8 +48,8 @@ pub trait PointerAnalysis<'tcx, 'compilation> {
         self.propagate();
         
         let elapsed = now.elapsed();
-        println!("Pointer analysis completed.");
-        println!(
+        log::info!("Pointer analysis completed.");
+        log::info!(
             "Analysis time: {}",
             humantime::format_duration(elapsed).to_string()
         );

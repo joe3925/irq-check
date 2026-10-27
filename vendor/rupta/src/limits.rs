@@ -11,10 +11,7 @@ static STOP: AtomicU8 = AtomicU8::new(0);
 static MONITOR: OnceLock<()> = OnceLock::new();
 
 pub fn begin_analysis() {
-    let now = STARTED.get_or_init(Instant::now);
-    if std::env::var_os("IRQ_CHECK_STATS").is_some() {
-        eprintln!("irq-check: analysis-start elapsed={:.3}s", now.elapsed().as_secs_f64());
-    }
+    STARTED.get_or_init(Instant::now);
 }
 
 pub fn checkpoint() -> bool {

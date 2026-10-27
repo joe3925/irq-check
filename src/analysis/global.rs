@@ -104,11 +104,6 @@ impl<'tcx> GlobalPointers<'tcx> {
             })
             .collect();
         functions.extend(roots.iter().copied());
-        if std::env::var_os("IRQ_CHECK_TRACE_HAVOC").is_some() {
-            for instance in &functions {
-                eprintln!("irq-check: discovery root: {instance}");
-            }
-        }
         let mut exported: HashMap<_, _> = instances
             .iter()
             .filter(|instance| {
@@ -152,7 +147,7 @@ impl<'tcx> GlobalPointers<'tcx> {
                         .or_insert(instance);
                 }
             }
-            if std::env::var_os("IRQ_CHECK_STATS").is_some() {
+            if crate::reporting::configuration().stats {
                 eprintln!(
                     "irq-check: linked Rust definitions local={local_definitions} dependency={}",
                     exported.len() - local_definitions
@@ -216,7 +211,7 @@ impl<'tcx> GlobalPointers<'tcx> {
                 }
                 if let Some(target) = target {
                     let source = mangle_internal_symbol(tcx, &global_fn_name(method));
-                    if std::env::var_os("IRQ_CHECK_STATS").is_some() {
+                    if crate::reporting::configuration().stats {
                         eprintln!("irq-check: compiler allocator shim {source} -> {target}");
                     }
                     exported.entry(source).or_insert(target);
@@ -300,10 +295,6 @@ impl<'tcx> GlobalPointers<'tcx> {
                 }
                 pending.extend(uses.get(&node).into_iter().flatten().copied());
             }
-        }
-        if let Ok(path) = std::env::var("IRQ_CHECK_RUPTA_POINTS") {
-            backend.acx.analysis_options.pts_output = Some(path);
-            backend.finalize();
         }
         let mut failure = irq_check_rupta::limits::stop_reason().map(str::to_owned);
         let instances: HashMap<_, _> = backend
@@ -592,9 +583,6 @@ impl<'tcx> GlobalPointers<'tcx> {
                 if let Some(groups) = path_groups.get(affected) {
                     pending.extend(groups.iter().copied());
                 } else {
-                    if std::env::var_os("IRQ_CHECK_TRACE_COVERAGE").is_some() {
-                        eprintln!("irq-check: coverage untracked path {path:?}");
-                    }
                     unknown_memory = true;
                     unknown_calls = true;
                 }
@@ -701,21 +689,9 @@ impl<'tcx> GlobalPointers<'tcx> {
                                                     .map(|target| node_groups[target.index()]),
                                             );
                                         } else if !no_provenance.contains(&node) {
-                                            if std::env::var_os("IRQ_CHECK_TRACE_COVERAGE")
-                                                .is_some()
-                                            {
-                                                eprintln!(
-                                                    "irq-check: coverage empty intrinsic write {instance} at {site:?}"
-                                                );
-                                            }
                                             unknown_memory = true;
                                         }
                                     } else {
-                                        if std::env::var_os("IRQ_CHECK_TRACE_COVERAGE").is_some() {
-                                            eprintln!(
-                                                "irq-check: coverage missing intrinsic write {instance} at {site:?}"
-                                            );
-                                        }
                                         unknown_memory = true;
                                     }
                                 }
@@ -800,13 +776,6 @@ impl<'tcx> GlobalPointers<'tcx> {
                         pending.push(group);
                     }
                 }
-                if std::env::var_os("IRQ_CHECK_TRACE_COVERAGE").is_some() {
-                    eprintln!(
-                        "irq-check: coverage unknown body {:?}: {}",
-                        instances.get(function),
-                        gap.2
-                    );
-                }
                 unknown_memory = true;
                 unknown_calls = true;
             }
@@ -890,12 +859,6 @@ impl<'tcx> GlobalPointers<'tcx> {
                             .is_none_or(|points| points.is_empty())
                             && !no_provenance.contains(&destination)
                         {
-                            if std::env::var_os("IRQ_CHECK_TRACE_COVERAGE").is_some() {
-                                eprintln!(
-                                    "irq-check: coverage empty store {:?}",
-                                    backend.pag.node_path(destination)
-                                );
-                            }
                             unknown_memory = true;
                         }
                     }
@@ -927,12 +890,6 @@ impl<'tcx> GlobalPointers<'tcx> {
                         }
                     }
                 } else if !no_provenance.contains(&node) {
-                    if std::env::var_os("IRQ_CHECK_TRACE_COVERAGE").is_some() {
-                        eprintln!(
-                            "irq-check: coverage empty scalar write {:?}",
-                            backend.pag.node_path(node)
-                        );
-                    }
                     unknown_memory = true;
                 }
             }
@@ -964,12 +921,6 @@ impl<'tcx> GlobalPointers<'tcx> {
             for sites in backend.call_sites.values() {
                 for site in sites {
                     if backend.call_graph.get_callees(&site.into()).is_empty() {
-                        if std::env::var_os("IRQ_CHECK_TRACE_COVERAGE").is_some() {
-                            eprintln!(
-                                "irq-check: coverage empty call {:?} at {site:?}",
-                                instances.get(&site.func.func_id)
-                            );
-                        }
                         unknown_memory = true;
                         unknown_calls = true;
                         if let Some(destination) = backend.pag.get_node_id(&site.destination) {
@@ -987,8 +938,6 @@ impl<'tcx> GlobalPointers<'tcx> {
                 .flat_map(|group| [group * 2, group * 2 + 1])
                 .collect();
             let mut unknown = vec![false; uses.len()];
-            let seeds: HashSet<_> = pending.iter().copied().collect();
-            let mut origins = vec![None; uses.len()];
             let mut memory_invalidated = false;
             let mut parameters_invalidated = false;
             loop {
@@ -1014,56 +963,13 @@ impl<'tcx> GlobalPointers<'tcx> {
                 if integer_groups.contains(&(group / 2)) {
                     for &next in integer_uses.get(&(group / 2)).into_iter().flatten() {
                         for next in [next * 2, next * 2 + 1] {
-                            if !unknown[next] && !seeds.contains(&next) && origins[next].is_none() {
-                                origins[next] = Some(group);
-                            }
                             pending.push(next);
                         }
                     }
                     continue;
                 }
-                if std::env::var_os("IRQ_CHECK_TRACE_COVERAGE").is_some()
-                    && (!unknown_memory && group % 2 == 0 && write_addresses.contains(&(group / 2))
-                        || !unknown_calls
-                            && group % 2 == 1
-                            && call_receivers.contains(&(group / 2)))
-                {
-                    eprintln!(
-                        "irq-check: coverage unknown consumer {:?}",
-                        groups
-                            .iter()
-                            .find(|(_, id)| **id == group / 2)
-                            .map(|(path, _)| path)
-                    );
-                    let mut source = Some(group);
-                    for _ in 0..256 {
-                        let Some(current) = source else { break };
-                        let path = groups
-                            .iter()
-                            .find(|(_, id)| **id == current / 2)
-                            .map(|(path, _)| path);
-                        let instance = path.and_then(|path| match base_path(&path.1).value {
-                            PathEnum::Parameter { func_id, .. }
-                            | PathEnum::LocalVariable { func_id, .. }
-                            | PathEnum::ReturnValue { func_id }
-                            | PathEnum::Auxiliary { func_id, .. }
-                            | PathEnum::HeapObj { func_id, .. } => instances.get(&func_id),
-                            _ => None,
-                        });
-                        eprintln!(
-                            "irq-check: coverage source {path:?} {instance:?} binding={}",
-                            current % 2 == 1
-                        );
-                        source = origins[current];
-                    }
-                }
                 unknown_memory |= group % 2 == 0 && write_addresses.contains(&(group / 2));
                 unknown_calls |= group % 2 == 1 && call_receivers.contains(&(group / 2));
-                for &next in &uses[group] {
-                    if !unknown[next] && !seeds.contains(&next) && origins[next].is_none() {
-                        origins[next] = Some(group);
-                    }
-                }
                 pending.extend(uses[group].iter().copied());
             }
             let mut covered_calls = HashSet::new();
@@ -1105,7 +1011,7 @@ impl<'tcx> GlobalPointers<'tcx> {
                 .node_indices()
                 .filter(|node| unknown[node_groups[node.index()] * 2])
                 .collect();
-            if std::env::var_os("IRQ_CHECK_STATS").is_some() {
+            if crate::reporting::configuration().stats {
                 let indirect = receivers
                     .keys()
                     .filter(|(function, location)| {
@@ -1121,7 +1027,7 @@ impl<'tcx> GlobalPointers<'tcx> {
                     node_groups.len()
                 );
             }
-            if let Some(directory) = std::env::var_os("IRQ_CHECK_DUMP_DIR") {
+            if let Some(directory) = crate::reporting::configuration().directory.as_ref() {
                 let mut evidence: Vec<_> = receivers
                     .iter()
                     .filter_map(|((function, location), groups)| {
@@ -1524,7 +1430,7 @@ impl<'tcx> GlobalPointers<'tcx> {
         if let Some(reason) = irq_check_rupta::limits::stop_reason() {
             failure = Some(reason.into());
         }
-        if let Some(directory) = std::env::var_os("IRQ_CHECK_DUMP_DIR") {
+        if let Some(directory) = crate::reporting::configuration().directory.as_ref() {
             let directory = std::path::PathBuf::from(directory);
             let mut gaps: Vec<_> = backend
                 .acx
@@ -1555,7 +1461,7 @@ impl<'tcx> GlobalPointers<'tcx> {
                 failure = Some(format!("cannot write backend coverage evidence: {error}"));
             }
         }
-        if std::env::var_os("IRQ_CHECK_STATS").is_some() {
+        if crate::reporting::configuration().stats {
             eprintln!(
                 "irq-check: global pointer graph contexts={} call_sites={} call_bindings={} coverage_gaps={} points-to-set-bytes={}",
                 backend.call_graph.func_nodes.len(),
@@ -2030,11 +1936,11 @@ impl<'tcx> GlobalPointers<'tcx> {
         }
         let mut safe_contexts: HashSet<_> = context_nodes.keys().copied()
             .filter(|node| !rejected_contexts.contains(node)).collect();
-        if std::env::var_os("IRQ_CHECK_STATS").is_some() {
+        if crate::reporting::configuration().stats {
             eprintln!("irq-check: context safety summaries safe={} total={} call_sites={}",
                 safe_contexts.len(), context_nodes.len(), context_bindings.len());
         }
-        if let Some(directory) = std::env::var_os("IRQ_CHECK_DUMP_DIR") {
+        if let Some(directory) = crate::reporting::configuration().directory.as_ref() {
             summary_gaps.sort();
             let path = std::path::PathBuf::from(directory).join(format!(
                 "{}-summary-gaps.txt",
@@ -2044,7 +1950,7 @@ impl<'tcx> GlobalPointers<'tcx> {
                 failure = Some(format!("cannot write summary coverage evidence: {error}"));
             }
         }
-        if std::env::var_os("IRQ_CHECK_STATS").is_some() {
+        if crate::reporting::configuration().stats {
             eprintln!(
                 "irq-check: local safety summaries queries={summary_queries} transfers={summary_transfers} gaps={}",
                 summary_gaps.len()
@@ -2068,7 +1974,7 @@ impl<'tcx> GlobalPointers<'tcx> {
             pointees.clear();
             pointee_ranges.clear();
         }
-        if std::env::var_os("IRQ_CHECK_STATS").is_some() {
+        if crate::reporting::configuration().stats {
             eprintln!(
                 "irq-check: pointer coverage complete={complete} call_complete={call_complete} unresolved_sites={unresolved_sites} safe_summaries={} alias_summaries={} alias_ranges={}",
                 safe.len(),

@@ -142,10 +142,6 @@ impl<'tcx> Analysis<'tcx> {
             diagnostic_cutoff: false,
         };
         if output.incomplete { return output; }
-        if let Some(directory) = std::env::var_os("IRQ_CHECK_DUMP_DIR") {
-            let path = std::path::PathBuf::from(directory).join(format!("{}-phase.txt", tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE)));
-            let _ = std::fs::write(path, "global pointer analysis complete; IRQ queries");
-        }
         let workers = crate::worker_limit().min(roots.len().max(1));
         let tasks: Vec<_> = (0..workers).collect();
         let results: Vec<_> = rustc_data_structures::sync::par_map(tasks, |worker| {
@@ -260,9 +256,6 @@ impl<'tcx> Analysis<'tcx> {
         let mut safety_checks = 0usize;
         let mut safety_hits = 0usize;
         let mut safety_transfers = 0usize;
-        let trace_time = std::env::var_os("IRQ_CHECK_TRACE_TIME").is_some();
-        let mut query_times = HashMap::<(Instance<'tcx>, Location), (usize, u128, u128, u128, usize)>::new();
-        let mut safety_time = 0u128;
         let mut site_sources = HashMap::<(Instance<'tcx>, Location), Arc<CallSiteSource>>::new();
         let mut evidence_loops = HashSet::<Arc<[Point]>>::new();
         let mut generation = solver.flow.generation;
@@ -291,13 +284,11 @@ impl<'tcx> Analysis<'tcx> {
                 || matches!(instance.def, InstanceKind::Shim(ty::ShimKind::DropGlue(_, None)))
             { continue; }
             if next_call == 0 && resume.is_none() && !scalar_witness {
-                let watch = trace_time.then(std::time::Instant::now);
                 solver.begin_query(limits.query_steps.min(4096));
                 safety_checks += 1;
                 let safe = matches!(solver.scalar_summary(Point { frame, location: Location::START }), Ok((_, true)));
                 safety_transfers += solver.budget.steps;
                 transfers += solver.budget.steps;
-                if let Some(watch) = watch { safety_time += watch.elapsed().as_nanos(); }
                 if safe {
                     output.specialized_safe.insert(caller);
                     safety_hits += 1;
@@ -381,7 +372,6 @@ impl<'tcx> Analysis<'tcx> {
                     *output.covered_calls.entry((instance, location, proof)).or_default() += 1;
                     continue;
                 }
-                let query_watch = trace_time.then(std::time::Instant::now);
                 solver.begin_query(limits.query_steps);
                 let mut attempts = 0;
                 let mut cases = 0usize;
@@ -439,44 +429,8 @@ impl<'tcx> Analysis<'tcx> {
                 if scalar_witness {
                     solver.budget.limit = solver.budget.limit.min(starting_steps.saturating_add(limits.scalar_steps.saturating_sub(transfers)));
                 }
-                if queries % 100 == 0 {
-                    if let Some(directory) = std::env::var_os("IRQ_CHECK_DUMP_DIR") {
-                        let path = std::path::PathBuf::from(directory).join(format!("{}-queries-{worker}.txt", tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE)));
-                        let _ = std::fs::write(path, format!("queries={queries} transfers={transfers} frames={} nodes={} pending={} instance={instance}", solver.frames.len(), output.graph.len(), queue.len()));
-                    }
-                }
-                if queries % 10000 == 0 && std::env::var_os("IRQ_CHECK_TRACE_MEMORY").is_some() {
-                    let edges = output.graph.values().map(Vec::len).sum::<usize>();
-                    let edge_storage = output.graph.values().map(|edges| edges.capacity() * std::mem::size_of::<Edge<'tcx>>()).sum::<usize>();
-                    let details = output.graph.values().flatten().map(|edge| match &edge.detail {
-                        std::borrow::Cow::Owned(detail) => detail.capacity(),
-                        std::borrow::Cow::Borrowed(_) => 0,
-                    }).sum::<usize>();
-                    let uncertainty = output.graph.values().flatten().map(|edge|
-                        edge.uncertainty.capacity() * std::mem::size_of::<(rustc_span::Span, &'static str)>()).sum::<usize>();
-                    let sites = output.sites.capacity() * std::mem::size_of::<CallSite<'tcx>>()
-                        + evidence_loops.capacity() * std::mem::size_of::<Arc<[Point]>>()
-                        + evidence_loops.iter().map(|entries| entries.len() * std::mem::size_of::<Point>()
-                            + std::mem::size_of::<usize>() * 2).sum::<usize>()
-                        + site_sources.capacity() * std::mem::size_of::<((Instance<'tcx>, Location), Arc<CallSiteSource>)>()
-                        + site_sources.values().map(|source| std::mem::size_of::<CallSiteSource>()
-                            + std::mem::size_of::<usize>() * 2
-                            + source.normal.capacity() * std::mem::size_of::<Location>()).sum::<usize>();
-                    let precision = output.precision_loss.capacity() * std::mem::size_of::<(String, usize)>()
-                        + output.precision_loss.keys().map(String::capacity).sum::<usize>();
-                    let mut frame_counts = HashMap::<_, usize>::new();
-                    for frame in &solver.frames { *frame_counts.entry(frame.instance).or_default() += 1; }
-                    let mut frame_counts: Vec<_> = frame_counts.into_iter().collect();
-                    frame_counts.sort_unstable_by_key(|(_, count)| std::cmp::Reverse(*count));
-                    eprintln!("irq-check: retained worker={worker} queries={queries} frames={} edges={edges} edge-bytes={edge_storage} detail-bytes={details} uncertainty-bytes={uncertainty} site-bytes={sites} precision-bytes={precision} control-bytes={} effect-bytes={}",
-                        solver.frames.len(), solver.controls.bytes, solver.effects.bytes);
-                    for (instance, count) in frame_counts.into_iter().take(12) {
-                        eprintln!("irq-check: retained-frame worker={worker} count={count} instance={instance}");
-                    }
-                }
                 let mut established = HashSet::new();
                 let mut control_stop = None;
-                let setup_time = query_watch.map_or(0, |watch| watch.elapsed().as_nanos());
                 let answer = loop {
                     let answer = (|| {
                         let mut complete = Vec::new();
@@ -610,7 +564,6 @@ impl<'tcx> Analysis<'tcx> {
                     _ => Vec::new(),
                 };
                 let diagnostics = (!diagnostics.is_empty()).then(|| Arc::from(diagnostics));
-                let fallback_start = query_watch.map_or(0, |watch| watch.elapsed().as_nanos());
                 let fallback = if !scalar_witness && fallback_steps < limits.query_steps
                     && !answer.as_ref().is_ok_and(|values| values.iter()
                     .all(|value| matches!(value.value, Value::Function(_))))
@@ -621,23 +574,6 @@ impl<'tcx> Analysis<'tcx> {
                 let fallback_used = solver.budget.steps.saturating_sub(precise_steps);
                 fallback_steps += fallback_used;
                 transfers += precise_steps.saturating_sub(starting_steps) + fallback_used;
-                if let Some(watch) = query_watch {
-                    let elapsed = watch.elapsed().as_nanos();
-                    let time = query_times.entry((instance, location)).or_default();
-                    time.0 += 1;
-                    time.1 += elapsed;
-                    time.2 += setup_time;
-                    time.3 += elapsed.saturating_sub(fallback_start);
-                    time.4 += precise_steps.saturating_sub(starting_steps) + fallback_used;
-                    if queries % 10000 == 0 {
-                        let mut ranked: Vec<_> = query_times.iter().collect();
-                        ranked.sort_unstable_by_key(|(_, time)| std::cmp::Reverse(time.1));
-                        eprintln!("irq-check: timing worker={worker} queries={queries} safety-checks={safety_checks} safety-hits={safety_hits} safety-ms={} safety-transfers={safety_transfers}", safety_time / 1000000);
-                        for ((instance, location), (count, total, setup, fallback, steps)) in ranked.into_iter().take(16) {
-                            eprintln!("irq-check: timing-site worker={worker} count={count} total-ms={} setup-ms={} fallback-ms={} steps={steps} {instance} at={location:?}", total / 1000000, setup / 1000000, fallback / 1000000);
-                        }
-                    }
-                }
                 solver.budget.steps = precise_steps;
                 if fallback == Err(QueryStop::ProcessLimit) {
                     output.incomplete = true;
@@ -668,9 +604,6 @@ impl<'tcx> Analysis<'tcx> {
                     loop_entries, cut_recursive_returns: solver.cut_recursive_returns,
                     witness: witness_value, result, conservative_safe: false, worker: None,
                 };
-                if std::env::var_os("IRQ_CHECK_TRACE_FLOW_VALUES").is_some() {
-                    eprintln!("irq-check: query values frame={frame} at={location:?} result={answer:?}");
-                }
                 let id = output.sites.len();
                 let source = site_sources.entry((instance, location)).or_insert_with(|| Arc::new(CallSiteSource {
                     location, scope: terminator.source_info.scope,
@@ -680,9 +613,6 @@ impl<'tcx> Analysis<'tcx> {
                     unwind: terminator.unwind().and_then(|unwind| match unwind { mir::UnwindAction::Cleanup(block) => Some(*block), _ => None }),
                 })).clone();
                 output.sites.push(CallSite { caller, state: id, source, evidence, diagnostics });
-                if std::env::var_os("IRQ_CHECK_TRACE").is_some() {
-                    eprintln!("irq-check: query frame={frame} {instance} at={location:?} {}", output.site_state(id));
-                }
                 if let Ok(targets) = fallback {
                     if !targets.is_empty() && targets.iter().all(|target| facts.safe.contains(target)) {
                         output.sites[id].evidence.conservative_safe = true;
@@ -902,7 +832,7 @@ impl<'tcx> Analysis<'tcx> {
         {
             output.safe_summaries.extend(roots.iter().copied());
         }
-        if std::env::var_os("IRQ_CHECK_STATS").is_some() {
+        if crate::reporting::configuration().stats {
             eprintln!("irq-check: shared diagnostic summaries functions={} reuse={diagnostic_reuse} widened={diagnostic_widened}", diagnostic_frames.len());
             eprintln!("irq-check: specialized safety checks={safety_checks} hits={safety_hits} transfers={safety_transfers}");
             eprintln!("irq-check: covered call summaries sites={} observations={}", output.covered_calls.len(), output.covered_calls.values().sum::<usize>());

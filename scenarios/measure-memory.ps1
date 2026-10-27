@@ -10,8 +10,6 @@ param(
     [double]$StopPrivateGiB = 0,
     [int]$TimeoutSeconds = 0,
     [string]$DumpDirectory = '',
-    [string]$TraceFunction = '',
-    [switch]$TraceHavoc,
     [switch]$Plain
 )
 
@@ -36,12 +34,8 @@ $start.EnvironmentVariables['IRQ_CHECK_STATS'] = '1'
 $start.EnvironmentVariables['IRQ_CHECK_REQUIRED_CRATE'] = $Scenario.Replace('-', '_')
 $start.EnvironmentVariables['IRQ_CHECK_ANALYSIS_ID'] = Split-Path $run -Leaf
 $start.EnvironmentVariables['CARGO_TARGET_DIR'] = if ($CargoTargetDirectory) { [IO.Path]::GetFullPath($CargoTargetDirectory) } else { Join-Path $root 'target/memory-scenario-cargo' }
-foreach ($name in @('IRQ_CHECK_DUMP_DIR', 'IRQ_CHECK_TRACE', 'IRQ_CHECK_TRACE_HAVOC', 'IRQ_CHECK_TRACE_FUNCTION')) {
-    $start.EnvironmentVariables.Remove($name)
-}
+$start.EnvironmentVariables.Remove('IRQ_CHECK_DUMP_DIR')
 if ($DumpDirectory) { $start.EnvironmentVariables['IRQ_CHECK_DUMP_DIR'] = [IO.Path]::GetFullPath($DumpDirectory) }
-if ($TraceHavoc) { $start.EnvironmentVariables['IRQ_CHECK_TRACE_HAVOC'] = '1' }
-if ($TraceFunction) { $start.EnvironmentVariables['IRQ_CHECK_TRACE_FUNCTION'] = $TraceFunction }
 $start.Arguments = '--cargo build --manifest-path "' + $manifest + '" -p ' + $Scenario + ' --release --target "' + $Target + '" -Zbuild-std=' + $BuildStd + ' -Zbuild-std-features=compiler-builtins-mem'
 if ($Target.EndsWith('.json')) { $start.Arguments += ' -Zunstable-options -Zjson-target-spec' }
 if ($PSBoundParameters.ContainsKey('Features')) { $start.Arguments += ' --no-default-features' }

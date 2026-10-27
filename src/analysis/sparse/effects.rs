@@ -602,13 +602,6 @@ impl<'tcx> Source<'tcx> {
                             && solver.alias_object.is_some_and(|object| object != address.object) => Value::ObjectPointer(address.object),
                         _ => Value::Unknown("the summary expression has an unknown input"),
                     };
-                    if matches!(value, Value::Unknown(_)) && solver.effects.value_traces < 64
-                        && std::env::var("IRQ_CHECK_TRACE_SUMMARY_VALUES")
-                            .is_ok_and(|filter| solver.frames[point.frame].instance.to_string().contains(&filter)) {
-                        solver.effects.value_traces += 1;
-                        eprintln!("irq-check: summary unknown {} frame={} at={:?} operation={operation:?} alias={:?} left={:?} right={:?} guards={guards:?}",
-                            solver.frames[point.frame].instance, point.frame, point.location, solver.alias_object, left, right);
-                    }
                     values.push(Alternative { value, guards });
                 }
             }
@@ -699,7 +692,6 @@ pub(crate) struct EffectCache<'tcx> {
     pub(crate) loads: usize,
     pub(crate) cycles: usize,
     pub(crate) iterations: usize,
-    value_traces: usize,
 }
 
 impl<'a, 'tcx> Solver<'a, 'tcx> {
@@ -879,9 +871,6 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                             }));
                         }
                         self.budget.reserve(std::mem::size_of::<Source<'tcx>>() * 64)?;
-                        if std::env::var("IRQ_CHECK_TRACE_EFFECT").is_ok_and(|filter| instance.to_string().contains(&filter)) {
-                            eprintln!("irq-check: atomic effect summary {instance} return_cases=2 stores=1");
-                        }
                         return Ok(Some(Arc::new(Summary {
                             stores: vec![Store { conditions: success, destination: Source::Argument(0, pointer_ty),
                                 offset: 0, bytes: value_layout.size.bytes(), source: Source::Argument(2, value_ty) }],
@@ -1234,10 +1223,6 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
         self.effects.active.remove(&key);
         self.budget.scratch = scratch.saturating_add(self.effects.pending_bytes.saturating_sub(retained));
         let summary = answer?;
-        if std::env::var("IRQ_CHECK_TRACE_EFFECT").is_ok_and(|filter| instance.to_string().contains(&filter)) {
-            eprintln!("irq-check: effect summary {instance} returned={:?} stores={:?}",
-                summary.as_ref().and_then(|summary| summary.returned.as_ref()), summary.as_ref().map(|summary| summary.stores.len()));
-        }
         Ok(summary)
     }
 }

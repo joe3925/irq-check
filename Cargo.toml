@@ -23,7 +23,6 @@ toml = "0.9"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
 
 [profile.release]
-debug = "line-tables-only"
 opt-level = 3
 lto = "fat"
 codegen-units = 1

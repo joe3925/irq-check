@@ -221,16 +221,16 @@ impl FuncPFG {
     }
 
     pub fn print_graph(&self) {
-        println!("--- Pointer Flow Graph for function {:?} ---", self.func_id);
+        log::debug!("--- Pointer Flow Graph for function {:?} ---", self.func_id);
         for n in self.graph.node_indices() {
             let node = &self.graph[n];
-            println!("  Node {:?}", node.path);
+            log::debug!("  Node {:?}", node.path);
             // println!("  Node {:?}: from_non_param={:?}", node.path, node.from_non_param);
         }
         for e in self.graph.edge_references() {
             let src = &self.graph[e.source()];
             let dst = &self.graph[e.target()];
-            println!(
+            log::debug!(
                 "  {:?} --{:?}--> {:?}",
                 src.path,
                 e.weight().kind,

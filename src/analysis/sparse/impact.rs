@@ -316,10 +316,6 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
         })();
         self.budget.refinement_limit = refinement;
         self.budget.scratch = scratch;
-        if std::env::var_os("IRQ_CHECK_TRACE_COVERAGE").is_some() {
-            eprintln!("irq-check: storage impact {instance} object={object:?} range={range:?} result={answer:?} steps={} allowance={allowance} enclosing={refinement:?}",
-                self.budget.steps.saturating_sub(before));
-        }
         match answer {
             Ok(WriteImpact::Preserved) => self.impacts.preserved += 1,
             Ok(WriteImpact::Unresolved(_)) => self.impacts.unresolved += 1,

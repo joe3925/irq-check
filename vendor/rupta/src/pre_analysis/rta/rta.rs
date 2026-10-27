@@ -82,8 +82,8 @@ impl<'a, 'tcx, 'compilation> RapidTypeAnalysis<'a, 'tcx, 'compilation> {
         self.iteratively_process_reachable_functions();
 
         self.analysis_time = now.elapsed();
-        println!("Rapid Type Analysis completed.");
-        println!(
+        log::info!("Rapid Type Analysis completed.");
+        log::info!(
             "Rapid Type Analysis time: {}", 
             humantime::format_duration(self.analysis_time).to_string()
         );

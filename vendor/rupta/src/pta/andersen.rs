@@ -219,7 +219,7 @@ impl<'pta, 'tcx, 'compilation> PointerAnalysis<'tcx, 'compilation> for AndersenP
         self.pre_analysis_time += rta.analysis_time;
         self.stack_filter = Some(StackFilter::new(rta.call_graph));
         self.pre_analysis_time += self.stack_filter.as_ref().unwrap().fra_time();
-        println!("Pre-analysis time {}", 
+        log::info!("Pre-analysis time {}",
             humantime::format_duration(self.pre_analysis_time).to_string()
         );
     }

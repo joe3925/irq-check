@@ -242,9 +242,6 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                         }
                         successors[tail.as_usize()].sort_unstable();
                         successors[tail.as_usize()].dedup();
-                        if std::env::var_os("IRQ_CHECK_TRACE_CONTROL").is_some() {
-                            eprintln!("irq-check: normal return ranking {instance} header={header:?} tail={tail:?} counter={counter:?}");
-                        }
                     }
                     let mut predecessors = vec![Vec::new(); body.basic_blocks.len()];
                     let mut remaining = vec![0usize; body.basic_blocks.len()];
@@ -452,10 +449,6 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                     self.retain_completed();
                     self.budget.scratch = scratch.saturating_add(self.flow.bytes.saturating_sub(stored));
                 }
-                if std::env::var_os("IRQ_CHECK_TRACE").is_some() {
-                    eprintln!("irq-check: control summary refinement={reason:?} {} at={:?} steps={}",
-                        self.frames[point.frame].instance, point.location, self.budget.steps.saturating_sub(before));
-                }
                 for value in witnesses.into_iter().chain(pending.remove(&key).into_iter().flat_map(|(values, _)| values)) {
                     if coarse.len() >= limits.alternatives { break; }
                     if value.path_proven() && !coarse.contains(&value) { coarse.push(value); }
@@ -468,9 +461,6 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
     pub(super) fn control_step(&mut self, point: Point, refine: bool, memory: bool, finished: &mut Vec<Alternative<'tcx>>)
         -> Result<Vec<Alternative<'tcx>>, QueryStop>
     {
-        let tracing = std::env::var_os("IRQ_CHECK_TRACE_CONTROL").is_some();
-        let started = std::time::Instant::now();
-        let starting_steps = self.budget.steps;
         let scratch = self.budget.scratch;
         let stored = self.flow.bytes;
         let pending_stored = self.controls.pending_bytes;
@@ -531,13 +521,7 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
             states[mir::START_BLOCK.as_usize()].push(initial);
             let mut queue = VecDeque::from([mir::START_BLOCK]);
             let mut queued = HashSet::from([mir::START_BLOCK]);
-            let mut visits = 0usize;
             while let Some(block) = queue.pop_front() {
-                visits += 1;
-                if tracing && visits % 10000 == 0 {
-                    eprintln!("irq-check: control template active {} visits={visits} blocks={} pending={} seconds={:.3} steps={}",
-                        frame.instance, states.len(), queue.len(), started.elapsed().as_secs_f64(), self.budget.steps.saturating_sub(starting_steps));
-                }
                 queued.remove(&block);
                 self.budget.scratch = scratch.saturating_add(self.flow.bytes.saturating_sub(stored))
                     .saturating_add(self.controls.pending_bytes.saturating_sub(pending_stored));
@@ -649,10 +633,6 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                 + paths.iter().map(|path| path.guards.len() * std::mem::size_of::<Guard>() * 2
                     + path.returns.len() * std::mem::size_of::<Location>() * 2).sum::<usize>()).sum::<usize>();
             let paths: Arc<[Vec<ControlPath>]> = Arc::from(states);
-            if tracing {
-                eprintln!("irq-check: control template complete {} visits={visits} blocks={} seconds={:.3} steps={} bytes={bytes}",
-                    frame.instance, paths.len(), started.elapsed().as_secs_f64(), self.budget.steps.saturating_sub(starting_steps));
-            }
             if self.controls.bytes.saturating_add(bytes) > self.cache_limit / 16 {
                 self.controls.templates.clear();
                 self.controls.answers.clear();
@@ -767,10 +747,6 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                             if let Some(guards) = self.merge(&value.guards, &returned.guards)? {
                                 let bytes = guards.capacity().saturating_mul(std::mem::size_of::<(usize, Guard)>() * 4);
                                 if bytes > limits.function_scratch_mib * 1024 * 1024 {
-                                    if std::env::var_os("IRQ_CHECK_TRACE").is_some() {
-                                        eprintln!("irq-check: control guard storage limit {} at={:?} return={location:?} guards={} bytes={bytes}",
-                                            frame.instance, point.location, guards.len());
-                                    }
                                     return Err(QueryStop::ScratchLimit);
                                 }
                                 joined.push(Alternative { value: Value::Bits(1), guards });
@@ -784,19 +760,8 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
             }
             self.bounded(finished.clone())
         })();
-        if tracing && started.elapsed().as_millis() >= 250 {
-            eprintln!("irq-check: control refinement {} at={:?} seconds={:.3} steps={} result={:?}",
-                frame.instance, point.location, started.elapsed().as_secs_f64(), self.budget.steps.saturating_sub(starting_steps),
-                answer.as_ref().map(|values| values.len()));
-        }
         self.budget.scratch = scratch.saturating_add(self.flow.bytes.saturating_sub(stored))
             .saturating_add(self.controls.pending_bytes.saturating_sub(pending_stored));
-        if let Err(reason) = &answer
-            && std::env::var_os("IRQ_CHECK_TRACE").is_some()
-        {
-            eprintln!("irq-check: control dependency stop={reason:?} {} at={:?} steps={}",
-                frame.instance, point.location, self.budget.steps);
-        }
         answer
     }
 }

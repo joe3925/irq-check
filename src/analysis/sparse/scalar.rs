@@ -185,7 +185,6 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
     }
 
     fn scalar_summaries(&mut self, point: Point, roots: Vec<SummaryKey<'tcx>>) -> Result<(Option<u128>, bool), QueryStop> {
-        let frame = self.frames[point.frame];
         if roots.iter().all(|root| self.scalars.summaries.contains_key(root)) {
             let value = roots.iter().fold(Fact::Bottom, |value, root| value.join(
                 self.scalars.summaries[root].conditions.get(&point.location).copied().unwrap_or(Fact::Unknown)));
@@ -206,7 +205,6 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
             }
         }
         let mut retained = 0usize;
-        let before = self.budget.steps;
         let answer = (|| {
             while let Some(key) = queue.pop_front() {
                 let (instance, irq, context, _) = key;
@@ -672,19 +670,6 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
             Ok(())
         })();
         self.budget.scratch = scratch;
-        if std::env::var_os("IRQ_CHECK_TRACE_CONTROL").is_some() {
-            eprintln!("irq-check: scalar summaries {} functions={} conditions={} constants={} steps={} bytes={retained} result={answer:?}",
-                frame.instance, summaries.len(), summaries.values().map(|summary| summary.conditions.len()).sum::<usize>(),
-                summaries.values().flat_map(|summary| summary.conditions.values()).filter(|fact| matches!(fact, Fact::Bits(_))).count(),
-                self.budget.steps.saturating_sub(before));
-        }
-        if let Ok(filter) = std::env::var("IRQ_CHECK_TRACE_SCALAR") {
-            for ((instance, _, context, inputs), summary) in &summaries {
-                if instance.to_string().contains(&filter) {
-                    eprintln!("irq-check: scalar result {instance} context={context:?} inputs={inputs:?} returned={:?} conditions={:?}", summary.returned, summary.conditions);
-                }
-            }
-        }
         answer?;
         let value = roots.iter().fold(Fact::Bottom, |value, root| value.join(
             summaries.get(root).or_else(|| self.scalars.summaries.get(root))

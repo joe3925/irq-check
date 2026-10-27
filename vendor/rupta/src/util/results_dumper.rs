@@ -118,7 +118,7 @@ pub fn dump_pts<P: PAGPath>(pt_data: &DiffPTDataTy, pag: &PAG<P>, pts_path: &Str
 
 pub fn dump_pts_for<P: PAGPath>(pt_data: &DiffPTDataTy, pag: &PAG<P>, node_id: PAGNodeId) {
     let path = pag.node_path(node_id);
-    println!("Processing node: {:?}, {:?}", node_id, path);
+    log::debug!("Processing node: {:?}, {:?}", node_id, path);
     let pts = pt_data.propa_pts_map.get(&node_id);
     if pts.is_some() {
         let pts = pts.unwrap();
@@ -126,7 +126,7 @@ pub fn dump_pts_for<P: PAGPath>(pt_data: &DiffPTDataTy, pag: &PAG<P>, node_id: P
         for node in pts {
             str.push_str(&format!("{:?}, ", pag.node_path(node)));
         }
-        println!("Points-to: {}", str);
+        log::debug!("Points-to: {}", str);
     }
 }
 

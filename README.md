@@ -27,9 +27,17 @@ Run the five paired Cargo scenarios from this checkout:
 
 The runner uses the installed checker. It checks the exit status, compiler identity, target, selected crates, expected forbidden target, and an indirect call reachable from the IRQ root. It uses a new Cargo output directory for each run under `target/scenarios`. A compiler error or a checker crash does not count as an expected rejection. Add `-VerifyCache` to repeat each safe build and check that Cargo reuses its result without changing the analysis evidence.
 
-Set `IRQ_CHECK_STATS=1` to print analysis counters. Set `IRQ_CHECK_DUMP_DIR` to save the IRQ graph, query evidence, separate candidate edges, and backend coverage gaps. The `<crate>-backend-coverage.txt` file records the function, MIR location, and reason for each backend gap. A backend gap is not an IRQ verdict. The pointer query must establish the binding or report an unknown call. Set `IRQ_CHECK_EXPLAIN=1` to include query evidence in failure diagnostics. These settings do not change the policy.
+Normal analysis uses Rust compiler diagnostics. Optional reports use the following settings. The driver reads them once per process. They do not change the policy or select another backend.
 
-Set `IRQ_CHECK_TRACE_UNKNOWN=1` to trace a read when it first stores an Unknown value. The trace includes the read key and its dependencies. It does not include every temporary value outside the worklist. The trace can be large.
+| Setting | Output |
+| --- | --- |
+| `IRQ_CHECK_STATS=1` | Analysis counters on standard error |
+| `IRQ_CHECK_DUMP_DIR=<directory>` | IRQ graph, query evidence, separate candidate edges, accepted gaps, and backend coverage files |
+| `IRQ_CHECK_EXPLAIN=1` | Query evidence and internal site details in failure diagnostics |
+
+The `<crate>-backend-coverage.txt` file records the function, MIR location, and reason for each backend gap. A backend gap is not an IRQ verdict. The pointer query must establish the binding or report an unknown call. Internal `IRQ_CHECK_TRACE*` and `IRQ_CHECK_RUPTA_POINTS` settings have been removed. Reports no longer write phase or per-worker progress files.
+
+The launcher CLI, `--interface` result, policy metadata, compiler-identity checks, and existing evidence fields retain their current interface. Rupta remains the pointer-analysis backend. See [saved analysis findings](TARGET_FINDINGS.md) for the investigation results preserved before build cleanup.
 
 To force fresh analysis through Cargo or xtask, set a new process-local cache ID before the build:
 
@@ -89,7 +97,7 @@ Identify the exact stop before increasing a limit. Keep each run bounded and rec
 
 Validation is in progress. The full scenario audit, the panic-only negative case, the block-contract cases, and both kernel targets must pass before acceptance.
 
-The frozen stage38 candidate checked on 20 October passes 112 of 113 non-panic cases, all 45 cache checks, and all 18 contract checks. This run uses query and scalar allowances of 1000000, not the defaults. Ordinary formatting negative still fails. Some passing cases take more work than earlier versions. Later summary candidates have regressions under investigation. The stage38 x86 kernel check completes with 129 Unknown diagnostics. The ARM check reaches the 1200-second analysis limit and has incomplete diagnostics. Neither kernel result is accepted. The migration is not accepted or complete. See [the summary plan and results](performance/control-summary-plan-20261018.md) for source identities, limits, and remaining work.
+The saved experiments do not establish a complete repair. Stage213 passes 113 non-panic cases, 45 non-panic cache checks, 18 contract checks, and 12 focused checks at increased work limits. Its panic negative case still reports one Forbidden and five Unknown errors. That saved source differs from this checkout. These counts are historical results, not validation of the current build. No saved result establishes a clean kernel check for the current source. See [saved analysis findings](TARGET_FINDINGS.md) for source identities, limits, failed experiments, and remaining work.
 
 ## Mark functions
 

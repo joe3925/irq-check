@@ -62,13 +62,6 @@ pub(super) enum RequestMode {
     OptionalRefinement,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum RequestState {
-    Pending,
-    Complete,
-    Stopped(QueryStop),
-}
-
 pub(super) enum ReadOutcome<T> {
     Complete(T),
     Stopped(QueryStop),
@@ -111,9 +104,6 @@ impl QueryBudget {
         if self.scratch > irq_check_rupta::limits::configuration().expect("validated analysis limits").query_scratch_mib * 1024 * 1024 {
             self.record_limit(QueryStop::ScratchLimit, "query scratch bytes", self.scratch,
                 irq_check_rupta::limits::configuration().expect("validated analysis limits").query_scratch_mib * 1024 * 1024);
-            if std::env::var_os("IRQ_CHECK_TRACE").is_some() {
-                eprintln!("irq-check: query scratch limit bytes={} added={bytes} steps={}", self.scratch, self.steps);
-            }
             return Err(QueryStop::ScratchLimit);
         }
         Ok(())
@@ -154,11 +144,6 @@ impl<'tcx> BodyIndex<'tcx> {
         irq: bool,
     ) -> Result<Self, QueryStop> {
         let body = tcx.instance_mir(instance.def);
-        if std::env::var("IRQ_CHECK_TRACE_FUNCTION")
-            .is_ok_and(|filter| !filter.is_empty() && instance.to_string().contains(&filter))
-        {
-            eprintln!("irq-check: indexed MIR {instance} irq={irq}\n{body:#?}");
-        }
         let mut index = Self {
             body,
             stops: vec![None; body.basic_blocks.len()],

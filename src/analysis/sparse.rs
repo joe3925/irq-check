@@ -1,4 +1,4 @@
-use super::query::{BodyIndex, Guard, GuardProof, QueryBudget, QueryStop, ReadOutcome, RequestMode, RequestState};
+use super::query::{BodyIndex, Guard, GuardProof, QueryBudget, QueryStop, ReadOutcome, RequestMode};
 use crate::trust::Trust;
 use rustc_abi::Size;
 use rustc_hir::def_id::DefId;
@@ -480,9 +480,6 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
             if distinct.len() == result.len() && !result.iter().any(|value| matches!(value.value, Value::Unknown(_))) {
                 if result.len() > limit {
                     self.budget.record_limit(QueryStop::AlternativeLimit, "value alternatives", result.len(), limit);
-                    if std::env::var_os("IRQ_CHECK_TRACE_FLOW_VALUES").is_some() {
-                        eprintln!("irq-check: alternative limit values={result:?}");
-                    }
                     return Err(QueryStop::AlternativeLimit);
                 }
                 break;
@@ -615,9 +612,6 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
             if !reduced {
                 if result.len() > limit {
                     self.budget.record_limit(QueryStop::AlternativeLimit, "value and guard alternatives", result.len(), limit);
-                    if std::env::var_os("IRQ_CHECK_TRACE_FLOW_VALUES").is_some() {
-                        eprintln!("irq-check: alternative limit values={result:?}");
-                    }
                     return Err(QueryStop::AlternativeLimit);
                 }
                 break;
@@ -676,10 +670,6 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                             Value::Unknown(reason) => reason,
                             _ => "the address calculation did not produce an established pointer",
                         });
-                        if std::env::var_os("IRQ_CHECK_TRACE_UNINITIALIZED").is_some() {
-                            eprintln!("irq-check: unknown-address {} frame={} at={:?} place={place:?} type={requested} value={:?}",
-                                frame.instance, point.frame, point.location, address.value);
-                        }
                         values.push(Alternative {
                             value: Value::Unknown("the storage address is unknown"),
                             guards: address.guards,
@@ -1987,18 +1977,6 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                     );
                 }
                 let right = self.operand(point, &operands.1, 0, right_ty)?;
-                if std::env::var("IRQ_CHECK_TRACE_TRANSFER").is_ok_and(|filter| {
-                        self.frames[point.frame]
-                            .instance
-                            .to_string()
-                            .contains(&filter)
-                    })
-                {
-                    eprintln!(
-                        "irq-check: binary {operation:?} {} frame={} at {:?} left={left:?} right={right:?}",
-                        self.frames[point.frame].instance, point.frame, point.location
-                    );
-                }
                 let width = self
                     .tcx
                     .layout_of(TypingEnv::fully_monomorphized().as_query_input(left_ty))
@@ -3237,13 +3215,6 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
             values.capacity() * std::mem::size_of::<Alternative<'tcx>>() * 4
                 + values.iter().map(|value| value.guards.capacity() * std::mem::size_of::<(usize, Guard)>() * 4).sum::<usize>());
         let live = scratch.saturating_add(self.flow.bytes.saturating_sub(stored));
-        if self.budget.scratch.saturating_sub(live.saturating_add(retained)) >= 1024 * 1024
-            && std::env::var_os("IRQ_CHECK_TRACE_FLOW_COST").is_some()
-        {
-            eprintln!("irq-check: return scratch release {} at={:?} charged={} outer={scratch} flow-growth={} result={retained} stop={:?}",
-                self.frames[point.frame].instance, point.location, self.budget.scratch,
-                self.flow.bytes.saturating_sub(stored), answer.as_ref().err());
-        }
         self.budget.scratch = live;
         if answer.is_ok() { self.budget.reserve(retained)?; }
         answer

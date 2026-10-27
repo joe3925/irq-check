@@ -115,7 +115,7 @@ impl<'r, 'a, 'tcx, 'compilation> PrecCritFnIdent<'r, 'a, 'tcx, 'compilation> {
         }
 
         self.analysis_time = now.elapsed();
-        println!(
+        log::info!(
             "Precision-critical function identification time: {}",
             humantime::format_duration(self.analysis_time).to_string()
         );
