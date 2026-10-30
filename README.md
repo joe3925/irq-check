@@ -9,7 +9,7 @@ rustup component add --toolchain nightly rustc-dev rust-src llvm-tools-preview
 cargo +nightly install --locked --force --path . --bins
 ```
 
-Add the Cargo bin directory to `PATH`. The rustOS `xtask` uses the installed checker.
+Add the Cargo bin directory to `PATH`. The rustOS `xtask irq-check` command uses the installed checker. Normal kernel builds do not run IRQ Check.
 
 Use the same installed nightly for the checker and the checked project. If you select another installed nightly, use its name in both commands. The checker records its build compiler identity. The launcher checks the selected compiler and the identity stored in the driver file before it loads the driver. A driver file without matching identity data is rejected. After a compiler update, rebuild and install both binaries. Compiler API changes can also require source changes.
 
@@ -37,7 +37,18 @@ Normal analysis uses Rust compiler diagnostics. Optional reports use the followi
 
 The `<crate>-backend-coverage.txt` file records the function, MIR location, and reason for each backend gap. A backend gap is not an IRQ verdict. The pointer query must establish the binding or report an unknown call. Internal `IRQ_CHECK_TRACE*` and `IRQ_CHECK_RUPTA_POINTS` settings have been removed. Reports no longer write phase or per-worker progress files.
 
-The launcher CLI, `--interface` result, policy metadata, compiler-identity checks, and existing evidence fields retain their current interface. Rupta remains the pointer-analysis backend. See [saved analysis findings](TARGET_FINDINGS.md) for the investigation results preserved before build cleanup.
+The launcher CLI, `--interface` result, policy metadata, compiler-identity checks, and existing evidence fields retain their current interface. Rupta remains the pointer-analysis backend.
+
+Run a separate kernel and boot-driver check from the rustOS checkout:
+
+```text
+cargo run --release -p xtask -- irq-check --platform x86_64-uefi --release
+cargo run --release -p xtask -- irq-check --platform aarch64-uefi --release
+```
+
+The command uses the platform target, default-feature selection, and feature list. It also accepts `--offline` and repeated `--kernel-feature NAME` options. It runs `cargo check` through IRQ Check and does not link a kernel or create a boot image. It writes component results to `target/irq-check/<platform>/<profile>/results.json`. Compiler diagnostics identify failed IRQ paths. Any failed component makes the command fail.
+
+For a direct metadata-only check, use `irq-check --cargo check` with the same manifest, package, target, features, and build-std options as the build. Build scripts and procedural macros still compile for the host.
 
 To force fresh analysis through Cargo or xtask, set a new process-local cache ID before the build:
 
@@ -47,8 +58,8 @@ $previousToolchain = $env:RUSTUP_TOOLCHAIN
 try {
     $env:RUSTUP_TOOLCHAIN = 'nightly'
     $env:IRQ_CHECK_ANALYSIS_ID = [guid]::NewGuid().ToString()
-    cargo +nightly run -p xtask -- build --platform x86_64-uefi --release
-    if ($LASTEXITCODE -ne 0) { throw 'Kernel build failed' }
+    cargo +nightly run -p xtask -- irq-check --platform x86_64-uefi --release
+    if ($LASTEXITCODE -ne 0) { throw 'Kernel IRQ check failed' }
 } finally {
     $env:IRQ_CHECK_ANALYSIS_ID = $previousAnalysisId
     $env:RUSTUP_TOOLCHAIN = $previousToolchain
@@ -95,9 +106,7 @@ Set `IRQ_CHECK_MEMORY_MIB` to a positive value no greater than 10240. Set `IRQ_C
 
 Identify the exact stop before increasing a limit. Keep each run bounded and record its settings. An increased query limit also changes retry and refinement allowances. More work does not prove that the implementation is correct.
 
-Validation is in progress. The full scenario audit, the panic-only negative case, the block-contract cases, and both kernel targets must pass before acceptance.
-
-The saved experiments do not establish a complete repair. Stage213 passes 113 non-panic cases, 45 non-panic cache checks, 18 contract checks, and 12 focused checks at increased work limits. Its panic negative case still reports one Forbidden and five Unknown errors. That saved source differs from this checkout. These counts are historical results, not validation of the current build. No saved result establishes a clean kernel check for the current source. See [saved analysis findings](TARGET_FINDINGS.md) for source identities, limits, failed experiments, and remaining work.
+The existing kernel reproduction cases are in `scenarios/kernel-scheduler`, `scenarios/kernel-metadata`, and `scenarios/kernel-caller-inputs`. Run them with `python scenarios/run-kernel-repros.py --checker <path-to-irq-check>`.
 
 ## Mark functions
 

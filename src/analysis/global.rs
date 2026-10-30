@@ -373,8 +373,10 @@ impl<'tcx> GlobalPointers<'tcx> {
             !result.is_any_ptr()
                 && irq_check_rupta::util::type_util::get_pointer_projections(tcx, result).is_empty()
         };
-        let mut complete = backend.acx.coverage_gaps.iter().all(&covered);
-        let mut call_complete = backend.acx.coverage_gaps.iter().all(|gap| {
+        let mut complete = backend.acx.forbidden_externals.is_empty()
+            && backend.acx.coverage_gaps.iter().all(&covered);
+        let mut call_complete = backend.acx.forbidden_externals.is_empty()
+            && backend.acx.coverage_gaps.iter().all(|gap| {
             covered(gap)
                 || matches!(
                     gap.2.as_str(),
@@ -546,8 +548,8 @@ impl<'tcx> GlobalPointers<'tcx> {
             let mut parameters = HashSet::new();
             let mut write_addresses = HashSet::new();
             let mut call_receivers = HashSet::new();
-            let mut unknown_memory = false;
-            let mut unknown_calls = false;
+            let mut unknown_memory = !backend.acx.forbidden_externals.is_empty();
+            let mut unknown_calls = !backend.acx.forbidden_externals.is_empty();
             let mut gap_functions = HashSet::new();
             let mut gap_sites = HashSet::new();
             let root_instances: HashSet<_> = ordered.iter().copied().collect();
@@ -1477,6 +1479,8 @@ impl<'tcx> GlobalPointers<'tcx> {
         let mut pointer_calls = covered_calls.clone();
         let mut safe_candidates = candidates.clone();
         let mut context_calls = HashSet::new();
+        let mut closed_trait_calls = HashMap::new();
+        let mut closed_trait_types = HashMap::new();
         let mut signature_candidates = HashMap::<_, HashSet<_>>::new();
         let mut rejected = HashSet::new();
         let mut safety_callers = HashMap::<_, HashSet<_>>::new();
@@ -1592,7 +1596,133 @@ impl<'tcx> GlobalPointers<'tcx> {
                         }
                     }
                 }
-                if call_complete && !pointer_calls.contains(&(instance, location)) {
+                if !pointer_calls.contains(&(instance, location))
+                    && tcx.crate_types() == [rustc_structures::CrateType::Executable]
+                    && let rustc_middle::mir::TerminatorKind::Call { func, .. }
+                        | rustc_middle::mir::TerminatorKind::TailCall { func, .. } = &terminator.kind
+                {
+                    let function = instance.instantiate_mir_and_normalize_erasing_regions(
+                        tcx, ty::TypingEnv::fully_monomorphized(),
+                        ty::EarlyBinder::bind(tcx, func.ty(index.body, tcx)));
+                    if let ty::FnDef(def, args) = *function.kind()
+                        && tcx.generics_of(def).count() == 1
+                        && let Some(trait_id) = tcx.trait_of_assoc(def)
+                        && trait_id.is_local()
+                        && !tcx.trait_def(trait_id).has_auto_impl
+                        && Instance::try_resolve(tcx, ty::TypingEnv::fully_monomorphized(), def,
+                            tcx.instantiate_bound_regions_with_erased(args)).ok().flatten()
+                            .is_some_and(|target| matches!(target.def, ty::InstanceKind::Virtual(..)))
+                    {
+                        if !closed_trait_types.contains_key(&trait_id) {
+                            let mut concrete = HashSet::new();
+                            let mut complete = true;
+                            for implementation in tcx.all_impls(trait_id) {
+                                if !irq_check_rupta::limits::checkpoint() {
+                                    complete = false;
+                                    break;
+                                }
+                                let generics = tcx.generics_of(implementation);
+                                if generics.parent.is_some()
+                                    || tcx.impl_polarity(implementation) != ty::ImplPolarity::Positive
+                                {
+                                    complete = false;
+                                    break;
+                                }
+                                let predicates = tcx.clauses_of(implementation);
+                                let mut substitutions = vec![Vec::new()];
+                                for parameter in &generics.own_params {
+                                    let values = match parameter.kind {
+                                        ty::GenericParamDefKind::Lifetime => Some(vec![tcx.lifetimes.re_erased.into()]),
+                                        ty::GenericParamDefKind::Const { .. } => None,
+                                        ty::GenericParamDefKind::Type { .. } => {
+                                            let bounds: Vec<_> = predicates.clauses.iter().filter_map(|(clause, _)| {
+                                                let ty::ClauseKind::Trait(predicate) = clause.kind().skip_binder() else { return None; };
+                                                (predicate.polarity == ty::ClausePolarity::Positive
+                                                    && matches!(predicate.trait_ref.self_ty().kind(), ty::Param(param) if param.index == parameter.index))
+                                                    .then_some(predicate.trait_ref)
+                                            }).collect();
+                                            let sized = bounds.iter().any(|bound| Some(bound.def_id) == tcx.lang_items().sized_trait());
+                                            let mut finite = None;
+                                            if sized {
+                                                for bound in bounds.iter().filter(|bound| bound.def_id.is_local()
+                                                    && bound.args.len() == 1 && !tcx.trait_def(bound.def_id).has_auto_impl)
+                                                {
+                                                    let mut types = HashSet::new();
+                                                    let mut complete_bound = true;
+                                                    for implementation in tcx.all_impls(bound.def_id) {
+                                                        if !irq_check_rupta::limits::checkpoint()
+                                                            || tcx.generics_of(implementation).count() != 0
+                                                            || tcx.impl_polarity(implementation) != ty::ImplPolarity::Positive
+                                                        {
+                                                            complete_bound = false;
+                                                            break;
+                                                        }
+                                                        let Ok(concrete) = tcx.try_normalize_erasing_regions(
+                                                            ty::TypingEnv::fully_monomorphized(),
+                                                            tcx.type_of(implementation).instantiate_identity())
+                                                        else { complete_bound = false; break; };
+                                                        if concrete.is_sized(tcx, ty::TypingEnv::fully_monomorphized()) {
+                                                            types.insert(concrete.into());
+                                                        }
+                                                    }
+                                                    if complete_bound && !types.is_empty() {
+                                                        finite = Some(types.into_iter().collect::<Vec<_>>());
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            finite
+                                        }
+                                    };
+                                    let Some(values) = values else { complete = false; break; };
+                                    if substitutions.len().saturating_mul(values.len())
+                                        > irq_check_rupta::limits::configuration().unwrap().alternatives
+                                    { complete = false; break; }
+                                    let mut expanded = Vec::new();
+                                    for substitution in &substitutions {
+                                        for value in &values {
+                                            let mut substitution = substitution.clone();
+                                            substitution.push(*value);
+                                            expanded.push(substitution);
+                                        }
+                                    }
+                                    substitutions = expanded;
+                                }
+                                if !complete { break; }
+                                for substitution in substitutions {
+                                    let Ok(concrete_type) = tcx.try_normalize_erasing_regions(
+                                        ty::TypingEnv::fully_monomorphized(),
+                                        tcx.type_of(implementation).instantiate(tcx, tcx.mk_args(&substitution)))
+                                    else { complete = false; break; };
+                                    concrete.insert(concrete_type);
+                                }
+                                if !complete { break; }
+                            }
+                            closed_trait_types.insert(trait_id, complete.then_some(concrete));
+                        }
+                        if let Some(Some(concrete)) = closed_trait_types.get(&trait_id) {
+                            let mut implementations = HashSet::new();
+                            let mut complete = true;
+                            for &concrete in concrete {
+                                let Some(target) = Instance::try_resolve(tcx,
+                                    ty::TypingEnv::fully_monomorphized(), def,
+                                    tcx.mk_args(&[concrete.into()])).ok().flatten()
+                                    .filter(|target| !matches!(target.def, ty::InstanceKind::Virtual(..)))
+                                else { complete = false; break; };
+                                implementations.insert(target);
+                            }
+                            if complete && !implementations.is_empty() {
+                                let singleton = implementations.len() == 1;
+                                let targets = safe_candidates.entry((instance, location)).or_default();
+                                targets.extend(implementations);
+                                covered_calls.insert((instance, location));
+                                if singleton && targets.len() == 1 { pointer_calls.insert((instance, location)); }
+                                closed_trait_calls.insert((instance, location), (trait_id, targets.clone()));
+                            }
+                        }
+                    }
+                }
+                if call_complete && !covered_calls.contains(&(instance, location)) {
                     let mut fallback = HashSet::new();
                     match &index.body.basic_blocks[location.block].terminator().kind {
                         rustc_middle::mir::TerminatorKind::Call { func, .. }
@@ -1955,6 +2085,28 @@ impl<'tcx> GlobalPointers<'tcx> {
                 "irq-check: local safety summaries queries={summary_queries} transfers={summary_transfers} gaps={}",
                 summary_gaps.len()
             );
+        }
+        if let Some(directory) = crate::reporting::configuration().directory.as_ref() {
+            let mut calls: Vec<_> = closed_trait_calls.iter().map(|(&(caller, location), (trait_id, targets))| {
+                let mut targets: Vec<_> = targets.iter().map(ToString::to_string).collect();
+                targets.sort();
+                let mut concrete: Vec<_> = closed_trait_types[trait_id].as_ref().unwrap().iter()
+                    .map(ToString::to_string).collect();
+                concrete.sort();
+                serde_json::json!({
+                    "caller": caller.to_string(), "location": format!("{location:?}"),
+                    "trait": tcx.def_path_str(*trait_id), "concrete_types": concrete,
+                    "targets": targets, "complete_binding": pointer_calls.contains(&(caller, location)),
+                    "proof": "complete implementation set from executable-local traits and generic bounds"
+                })
+            }).collect();
+            calls.sort_by_key(|call| (call["caller"].as_str().unwrap().to_owned(),
+                call["location"].as_str().unwrap().to_owned()));
+            let path = std::path::PathBuf::from(directory).join(format!(
+                "{}-trait-bindings.json", tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE)));
+            if let Err(error) = serde_json::to_vec_pretty(&calls).map_err(std::io::Error::other)
+                .and_then(|data| std::fs::write(path, data))
+            { failure = Some(format!("cannot write trait binding evidence: {error}")); }
         }
         if let Some(reason) = irq_check_rupta::limits::stop_reason() {
             failure = Some(reason.into());

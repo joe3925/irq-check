@@ -1447,6 +1447,22 @@ pub fn equivalent_ptr_types<'tcx>(tcx: TyCtxt<'tcx>, ty1: Ty<'tcx>, ty2: Ty<'tcx
     }
     let deref_ty1 = get_dereferenced_type(ty1);
     let deref_ty2 = get_dereferenced_type(ty2);
+    let (mut tail1, mut tail2) = (deref_ty1, deref_ty2);
+    while let (TyKind::Adt(def1, args1), TyKind::Adt(def2, args2)) =
+        (tail1.kind(), tail2.kind())
+    {
+        if def1 != def2 || !def1.is_struct() { break; }
+        let fields = &def1.non_enum_variant().fields;
+        let Some(tail) = fields.iter().last() else { break; };
+        if !fields.iter().take(fields.len() - 1).all(|field|
+            field_ty(tcx, field, args1) == field_ty(tcx, field, args2))
+        {
+            break;
+        }
+        tail1 = field_ty(tcx, tail, args1);
+        tail2 = field_ty(tcx, tail, args2);
+        if tail1.is_trait() || tail2.is_trait() { return true; }
+    }
     if !deref_ty1.is_any_ptr() || !deref_ty2.is_any_ptr() {
         // We don't make cast or do type filtering when we propagate the points-to set to a dyn trait 
         // pointer, therefore we treat a pointer and a dyn trait pointer as equilvalent pointers.

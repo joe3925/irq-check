@@ -11,6 +11,7 @@ extern crate rustc_interface;
 extern crate rustc_middle;
 extern crate rustc_mir_dataflow;
 extern crate rustc_span;
+extern crate rustc_structures;
 extern crate rustc_symbol_mangling;
 
 mod analysis;
@@ -75,6 +76,11 @@ fn forbidden(tcx: TyCtxt<'_>, instance: Instance<'_>) -> Option<String> {
 }
 
 fn context_method(tcx: TyCtxt<'_>, def: DefId) -> bool {
+    if !matches!(tcx.def_kind(def), rustc_hir::def::DefKind::Fn
+        | rustc_hir::def::DefKind::AssocFn | rustc_hir::def::DefKind::Trait)
+    {
+        return false;
+    }
     marked(tcx, def, "context")
         || tcx.opt_associated_item(def).is_some_and(|item| {
             item.trait_item_def_id().is_some_and(|method| {

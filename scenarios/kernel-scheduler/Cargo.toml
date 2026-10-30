@@ -1,0 +1,17 @@
+[package]
+name = "kernel-scheduler"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+spin = { version = "=0.10.1", default-features = false, features = ["once"] }
+
+[features]
+native-alloc = []
+trait-context = []
+direct-root = []
+task-scan = []
+
+[lints]
+workspace = true

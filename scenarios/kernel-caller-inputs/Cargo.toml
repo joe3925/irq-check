@@ -1,0 +1,12 @@
+[package]
+name = "kernel-caller-inputs"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[features]
+few-callers = []
+opaque-init = []
+
+[lints]
+workspace = true

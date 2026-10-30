@@ -1,5 +1,5 @@
 [workspace]
-members = ["formatting", "mixed-dyn", "correlated-dyn", "erased-records", "pointer-alias", "context-growth", "context-growth-boundary", "kernel-memory", "memory-growth", "memory-growth-roots", "writer-growth", "heap-context", "leaf-reads", "batch-frontier", "read-chain", "heap-read-chain", "context-retirement", "return-widening", "recursive-bindings", "contract-checks", "contract-dependency", "contract-leaf"]
+members = ["formatting", "mixed-dyn", "correlated-dyn", "erased-records", "pointer-alias", "context-growth", "context-growth-boundary", "kernel-memory", "memory-growth", "memory-growth-roots", "writer-growth", "heap-context", "leaf-reads", "batch-frontier", "read-chain", "heap-read-chain", "context-retirement", "return-widening", "recursive-bindings", "contract-checks", "contract-dependency", "contract-leaf", "kernel-scheduler", "kernel-metadata", "kernel-caller-inputs"]
 resolver = "2"
 
 [workspace.package]

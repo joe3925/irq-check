@@ -111,6 +111,8 @@ struct QueryEvidence {
     witness: Option<u128>,
     result: Result<[usize; 4], QueryStop>,
     conservative_safe: bool,
+    conservative_targets: usize,
+    conservative_proven: usize,
     worker: Option<usize>,
 }
 
@@ -209,6 +211,7 @@ impl<'tcx> Analysis<'tcx> {
         let mut deferred = VecDeque::new();
         let mut queued = HashMap::<usize, Vec<Vec<(usize, Guard)>>>::new();
         let mut candidate_sites = HashSet::new();
+        let mut target_obligations = HashMap::<usize, (&'static str, HashSet<Node<'tcx>>)>::new();
         let mut diagnostic_frames = HashMap::new();
         let mut diagnostic_inputs = HashMap::<Instance<'tcx>, HashMap<Point, usize>>::new();
         let mut diagnostic_reuse = 0usize;
@@ -602,7 +605,8 @@ impl<'tcx> Analysis<'tcx> {
                 let evidence = QueryEvidence {
                     steps: precise_steps + fallback_steps, attempts: attempts + 1, cases,
                     loop_entries, cut_recursive_returns: solver.cut_recursive_returns,
-                    witness: witness_value, result, conservative_safe: false, worker: None,
+                    witness: witness_value, result, conservative_safe: false,
+                    conservative_targets: 0, conservative_proven: 0, worker: None,
                 };
                 let id = output.sites.len();
                 let source = site_sources.entry((instance, location)).or_insert_with(|| Arc::new(CallSiteSource {
@@ -613,7 +617,10 @@ impl<'tcx> Analysis<'tcx> {
                     unwind: terminator.unwind().and_then(|unwind| match unwind { mir::UnwindAction::Cleanup(block) => Some(*block), _ => None }),
                 })).clone();
                 output.sites.push(CallSite { caller, state: id, source, evidence, diagnostics });
+                let mut conditional_targets = Vec::new();
                 if let Ok(targets) = fallback {
+                    output.sites[id].evidence.conservative_targets = targets.len();
+                    output.sites[id].evidence.conservative_proven = targets.iter().filter(|target| facts.safe.contains(target)).count();
                     if !targets.is_empty() && targets.iter().all(|target| facts.safe.contains(target)) {
                         output.sites[id].evidence.conservative_safe = true;
                         for target in targets {
@@ -624,6 +631,12 @@ impl<'tcx> Analysis<'tcx> {
                             });
                         }
                         continue;
+                    }
+                    if !targets.is_empty() && targets.len() <= limits.alternatives
+                        && targets.iter().all(|target| crate::forbidden(tcx, *target).is_none())
+                    {
+                        target_obligations.insert(id, (kind, HashSet::new()));
+                        conditional_targets = targets;
                     }
                 }
                 let unfinished = answer.is_ok() && !pending.is_empty();
@@ -659,7 +672,10 @@ impl<'tcx> Analysis<'tcx> {
                 if let Some(reason) = control_stop {
                     *output.precision_loss.entry(format!("{instance} at {location:?}: control refinement stopped after {reason:?}")).or_default() += 1;
                 }
-                for value in values {
+                for (value, conditional) in values.into_iter().map(|value| (value, false)).chain(
+                    conditional_targets.into_iter().map(|target|
+                        (Alternative { value: Value::Function(target), guards: Vec::new() }, true)))
+                {
                     let mut uncertainty = Vec::new();
                     for &(frame, guard) in &value.guards {
                         if matches!(guard.proof, query::GuardProof::Established | query::GuardProof::Predicate)
@@ -738,12 +754,14 @@ impl<'tcx> Analysis<'tcx> {
                         uncertainty.push((span.source_callsite(), "caller inputs were discarded at this call because the function reached its retained-caller limit"));
                     }
                     let node = Node { instance: target, context };
+                    if conditional { target_obligations.get_mut(&id).unwrap().1.insert(node); }
                     output.graph.entry(caller).or_default().push(Edge {
-                        candidate: false, site: Some(id), target: Some(node), span, kind,
-                        detail: "the target has an established pointer binding".into(), trusted,
-                        allow_incomplete, path_proven: value.path_proven(), uncertainty,
+                        candidate: conditional, site: Some(id), target: Some(node), span, kind,
+                        detail: if conditional { "member of a complete target set; safety check pending" }
+                            else { "the target has an established pointer binding" }.into(), trusted,
+                        allow_incomplete, path_proven: !conditional && value.path_proven(), uncertainty,
                     });
-                    if crate::forbidden(tcx, target).is_some() && generation == solver.flow.generation {
+                    if !conditional && crate::forbidden(tcx, target).is_some() && generation == solver.flow.generation {
                         let mut pending: Vec<_> = output.roots.values().copied().collect();
                         let mut seen = HashSet::new();
                         while let Some(reached) = pending.pop() {
@@ -821,10 +839,80 @@ impl<'tcx> Analysis<'tcx> {
         output.covered_calls.clear();
         queued.clear();
         candidate_sites.clear();
+        target_obligations.clear();
         for &instance in roots {
             let context = output.roots[&instance].context;
             queue.push_back((context, Vec::new(), 0, None));
         }
+        }
+        if !output.incomplete && !output.diagnostic_cutoff && !target_obligations.is_empty() {
+            let mut failed = HashSet::new();
+            let mut callers = HashMap::<Node<'tcx>, HashSet<Node<'tcx>>>::new();
+            for (&caller, edges) in &output.graph {
+                if !irq_check_rupta::limits::checkpoint() {
+                    output.incomplete = true;
+                    output.limit_detail = irq_check_rupta::limits::stop_reason().unwrap_or("analysis stopped").into();
+                    break;
+                }
+                if crate::forbidden(tcx, caller.instance).is_some() { failed.insert(caller); }
+                for edge in edges.iter().filter(|edge| !edge.candidate) {
+                    if let Some(target) = edge.target {
+                        callers.entry(target).or_default().insert(caller);
+                        if crate::forbidden(tcx, target.instance).is_some() { failed.insert(target); }
+                    } else if !edge.site.is_some_and(|id|
+                        output.sites[id].caller == caller && target_obligations.get(&id)
+                            .is_some_and(|(kind, targets)| edge.kind == *kind && !targets.is_empty()))
+                    {
+                        failed.insert(caller);
+                    }
+                }
+            }
+            for (&id, (_, targets)) in &target_obligations {
+                let caller = output.sites[id].caller;
+                for &target in targets {
+                    callers.entry(target).or_default().insert(caller);
+                    if crate::forbidden(tcx, target.instance).is_some() { failed.insert(target); }
+                }
+            }
+            let mut pending: VecDeque<_> = failed.iter().copied().collect();
+            while let Some(target) = pending.pop_front() {
+                if !irq_check_rupta::limits::checkpoint() {
+                    output.incomplete = true;
+                    output.limit_detail = irq_check_rupta::limits::stop_reason().unwrap_or("analysis stopped").into();
+                    break;
+                }
+                for &caller in callers.get(&target).into_iter().flatten() {
+                    if failed.insert(caller) { pending.push_back(caller); }
+                }
+            }
+            if !output.incomplete {
+                for (id, (kind, targets)) in target_obligations {
+                    if !irq_check_rupta::limits::checkpoint() {
+                        output.incomplete = true;
+                        output.limit_detail = irq_check_rupta::limits::stop_reason().unwrap_or("analysis stopped").into();
+                        break;
+                    }
+                    let site = &mut output.sites[id];
+                    let proven = targets.iter().filter(|target| !failed.contains(target)).count();
+                    site.evidence.conservative_proven = proven;
+                    let safe = !targets.is_empty() && proven == targets.len();
+                    site.evidence.conservative_safe = safe;
+                    if let Some(edges) = output.graph.get_mut(&site.caller) {
+                        if safe { edges.retain(|edge| edge.site != Some(id) || edge.kind != kind || edge.target.is_some()); }
+                        for edge in edges.iter_mut().filter(|edge| edge.site == Some(id) && edge.candidate
+                            && edge.target.is_some_and(|target| targets.contains(&target)))
+                        {
+                            edge.detail = if edge.target.is_some_and(|target| failed.contains(&target)) {
+                                "member of a complete target set; IRQ safety was not proved"
+                            } else { "member of a complete target set; IRQ-safe closure was proved" }.into();
+                        }
+                    }
+                    if safe {
+                        *output.covered_calls.entry((site.caller.instance, site.source.location,
+                            "complete call-target coverage; every target passed its contextual IRQ safety check")).or_default() += 1;
+                    }
+                }
+            }
         }
         if !scalar_witness && !output.incomplete && !output.diagnostic_cutoff
             && output.graph.values().flatten().all(|edge| edge.candidate || edge.target.is_some_and(|target|
@@ -867,7 +955,11 @@ impl<'tcx> Analysis<'tcx> {
             Err(reason) => format!("stopped={reason:?}"),
         };
         let worker = evidence.worker.map_or_else(String::new, |worker| format!("worker={worker} "));
-        let suffix = if evidence.conservative_safe { "; complete conservative target closure is IRQ-safe" } else { "" };
+        let suffix = if evidence.conservative_targets != 0 {
+            format!("; complete target set: {} members, {} proved IRQ-safe{}",
+                evidence.conservative_targets, evidence.conservative_proven,
+                if evidence.conservative_safe { "; complete conservative target closure is IRQ-safe" } else { "" })
+        } else { String::new() };
         format!("{worker}steps={} attempts={} cases={} loop_entries={:?} cut_recursive_returns={} root_scalar_witness={:?} {result}{suffix}",
             evidence.steps, evidence.attempts, evidence.cases, evidence.loop_entries, evidence.cut_recursive_returns, evidence.witness)
     }

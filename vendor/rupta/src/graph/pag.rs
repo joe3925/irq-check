@@ -597,6 +597,14 @@ impl<P: PAGPath> PAG<P> {
         if matches!(reference.kind, rustc_middle::ty::InstanceKind::Item(_))
             && !crate::util::type_util::has_instance_mir(acx.tcx, reference.kind)
         {
+            if acx.tcx.is_foreign_item(def_id)
+                && acx.tcx.get_attrs_by_path(def_id, &[
+                    rustc_span::Symbol::intern("irq"), rustc_span::Symbol::intern("forbidden"),
+                ]).next().is_some()
+            {
+                acx.forbidden_externals.insert(func_id);
+                return false;
+            }
             acx.coverage_gaps
                 .insert((func_id, None, "MIR body is unavailable".into()));
             warn!("Unavailable mir for def_id: {:?}", def_id);
