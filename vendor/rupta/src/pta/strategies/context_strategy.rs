@@ -350,7 +350,7 @@ impl RCEUSCallSiteSensitive {
         let mut new_callee_ctx_elem = vec![flow_entry];
         let callee_ctx = Context::new_k_limited_context(&caller_ctx, callsite.into(), inner.k);
         new_callee_ctx_elem.extend(callee_ctx.context_elems.iter().cloned());
-        let new_callee_ctx = Rc::new(Context { context_elems: new_callee_ctx_elem });
+        let new_callee_ctx = Rc::new(Context { context_elems: new_callee_ctx_elem, callback: caller_ctx.callback });
         inner.ctx_cache.get_context_id(&new_callee_ctx)
     }
 }

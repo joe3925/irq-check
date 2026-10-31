@@ -38,6 +38,7 @@ pub type ObjectSensitivePTA<'tcx, 'compilation> =
 pub struct ContextSensitivePTA<'tcx, 'compilation, S: ContextStrategy> {
     pub call_sites: HashMap<BaseCallSite, HashSet<Rc<CSCallSite>>>,
     pub call_bindings: HashSet<(Rc<CSCallSite>, CSFuncId)>,
+    pub callback_contexts: HashSet<ContextId>,
     /// The analysis context
     pub acx: AnalysisContext<'tcx, 'compilation>,
     /// Points-to data
@@ -88,6 +89,7 @@ impl<'tcx, 'compilation, S: ContextStrategy> ContextSensitivePTA<'tcx, 'compilat
         ContextSensitivePTA {
             call_sites: HashMap::new(),
             call_bindings: HashSet::new(),
+            callback_contexts: HashSet::new(),
             acx,
             pt_data: DiffPTDataTy::new(),
             pag,
@@ -137,7 +139,6 @@ impl<'tcx, 'compilation, S: ContextStrategy> ContextSensitivePTA<'tcx, 'compilat
                 );
                 if self.pag.build_func_pag(&mut self.acx, func.func_id) {
                     self.add_fpag_edges(func);
-                    self.process_calls_in_fpag(func);
                 } else {
                     self.processed_funcs.insert(func);
                 }
@@ -148,7 +149,7 @@ impl<'tcx, 'compilation, S: ContextStrategy> ContextSensitivePTA<'tcx, 'compilat
     /// Adds internal edges of a function pag to the whole program's pag.
     /// The function pag for the given def_id should be built before calling this function.
     pub fn add_fpag_edges(&mut self, func: CSFuncId) {
-        if self.processed_funcs.contains(&func) {
+        if !self.processed_funcs.insert(func) {
             return;
         }
 
@@ -184,7 +185,7 @@ impl<'tcx, 'compilation, S: ContextStrategy> ContextSensitivePTA<'tcx, 'compilat
             }
         }
 
-        self.processed_funcs.insert(func);
+        self.process_calls_in_fpag(func);
     }
 
     fn process_calls_in_fpag(&mut self, func: CSFuncId) {
@@ -246,6 +247,10 @@ impl<'tcx, 'compilation, S: ContextStrategy> ContextSensitivePTA<'tcx, 'compilat
 
     /// Process a resolved call according to the call type
     fn process_new_call(&mut self, callsite: &Rc<CSCallSite>, callee: &FuncId) {
+        if self.callback_contexts.contains(&callsite.func.cid) {
+            self.add_call_edge(callsite, &CSFuncId::new(callsite.func.cid, *callee));
+            return;
+        }
         let callee_def_id = self.acx.get_function_reference(*callee).def_id;
         if util::has_self_parameter(self.tcx(), callee_def_id) {
             if util::has_self_ref_parameter(self.tcx(), callee_def_id) {
@@ -288,7 +293,11 @@ impl<'tcx, 'compilation, S: ContextStrategy> ContextSensitivePTA<'tcx, 'compilat
         callee: &FuncId,
     ) -> ContextId {
         // Currently we treat all special callsites as static callsites
-        self.ctx_strategy.new_static_call_context(callsite, *callee)
+        if self.callback_contexts.contains(&callsite.func.cid) {
+            callsite.func.cid
+        } else {
+            self.ctx_strategy.new_static_call_context(callsite, *callee)
+        }
     }
 
     pub fn process_new_calls(&mut self, new_calls: &Vec<(Rc<CSCallSite>, FuncId)>) {
@@ -303,6 +312,10 @@ impl<'tcx, 'compilation, S: ContextStrategy> ContextSensitivePTA<'tcx, 'compilat
         new_call_instances: &Vec<(Rc<CSCallSite>, Rc<CSPath>, FuncId)>,
     ) {
         for (callsite, instance, callee_id) in new_call_instances {
+            if self.callback_contexts.contains(&callsite.func.cid) {
+                self.add_call_edge(callsite, &CSFuncId::new(callsite.func.cid, *callee_id));
+                continue;
+            }
             if let Some(callee_cid) =
                 self.ctx_strategy
                     .new_instance_call_context(callsite, Some(instance), *callee_id)
@@ -463,9 +476,37 @@ impl<'tcx, 'compilation, S: ContextStrategy> PointerAnalysis<'tcx, 'compilation>
                 self.stack_filter.as_mut(),
             );
             propagator.solve_worklist();
+            if std::env::var_os("IRQ_CHECK_RUPTA_STATS").is_some() {
+                eprintln!("irq-check: RUPTA nodes={} edges={} functions={} calls={} pointer_bytes={}", self.pag.graph().node_count(), self.pag.graph().edge_count(), self.processed_funcs.len(), new_calls.len(), self.pt_data.storage_bytes());
+            }
 
             if new_calls.is_empty() && new_call_instances.is_empty() {
-                break;
+                let analyzed: HashSet<_> = self.processed_funcs.iter().map(|func| func.func_id).collect();
+                let callbacks: HashSet<_> = self.pag.graph().node_indices().filter_map(|node| {
+                    let PathEnum::Function(function) = self.pag.node_path(node).path.value else { return None; };
+                    if analyzed.contains(&function) { return None; }
+                    let reference = self.acx.get_function_reference(function);
+                    let available = if self.tcx().is_foreign_item(reference.def_id) {
+                        let declaration = rustc_middle::ty::Instance::mono(self.tcx(), reference.def_id);
+                        self.acx.linked_definitions.contains_key(self.tcx().symbol_name(declaration).name)
+                    } else {
+                        crate::util::type_util::has_instance_mir(self.tcx(), reference.kind)
+                    };
+                    available.then_some(function)
+                }).collect();
+                if callbacks.is_empty() { break; }
+                if std::env::var_os("IRQ_CHECK_RUPTA_STATS").is_some() {
+                    eprintln!("irq-check: RUPTA analyzing {} additional callback bodies", callbacks.len());
+                }
+                let context = self.get_context_id(&Rc::new(Context {
+                    context_elems: Vec::new(), callback: true,
+                }));
+                self.callback_contexts.insert(context);
+                for function in callbacks {
+                    self.acx.callback_roots.insert(function);
+                    self.call_graph.add_node(CSFuncId::new(context, function));
+                }
+                self.process_reach_funcs();
             } else {
                 // Note: RCEUS is for call-site sensitivity only,
                 // so new call instances become normal new calls there.
@@ -475,6 +516,7 @@ impl<'tcx, 'compilation, S: ContextStrategy> PointerAnalysis<'tcx, 'compilation>
                 }
             }
         }
+        self.pag.release_edge_indexes();
     }
 
     /// Finalize the analysis.

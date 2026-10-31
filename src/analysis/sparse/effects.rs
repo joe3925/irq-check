@@ -180,9 +180,12 @@ impl<'tcx> Source<'tcx> {
                     let prefix = Place { local: place.local, projection: tcx.mk_place_elems(&place.projection[..position]) };
                     let ty = normalize(prefix.ty(index.body, tcx).ty);
                     let layout = tcx.layout_of(TypingEnv::fully_monomorphized().as_query_input(ty)).ok()?;
-                    let layout = if matches!(ty.kind(), ty::Adt(adt, _) if adt.is_enum()) {
-                        layout.for_variant(&ty::layout::LayoutCx::new(tcx, TypingEnv::fully_monomorphized()), variant?)
-                    } else { layout };
+                    let layout = match variant {
+                        Some(selected) => layout.for_variant(
+                            &ty::layout::LayoutCx::new(tcx, TypingEnv::fully_monomorphized()), selected),
+                        None if matches!(ty.kind(), ty::Adt(adt, _) if adt.is_enum()) => return None,
+                        None => layout,
+                    };
                     variant = None;
                     offset = offset.checked_add(i128::from(layout.fields.offset(field.as_usize()).bytes()))?;
                 }

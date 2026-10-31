@@ -275,7 +275,7 @@ impl<'tcx> FieldByteOffsetCache<'tcx> {
                 let subflds_offsets = self.field_byte_offset_cache.get(&fld_ty).unwrap();
                 for (subfld, suboffset) in subflds_offsets {
                     let mut full_proj = fld_proj.clone();
-                    full_proj.extend(subfld);
+                    full_proj.extend(subfld.iter().cloned());
                     fld_byte_offsets.insert(full_proj, fld_offset + suboffset);
                 }
             };
@@ -428,7 +428,7 @@ impl<'tcx> PathCastCache<'tcx> {
         let original_ty = if let Some(ty) = acx.get_path_rustc_type(&path) {
             ty
         } else {
-            let ty = try_eval_path_type(acx, &path).unwrap();
+            let ty = try_eval_path_type(acx, &path)?;
             acx.set_path_rustc_type(path.clone(), ty);
             ty
         };
@@ -477,7 +477,7 @@ impl<'tcx> PathCastCache<'tcx> {
         let original_ty = if let Some(ty) = acx.get_path_rustc_type(&path) {
             ty
         } else {
-            let ty = try_eval_path_type(acx, &path).unwrap();
+            let ty = try_eval_path_type(acx, &path)?;
             acx.set_path_rustc_type(path.clone(), ty);
             ty
         };
@@ -870,11 +870,11 @@ pub fn projections_and_types<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Vec<(Proj
                 } else {
                     PathSelector::UnionField(i)
                 };
-                fields.push((vec![field], field_ty));
+                fields.push((vec![field.clone()], field_ty));
                 // recursively get the subfields of this field
                 let subfields = projections_and_types(tcx, field_ty);
                 for (mut subfield, subfield_ty) in subfields {
-                    subfield.insert(0, field);
+                    subfield.insert(0, field.clone());
                     fields.push((subfield, subfield_ty));
                 }
             }
@@ -890,11 +890,11 @@ pub fn projections_and_types<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Vec<(Proj
                         for (i, field) in variant.fields.iter().enumerate() {
                             let field_ty = field_ty(tcx, field, args);
                             let field = PathSelector::Field(i);
-                            fields.push((vec![downcast, field], field_ty));
+                            fields.push((vec![downcast.clone(), field.clone()], field_ty));
                             // recursively get the subfields of this field
                             let subfields = projections_and_types(tcx, field_ty);
                             for (mut subfield, subfield_ty) in subfields {
-                                let mut projection = vec![downcast, field];
+                                let mut projection = vec![downcast.clone(), field.clone()];
                                 projection.append(&mut subfield);
                                 fields.push((projection, subfield_ty));
                             }
@@ -915,11 +915,11 @@ pub fn projections_and_types<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Vec<(Proj
             let closure_field_types = closure_field_types(ty);
             for (i, field_ty) in closure_field_types.iter().enumerate() {
                 let field = PathSelector::Field(i);
-                fields.push((vec![field], *field_ty));
+                fields.push((vec![field.clone()], *field_ty));
                 // recursively get the pointer type subfields of this field
                 let subfields = projections_and_types(tcx, *field_ty);
                 for (mut subfield, subfield_ty) in subfields {
-                    subfield.insert(0, field);
+                    subfield.insert(0, field.clone());
                     fields.push((subfield, subfield_ty));
                 }
             }
@@ -990,7 +990,7 @@ pub fn get_value_projections<'tcx>(
                 } else {
                     // recursively get the pointer type subfields of this field
                     for (mut subfield, subfield_ty) in get_value_projections(tcx, field_ty, integer_carriers) {
-                        subfield.insert(0, field);
+                        subfield.insert(0, field.clone());
                         ptr_projs.push((subfield, subfield_ty));
                     }
                 }
@@ -1008,11 +1008,11 @@ pub fn get_value_projections<'tcx>(
                             let field_ty = field_ty(tcx, field, args);
                             let field = PathSelector::Field(i);
                             if field_ty.is_any_ptr() {
-                                ptr_projs.push((vec![downcast, field], field_ty));
+                                ptr_projs.push((vec![downcast.clone(), field.clone()], field_ty));
                             } else {
                                 // recursively get the pointer type subfields of this field
                                 for (mut subfield, subfield_ty) in get_value_projections(tcx, field_ty, integer_carriers) {
-                                    let mut projection = vec![downcast, field];
+                                    let mut projection = vec![downcast.clone(), field.clone()];
                                     projection.append(&mut subfield);
                                     ptr_projs.push((projection, subfield_ty));
                                 }
@@ -1045,7 +1045,7 @@ pub fn get_value_projections<'tcx>(
                 } else {
                     // recursively get the pointer type subfields of this field
                     for (mut subfield, subfield_ty) in get_value_projections(tcx, *field_ty, integer_carriers) {
-                        subfield.insert(0, field);
+                        subfield.insert(0, field.clone());
                         ptr_projs.push((subfield, subfield_ty));
                     }
                 }
@@ -1543,7 +1543,7 @@ pub fn try_eval_path_type<'tcx>(acx: &mut AnalysisContext<'tcx, '_>, path: &Rc<P
         PathEnum::Constant => None,
         PathEnum::StaticVariable { def_id } => Some(acx.tcx.type_of(*def_id).skip_binder()),
         PathEnum::QualifiedPath { base, projection } => {
-            let mut base_ty = try_eval_path_type(acx, base).expect("Unable to evaluate the base type");
+            let mut base_ty = try_eval_path_type(acx, base)?;
             let mut projection = &projection[..];
             while !projection.is_empty() {
                 let projection_elem = projection.first().unwrap();
@@ -1555,11 +1555,21 @@ pub fn try_eval_path_type<'tcx>(acx: &mut AnalysisContext<'tcx, '_>, path: &Rc<P
                             | TyKind::Tuple(..)
                             | TyKind::Closure(..)
                             | TyKind::Coroutine(..) => {
-                                if let TyKind::Adt(def, _) = base_ty.kind() {
-                                    if def.is_struct() || def.is_union() {
-                                        assert!(*ordinal < def.non_enum_variant().fields.len(),
-                                            "field {ordinal} is outside {base_ty}; path={path:?}");
+                                let field_count = match base_ty.kind() {
+                                    TyKind::Adt(def, _) if def.is_struct() || def.is_union() => {
+                                        Some(def.non_enum_variant().fields.len())
                                     }
+                                    TyKind::Tuple(types) => Some(types.len()),
+                                    TyKind::Closure(..) | TyKind::Coroutine(..) => {
+                                        Some(closure_field_types(base_ty).len())
+                                    }
+                                    _ => None,
+                                };
+                                if field_count.is_some_and(|count| *ordinal >= count) {
+                                    acx.unmodeled_flows.insert(format!(
+                                        "field {ordinal} is outside {base_ty}; path={path:?}"));
+                                    acx.value_unknown_paths.insert(path.clone());
+                                    return None;
                                 }
                                 let ft = get_field_type(acx.tcx, base_ty, *ordinal);
                                 ft
@@ -1574,7 +1584,10 @@ pub fn try_eval_path_type<'tcx>(acx: &mut AnalysisContext<'tcx, '_>, path: &Rc<P
                             // the type `Str` cannot be indexed
                             TyKind::Array(..) | TyKind::Slice(..) => get_element_type(acx.tcx, base_ty),
                             _ => {
-                                panic!("index projection on {base_ty}; path={path:?}");
+                                acx.unmodeled_flows.insert(format!(
+                                    "index projection on {base_ty}; path={path:?}"));
+                                acx.value_unknown_paths.insert(path.clone());
+                                return None;
                             }
                         }
                     }

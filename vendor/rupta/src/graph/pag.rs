@@ -3,11 +3,12 @@
 // This source code is licensed under the GNU license found in the
 // LICENSE file in the root directory of this source tree.
 
+use std::rc::Rc;
+use crate::mir::path::Path;
 use log::*;
 use petgraph::Graph;
 use petgraph::graph::{DefaultIx, EdgeIndex, NodeIndex};
-use std::collections::hash_map::Entry;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::hash::Hash;
 
@@ -51,6 +52,7 @@ pub trait PAGPath: Clone + PartialEq + Eq + Hash + Debug {
     ) -> Self;
     fn value(&self) -> &PathEnum;
     fn append_projection(&self, projection_elems: &ProjectionElems) -> Self;
+    fn intern(&self, paths: &mut HashSet<Rc<Path>>) -> Self;
     fn add_offset(&self, offset: usize) -> Self;
     fn dyn_ptr_metadata(&self) -> Self;
     fn remove_cast(&self) -> Self;
@@ -109,13 +111,24 @@ pub enum PAGEdgeEnum {
     OffsetPAGEdge,
 }
 
-type EdgeMap = HashMap<PAGNodeId, BTreeSet<PAGEdgeId>>;
+type EdgeMap = HashMap<PAGNodeId, Vec<PAGEdgeId>>;
+
+fn insert_indexed_edge(edges: &mut EdgeMap, node: PAGNodeId, edge: PAGEdgeId) {
+    let values = edges.entry(node).or_default();
+    if values.last().is_none_or(|last| *last < edge) {
+        values.push(edge);
+    } else if let Err(index) = values.binary_search(&edge) {
+        values.insert(index, edge);
+    }
+}
 
 pub struct PAG<P: PAGPath> {
     /// The graph structure capturing assignment relations between nodes.
     pub(crate) graph: Graph<PAGNode<P>, PAGEdge>,
+    pub(crate) format_bindings: HashSet<PAGEdgeId>,
     /// A map from values to node id.
     pub(crate) values: HashMap<P, PAGNodeId>,
+    paths: HashSet<Rc<Path>>,
     /// Maintains a func_pag for each function, so that in context sensitive
     /// analysis we only need to process each function for once.
     pub(crate) func_pags: HashMap<FuncId, FuncPAG>,
@@ -127,19 +140,11 @@ pub struct PAG<P: PAGPath> {
     // put the new addr_edges into this queue to help active new constraints.
     pub(crate) addr_edges_queue: ChunkedQueue<PAGEdgeId>,
 
-    pub(crate) addr_in_edges: EdgeMap,
-    pub(crate) addr_out_edges: EdgeMap,
-    pub(crate) direct_in_edges: EdgeMap,
     pub(crate) direct_out_edges: EdgeMap,
-    pub(crate) load_in_edges: EdgeMap,
     pub(crate) load_out_edges: EdgeMap,
     pub(crate) store_in_edges: EdgeMap,
-    pub(crate) store_out_edges: EdgeMap,
-    pub(crate) gep_in_edges: EdgeMap,
     pub(crate) gep_out_edges: EdgeMap,
-    pub(crate) cast_in_edges: EdgeMap,
     pub(crate) cast_out_edges: EdgeMap,
-    pub(crate) offset_in_edges: EdgeMap,
     pub(crate) offset_out_edges: EdgeMap,
 }
 
@@ -148,25 +153,19 @@ impl<P: PAGPath> PAG<P> {
     pub fn new() -> Self {
         PAG {
             graph: Graph::<PAGNode<P>, PAGEdge>::new(),
+            format_bindings: HashSet::new(),
             values: HashMap::new(),
+            paths: HashSet::new(),
             func_pags: HashMap::new(),
             promoted_funcs_map: HashMap::new(),
             involved_static_funcs_map: HashMap::new(),
             addr_edges_queue: ChunkedQueue::new(),
 
-            addr_in_edges: EdgeMap::new(),
-            addr_out_edges: EdgeMap::new(),
-            direct_in_edges: EdgeMap::new(),
             direct_out_edges: EdgeMap::new(),
-            load_in_edges: EdgeMap::new(),
             load_out_edges: EdgeMap::new(),
             store_in_edges: EdgeMap::new(),
-            store_out_edges: EdgeMap::new(),
-            gep_in_edges: EdgeMap::new(),
             gep_out_edges: EdgeMap::new(),
-            cast_in_edges: EdgeMap::new(),
             cast_out_edges: EdgeMap::new(),
-            offset_in_edges: EdgeMap::new(),
             offset_out_edges: EdgeMap::new(),
         }
     }
@@ -212,24 +211,33 @@ impl<P: PAGPath> PAG<P> {
 
     /// Adds a new node to the pag.
     pub fn add_node(&mut self, path: P) {
-        if let Entry::Vacant(e) = self.values.entry(path.clone()) {
-            let node = PAGNode::new(path);
-            let node_id = self.graph.add_node(node);
-            e.insert(node_id);
+        if !self.values.contains_key(&path) {
+            let path = path.intern(&mut self.paths);
+            let node_id = self.graph.add_node(PAGNode::new(path.clone()));
+            self.values.insert(path, node_id);
         }
     }
 
     /// Helper function to get a node or insert a new
     /// node if it does not exist in the map.
     pub fn get_or_insert_node(&mut self, path: &P) -> PAGNodeId {
-        match self.values.entry(path.clone()) {
-            Entry::Occupied(o) => o.get().to_owned(),
-            Entry::Vacant(v) => {
-                let node = PAGNode::new(path.clone());
-                let node_id = self.graph.add_node(node);
-                *v.insert(node_id)
-            }
+        if let Some(node) = self.values.get(path) {
+            return *node;
         }
+        let path = path.intern(&mut self.paths);
+        let node_id = self.graph.add_node(PAGNode::new(path.clone()));
+        self.values.insert(path, node_id);
+        node_id
+    }
+
+    pub(crate) fn release_edge_indexes(&mut self) {
+        self.direct_out_edges = EdgeMap::new();
+        self.load_out_edges = EdgeMap::new();
+        self.store_in_edges = EdgeMap::new();
+        self.gep_out_edges = EdgeMap::new();
+        self.cast_out_edges = EdgeMap::new();
+        self.offset_out_edges = EdgeMap::new();
+        self.paths = HashSet::new();
     }
 
     /// Returns true if the edge from `src` to `dst` of the `kind` exists.
@@ -251,102 +259,28 @@ impl<P: PAGPath> PAG<P> {
     }
 
     #[inline]
-    pub fn add_incoming_addr_edge(&mut self, node_id: PAGNodeId, in_edge: PAGEdgeId) {
-        self.addr_in_edges
-            .entry(node_id)
-            .or_default()
-            .insert(in_edge);
-    }
-    #[inline]
-    pub fn add_outgoing_addr_edge(&mut self, node_id: PAGNodeId, out_edge: PAGEdgeId) {
-        self.addr_out_edges
-            .entry(node_id)
-            .or_default()
-            .insert(out_edge);
-    }
-    #[inline]
-    pub fn add_incoming_direct_edge(&mut self, node_id: PAGNodeId, in_edge: PAGEdgeId) {
-        self.direct_in_edges
-            .entry(node_id)
-            .or_default()
-            .insert(in_edge);
-    }
-    #[inline]
     pub fn add_outgoing_direct_edge(&mut self, node_id: PAGNodeId, out_edge: PAGEdgeId) {
-        self.direct_out_edges
-            .entry(node_id)
-            .or_default()
-            .insert(out_edge);
-    }
-    #[inline]
-    pub fn add_incoming_load_edge(&mut self, node_id: PAGNodeId, in_edge: PAGEdgeId) {
-        self.load_in_edges
-            .entry(node_id)
-            .or_default()
-            .insert(in_edge);
+        insert_indexed_edge(&mut self.direct_out_edges, node_id, out_edge);
     }
     #[inline]
     pub fn add_outgoing_load_edge(&mut self, node_id: PAGNodeId, out_edge: PAGEdgeId) {
-        self.load_out_edges
-            .entry(node_id)
-            .or_default()
-            .insert(out_edge);
+        insert_indexed_edge(&mut self.load_out_edges, node_id, out_edge);
     }
     #[inline]
     pub fn add_incoming_store_edge(&mut self, node_id: PAGNodeId, in_edge: PAGEdgeId) {
-        self.store_in_edges
-            .entry(node_id)
-            .or_default()
-            .insert(in_edge);
-    }
-    #[inline]
-    pub fn add_outgoing_store_edge(&mut self, node_id: PAGNodeId, out_edge: PAGEdgeId) {
-        self.store_out_edges
-            .entry(node_id)
-            .or_default()
-            .insert(out_edge);
-    }
-    #[inline]
-    pub fn add_incoming_gep_edge(&mut self, node_id: PAGNodeId, in_edge: PAGEdgeId) {
-        self.gep_in_edges
-            .entry(node_id)
-            .or_default()
-            .insert(in_edge);
+        insert_indexed_edge(&mut self.store_in_edges, node_id, in_edge);
     }
     #[inline]
     pub fn add_outgoing_gep_edge(&mut self, node_id: PAGNodeId, out_edge: PAGEdgeId) {
-        self.gep_out_edges
-            .entry(node_id)
-            .or_default()
-            .insert(out_edge);
-    }
-    #[inline]
-    pub fn add_incoming_cast_edge(&mut self, node_id: PAGNodeId, in_edge: PAGEdgeId) {
-        self.cast_in_edges
-            .entry(node_id)
-            .or_default()
-            .insert(in_edge);
+        insert_indexed_edge(&mut self.gep_out_edges, node_id, out_edge);
     }
     #[inline]
     pub fn add_outgoing_cast_edge(&mut self, node_id: PAGNodeId, out_edge: PAGEdgeId) {
-        self.cast_out_edges
-            .entry(node_id)
-            .or_default()
-            .insert(out_edge);
-    }
-    #[inline]
-    pub fn add_incoming_offset_edge(&mut self, node_id: PAGNodeId, in_edge: PAGEdgeId) {
-        self.offset_in_edges
-            .entry(node_id)
-            .or_default()
-            .insert(in_edge);
+        insert_indexed_edge(&mut self.cast_out_edges, node_id, out_edge);
     }
     #[inline]
     pub fn add_outgoing_offset_edge(&mut self, node_id: PAGNodeId, out_edge: PAGEdgeId) {
-        self.offset_out_edges
-            .entry(node_id)
-            .or_default()
-            .insert(out_edge);
+        insert_indexed_edge(&mut self.offset_out_edges, node_id, out_edge);
     }
 
     /// Adds an edge from `src` to `dst` according to the edge type.
@@ -373,8 +307,6 @@ impl<P: PAGPath> PAG<P> {
             let edge_id = self.graph.add_edge(src_id, dst_id, edge);
             self.addr_edges_queue.push(edge_id);
 
-            self.add_outgoing_addr_edge(src_id, edge_id);
-            self.add_incoming_addr_edge(dst_id, edge_id);
 
             return Some(edge_id);
         }
@@ -391,7 +323,6 @@ impl<P: PAGPath> PAG<P> {
             let edge_id = self.graph.add_edge(src_id, dst_id, edge);
 
             self.add_outgoing_direct_edge(src_id, edge_id);
-            self.add_incoming_direct_edge(dst_id, edge_id);
 
             return Some(edge_id);
         }
@@ -406,7 +337,6 @@ impl<P: PAGPath> PAG<P> {
             let edge_id = self.graph.add_edge(src_id, dst_id, edge);
 
             self.add_outgoing_load_edge(src_id, edge_id);
-            self.add_incoming_load_edge(dst_id, edge_id);
             return Some(edge_id);
         }
         None
@@ -419,7 +349,6 @@ impl<P: PAGPath> PAG<P> {
             let edge = PAGEdge { kind };
             let edge_id = self.graph.add_edge(src_id, dst_id, edge);
 
-            self.add_outgoing_store_edge(src_id, edge_id);
             self.add_incoming_store_edge(dst_id, edge_id);
 
             return Some(edge_id);
@@ -435,7 +364,6 @@ impl<P: PAGPath> PAG<P> {
             let edge_id = self.graph.add_edge(src_id, dst_id, edge);
 
             self.add_outgoing_gep_edge(src_id, edge_id);
-            self.add_incoming_gep_edge(dst_id, edge_id);
 
             return Some(edge_id);
         }
@@ -452,7 +380,6 @@ impl<P: PAGPath> PAG<P> {
             let edge_id = self.graph.add_edge(src_id, dst_id, edge);
 
             self.add_outgoing_cast_edge(src_id, edge_id);
-            self.add_incoming_cast_edge(dst_id, edge_id);
 
             return Some(edge_id);
         }
@@ -469,7 +396,6 @@ impl<P: PAGPath> PAG<P> {
             let edge_id = self.graph.add_edge(src_id, dst_id, edge);
 
             self.add_outgoing_offset_edge(src_id, edge_id);
-            self.add_incoming_offset_edge(dst_id, edge_id);
 
             return Some(edge_id);
         }
@@ -647,10 +573,6 @@ impl<P: PAGPath> PAG<P> {
         acx: &mut AnalysisContext<'_, '_>,
         def_id: DefId,
     ) -> Option<FuncId> {
-        if !acx.tcx.is_mir_available(def_id) {
-            warn!("Unavailable mir for static: {:?}", def_id);
-            return None;
-        }
         let static_variable_ty = acx.tcx.type_of(def_id).skip_binder();
         if !static_variable_ty.is_any_ptr()
             && acx.get_value_projections(static_variable_ty).is_empty()
@@ -659,6 +581,33 @@ impl<P: PAGPath> PAG<P> {
         }
 
         let func_id = acx.get_func_id(def_id, acx.tcx.mk_args(&[]));
+        if !acx.tcx.is_mir_available(def_id) {
+            if !self.func_pags.contains_key(&func_id) {
+                let mut fpag = FuncPAG::new(func_id);
+                let path = crate::mir::path::Path::new_static_variable(def_id);
+                acx.set_path_rustc_type(path.clone(), static_variable_ty);
+                match acx.tcx.eval_static_initializer(def_id) {
+                    Ok(allocation) => fpag.add_constant_allocation(
+                        acx, path, static_variable_ty, allocation, rustc_abi::Size::ZERO,
+                    ),
+                    Err(_) => {
+                        acx.value_unknown_paths.insert(path);
+                        acx.coverage_gaps.insert((func_id, None,
+                            "static initializer is unavailable".into()));
+                    }
+                }
+                let statics: Vec<_> = fpag.static_variables_involved.iter().cloned().collect();
+                self.func_pags.insert(func_id, fpag);
+                for path in statics {
+                    if let PathEnum::StaticVariable { def_id } = path.value
+                        && let Some(target) = self.build_static_pag(acx, def_id)
+                    {
+                        self.involved_static_funcs_map.entry(func_id).or_default().insert(target);
+                    }
+                }
+            }
+            return Some(func_id);
+        }
         if !self.func_pags.contains_key(&func_id) {
             // Build function pags for promoted functions
             if let Some(promoted_funcs) = self.promote_constants(acx, def_id, &vec![]) {
@@ -780,8 +729,11 @@ where
             }
             if !target_ty.is_any_ptr() {
                 if !acx.get_pointer_projections(target_ty).is_empty() {
-                    acx.coverage_gaps.insert((callsite.func.into(), Some(callsite.location),
-                        "call value has an unmatched aggregate pointer field".into()));
+                    acx.unmodeled_flows.insert(format!(
+                        "call value has an unmatched aggregate pointer field at {:?}: {source_ty:?} -> {destination_ty:?} {target:?}",
+                        callsite.location));
+                    target.set_path_rustc_type(acx, target_ty);
+                    self.get_or_insert_node(&target);
                     acx.unmodeled_paths.insert(std::rc::Rc::new(crate::mir::path::Path {
                         value: target.value().clone(),
                     }));
@@ -801,11 +753,28 @@ where
                 } else {
                     self.add_cast_edge(origin, &target)
                 };
+                if origin_ty.is_raw_ptr() && crate::util::type_util::get_dereferenced_type(*origin_ty).is_unit() && target_ty.is_ref() {
+                    let caller = acx.get_function_reference(callsite.func.into());
+                    if callsite.args.first().is_some_and(|argument| argument == source)
+                        && acx.tcx.opt_item_name(caller.def_id).is_some_and(|name| name.as_str() == "fmt")
+                    {
+                        let receiver = P::new_parameter(callsite.func, 1).try_eval_path_type(acx);
+                        if let rustc_middle::ty::Ref(_, receiver, _) = receiver.kind()
+                            && let rustc_middle::ty::Adt(definition, _) = receiver.kind()
+                            && acx.tcx.lang_items().format_argument() == Some(definition.did())
+                        {
+                            self.format_bindings.extend(edge);
+                        }
+                    }
+                }
                 added.extend(edge);
             }
             if !matched && !source_ty.is_never() {
-                acx.coverage_gaps.insert((callsite.func.into(), Some(callsite.location),
-                    "call value has an unmatched pointer field".into()));
+                acx.unmodeled_flows.insert(format!(
+                    "call value has an unmatched pointer field at {:?}: {source_ty:?} -> {destination_ty:?} {target:?}",
+                    callsite.location));
+                target.set_path_rustc_type(acx, target_ty);
+                self.get_or_insert_node(&target);
                 acx.unmodeled_paths.insert(std::rc::Rc::new(crate::mir::path::Path {
                     value: target.value().clone(),
                 }));

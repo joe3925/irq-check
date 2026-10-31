@@ -1,4 +1,5 @@
 use crate::trust::Trust;
+use irq_check_rupta::graph::pag::PAGPath;
 use irq_check_rupta::mir::function::GenericArgE;
 use irq_check_rupta::pta::PointerAnalysis;
 use irq_check_rupta::pts_set::points_to::PointsToSet;
@@ -90,9 +91,11 @@ impl<'tcx> GlobalPointers<'tcx> {
                         || matches!(
                             tcx.def_kind(instance.def_id()),
                             rustc_hir::def::DefKind::Fn | rustc_hir::def::DefKind::AssocFn
-                        ) && tcx
+                        ) && (tcx
                             .codegen_fn_attrs(instance.def_id())
                             .contains_extern_indicator()
+                            || !tcx.fn_sig(instance.def_id()).instantiate(tcx, instance.args)
+                                .skip_binder().abi().is_rustic_abi())
                             && tcx.lang_items().panic_impl() != Some(instance.def_id())
                             && !(tcx.codegen_fn_attrs(instance.def_id()).flags.contains(
                                 rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags::RUSTC_STD_INTERNAL_SYMBOL)
@@ -324,6 +327,7 @@ impl<'tcx> GlobalPointers<'tcx> {
         let mut candidates = HashMap::<_, HashSet<_>>::new();
         for sites in backend.call_sites.values() {
             for site in sites {
+                if backend.callback_contexts.contains(&site.func.cid) { continue; }
                 let Some(&caller) = instances.get(&site.func.func_id) else {
                     continue;
                 };
@@ -451,20 +455,91 @@ impl<'tcx> GlobalPointers<'tcx> {
                 }
             }
             let mut path_groups = HashMap::<_, Vec<_>>::new();
-            for ((_, path), &group) in &groups {
+            let mut group_contexts = vec![None; groups.len()];
+            for ((context, path), &group) in &groups {
                 path_groups.entry(path.clone()).or_default().push(group);
+                group_contexts[group] = Some(*context);
+            }
+            let mut storage_overlaps = vec![Vec::new(); groups.len()];
+            for (left, right) in &backend.acx.storage_overlaps {
+                if let (Some(left), Some(right)) = (path_groups.get(left), path_groups.get(right)) {
+                    for &left in left {
+                        for &right in right {
+                            if group_contexts[left] == group_contexts[right] {
+                                storage_overlaps[left].push(right);
+                                storage_overlaps[right].push(left);
+                            }
+                        }
+                    }
+                }
             }
             let mut uses = vec![Vec::new(); groups.len() * 2];
+            for (group, overlaps) in storage_overlaps.iter().enumerate() {
+                for &overlap in overlaps {
+                    uses[group * 2].push(overlap * 2);
+                    uses[group * 2 + 1].push(overlap * 2 + 1);
+                }
+            }
+            let mut children = vec![Vec::new(); groups.len()];
+            let mut parents = vec![None; groups.len()];
+            let mut pointee_groups = vec![Vec::new(); groups.len()];
+            let mut escaping = Vec::new();
+            let mut escaping_calls = HashMap::<_, Vec<_>>::new();
+            let mut escaping_stores = HashMap::<_, Vec<_>>::new();
+            let mut callable_functions = HashSet::new();
+            let mut function_objects = HashMap::new();
+            let unavailable_functions: HashSet<_> = backend.acx.coverage_gaps.iter()
+                .filter(|gap| gap.1.is_none() && !covered(gap)).map(|gap| gap.0).collect();
+            let analyzed_functions: HashSet<_> = backend.call_graph.func_nodes.keys()
+                .map(|function| function.func_id)
+                .filter(|function| !unavailable_functions.contains(function)).collect();
+            let mut opaque_objects = HashMap::new();
+            for node in backend.pag.graph().node_indices() {
+                let group = node_groups[node.index()];
+                if let PathEnum::Function(function) = backend.pag.node_path(node).path.value {
+                    function_objects.insert(group, function);
+                    if !analyzed_functions.contains(&function) {
+                        opaque_objects.insert(group, format!("escaped callback has no analyzed body: {}",
+                            backend.acx.get_function_reference(function).to_string()));
+                    }
+                } else if matches!(backend.pag.node_path(node).path.value, PathEnum::Type(_)) {
+                    opaque_objects.insert(group, format!("escaped type has no concrete allocation: {:?}",
+                        backend.pag.node_path(node).path));
+                }
+                if let Some(points) = backend.get_pt_data().get_propa_pts(node) {
+                    pointee_groups[group].extend(points.iter().map(|target| node_groups[target.index()]));
+                }
+            }
+            for sites in backend.assoc_calls.dynamic_dispatch_calls.values()
+                .chain(backend.assoc_calls.dynamic_fntrait_calls.values())
+            {
+                for site in sites {
+                    callable_functions.extend(backend.call_graph.get_callees(&site.into())
+                        .iter().map(|callee| callee.func_id));
+                }
+            }
+            for points in &mut pointee_groups {
+                points.sort_unstable();
+                points.dedup();
+            }
             for ((context, path), &group) in &groups {
                 if let PathEnum::QualifiedPath { base, .. } | PathEnum::OffsetPath { base, .. } =
                     &path.value
                 {
                     let parent = groups[&(*context, base.clone())];
+                    children[parent].push(group);
+                    parents[group] = Some(parent);
                     uses[parent * 2].push(group * 2);
                     uses[parent * 2 + 1].push(group * 2 + 1);
                 }
             }
             let mut pending = Vec::new();
+            let mut seed_kinds = vec![0u16; groups.len()];
+            let mut seed_cursor = 0;
+            let mut record_seeds = |pending: &[usize], kind: u16| {
+                for &group in &pending[seed_cursor..] { seed_kinds[group] |= kind; }
+                seed_cursor = pending.len();
+            };
             let mut no_provenance = HashSet::new();
             let mut value_uses = HashMap::<_, Vec<_>>::new();
             let mut no_provenance_pending = Vec::new();
@@ -505,6 +580,7 @@ impl<'tcx> GlobalPointers<'tcx> {
                 }
                 no_provenance_pending.extend(value_uses.get(&node).into_iter().flatten().copied());
             }
+            record_seeds(&pending, 1);
             let mut offset_nodes = HashSet::new();
             let mut offset_pending: Vec<_> = backend
                 .pag
@@ -546,23 +622,51 @@ impl<'tcx> GlobalPointers<'tcx> {
             drop(value_uses);
             let mut memory = HashSet::new();
             let mut parameters = HashSet::new();
+            let mut callback_parameters = HashMap::<_, Vec<_>>::new();
+            let mut callback_returns = HashMap::<_, Vec<_>>::new();
             let mut write_addresses = HashSet::new();
             let mut call_receivers = HashSet::new();
             let mut unknown_memory = !backend.acx.forbidden_externals.is_empty();
             let mut unknown_calls = !backend.acx.forbidden_externals.is_empty();
             let mut gap_functions = HashSet::new();
             let mut gap_sites = HashSet::new();
+            let mut escape_gaps = HashSet::new();
             let root_instances: HashSet<_> = ordered.iter().copied().collect();
-            for ((_, path), &group) in &groups {
+            for ((context, path), &group) in &groups {
                 match path.value {
                     PathEnum::Parameter { func_id, .. } => {
-                        parameters.insert(group);
-                        if instances
-                            .get(&func_id)
-                            .is_none_or(|instance| root_instances.contains(instance))
-                        {
-                            pending.push(group);
+                        let external_root = instances.get(&func_id)
+                            .is_none_or(|instance| root_instances.contains(instance));
+                        let entry_context = if backend.callback_contexts.contains(context) {
+                            backend.acx.callback_roots.contains(&func_id)
+                        } else {
+                            backend.get_context_by_id(*context).len() == 0
+                        };
+                        if entry_context || !(external_root || backend.acx.callback_roots.contains(&func_id)) {
+                            callback_parameters.entry(func_id).or_default().push(group);
                         }
+                        if callable_functions.contains(&func_id) && (!external_root || entry_context) {
+                            parameters.insert(group);
+                        }
+                        if external_root && entry_context {
+                            complete = false;
+                            call_complete = false;
+                            pending.push(group);
+                            escaping.push((group, false));
+                        }
+                    }
+                    PathEnum::ReturnValue { func_id } => {
+                        let external_root = instances.get(&func_id)
+                            .is_none_or(|instance| root_instances.contains(instance));
+                        let entry_context = if backend.callback_contexts.contains(context) {
+                            backend.acx.callback_roots.contains(&func_id)
+                        } else {
+                            backend.get_context_by_id(*context).len() == 0
+                        };
+                        if entry_context || !(external_root || backend.acx.callback_roots.contains(&func_id)) {
+                            callback_returns.entry(func_id).or_default().push(group);
+                        }
+                        if external_root && entry_context { escaping.push((group, false)); }
                     }
                     PathEnum::HeapObj { .. }
                     | PathEnum::StaticVariable { .. }
@@ -570,10 +674,16 @@ impl<'tcx> GlobalPointers<'tcx> {
                     | PathEnum::PromotedStrRefArray
                     | PathEnum::PromotedArgumentV1Array => {
                         memory.insert(group);
+                        if let PathEnum::StaticVariable { def_id } = path.value
+                            && tcx.codegen_fn_attrs(def_id).contains_extern_indicator()
+                        {
+                            escaping.push((group, true));
+                        }
                     }
                     _ => {}
                 }
             }
+            record_seeds(&pending, 2);
             for path in &backend.acx.unmodeled_paths {
                 let mut affected = path;
                 while !path_groups.contains_key(affected) {
@@ -585,10 +695,13 @@ impl<'tcx> GlobalPointers<'tcx> {
                 if let Some(groups) = path_groups.get(affected) {
                     pending.extend(groups.iter().copied());
                 } else {
+                    escape_gaps.insert(format!("unmodeled storage has no graph node: {path:?}"));
+                    escaping.extend(memory.iter().map(|&group| (group, true)));
                     unknown_memory = true;
                     unknown_calls = true;
                 }
             }
+            record_seeds(&pending, 4);
             let mut integer_groups = HashSet::new();
             let mut function_groups = HashSet::new();
             for node in backend.pag.graph().node_indices() {
@@ -638,16 +751,12 @@ impl<'tcx> GlobalPointers<'tcx> {
                     }
                 }
             }
+            record_seeds(&pending, 8);
             for gap in &backend.acx.coverage_gaps {
                 if covered(gap) {
                     continue;
                 }
                 let (function, location, _) = gap;
-                if let Some(location) = location {
-                    gap_sites.insert((*function, *location));
-                } else {
-                    gap_functions.insert(*function);
-                }
                 if let Some(instance) = instances
                     .get(function)
                     .filter(|instance| matches!(instance.def, ty::InstanceKind::Intrinsic(_)))
@@ -702,6 +811,11 @@ impl<'tcx> GlobalPointers<'tcx> {
                         continue;
                     }
                 }
+                if let Some(location) = location {
+                    gap_sites.insert((*function, *location));
+                } else {
+                    gap_functions.insert(*function);
+                }
                 let body = instances.get(function).and_then(|instance| {
                     if matches!(
                         instance.def,
@@ -722,6 +836,26 @@ impl<'tcx> GlobalPointers<'tcx> {
                     {
                         if let StatementKind::Assign(assignment) = &statement.kind {
                             let place = assignment.0;
+                            if let rustc_middle::mir::Rvalue::Cast(
+                                rustc_middle::mir::CastKind::PointerExposeProvenance, operand, _
+                            ) = &assignment.1
+                            {
+                                if let Some(source) = operand.place() {
+                                    let source = Path::new_local_parameter_or_result(
+                                        *function, source.local.as_usize(), body.arg_count);
+                                    if let Some(groups) = path_groups.get(&source) {
+                                        escaping.extend(groups.iter().map(|&group| (group, false)));
+                                    } else {
+                                        escape_gaps.insert(format!("exposed pointer has no graph node in {:?}: {source:?}",
+                                            instances.get(function)));
+                                        escaping.extend(memory.iter().map(|&group| (group, true)));
+                                    }
+                                } else {
+                                    escape_gaps.insert(format!("exposed pointer is constant in {:?}: {operand:?}",
+                                        instances.get(function)));
+                                    escaping.extend(memory.iter().map(|&group| (group, true)));
+                                }
+                            }
                             let path = Path::new_local_parameter_or_result(
                                 *function,
                                 place.local.as_usize(),
@@ -729,6 +863,11 @@ impl<'tcx> GlobalPointers<'tcx> {
                             );
                             if let Some(groups) = path_groups.get(&path) {
                                 pending.extend(groups.iter().copied());
+                                if place.is_indirect() {
+                                    for &group in groups {
+                                        pending.extend(pointee_groups[group].iter().copied());
+                                    }
+                                }
                             }
                             if place.is_indirect() {
                                 unknown_memory = true;
@@ -741,6 +880,24 @@ impl<'tcx> GlobalPointers<'tcx> {
                     } = &body.basic_blocks[location.block].terminator().kind
                     {
                         for operand in operands {
+                            let input = match operand {
+                                rustc_middle::mir::InlineAsmOperand::In { value, .. }
+                                | rustc_middle::mir::InlineAsmOperand::InOut { in_value: value, .. } => value.place(),
+                                _ => None,
+                            };
+                            if let Some(place) = input {
+                                let path = Path::new_local_parameter_or_result(
+                                    *function, place.local.as_usize(), body.arg_count);
+                                if let Some(groups) = path_groups.get(&path) {
+                                    escaping.extend(groups.iter().map(|&group| (group, false)));
+                                }
+                            }
+                            if let rustc_middle::mir::InlineAsmOperand::SymStatic { def_id } = operand {
+                                let path = Path::new_static_variable(*def_id);
+                                if let Some(groups) = path_groups.get(&path) {
+                                    escaping.extend(groups.iter().map(|&group| (group, true)));
+                                }
+                            }
                             let place = match operand {
                                 rustc_middle::mir::InlineAsmOperand::Out { place, .. } => *place,
                                 rustc_middle::mir::InlineAsmOperand::InOut {
@@ -776,11 +933,13 @@ impl<'tcx> GlobalPointers<'tcx> {
                         | PathEnum::ReturnValue { func_id } | PathEnum::Auxiliary { func_id, .. } if func_id == *function)
                     {
                         pending.push(group);
+                        escaping.push((group, false));
                     }
                 }
                 unknown_memory = true;
                 unknown_calls = true;
             }
+            record_seeds(&pending, 16);
             for edge in backend.pag.graph().edge_indices() {
                 if !irq_check_rupta::limits::checkpoint() {
                     break;
@@ -847,6 +1006,7 @@ impl<'tcx> GlobalPointers<'tcx> {
                     }
                     PAGEdgeEnum::StorePAGEdge(_) => {
                         write_addresses.insert(to);
+                        escaping_stores.entry(to).or_default().push(from);
                         if offset_nodes.contains(&destination)
                             && let Some(points) = backend.get_pt_data().get_propa_pts(destination)
                         {
@@ -862,10 +1022,12 @@ impl<'tcx> GlobalPointers<'tcx> {
                             && !no_provenance.contains(&destination)
                         {
                             unknown_memory = true;
+                            escaping.push((from, false));
                         }
                     }
                 }
             }
+            record_seeds(&pending, 32);
             for node in backend.pag.graph().node_indices() {
                 let Some(projections) = scalar_writes.get(&backend.pag.node_path(node).path) else {
                     continue;
@@ -888,6 +1050,14 @@ impl<'tcx> GlobalPointers<'tcx> {
                             );
                             if let Some(&group) = groups.get(&(backend.pag.node_path(target).cid, stored)) {
                                 pending.push(group);
+                                let mut overlapping = storage_overlaps[group].clone();
+                                let mut seen = HashSet::new();
+                                while let Some(overlap) = overlapping.pop() {
+                                    if seen.insert(overlap) {
+                                        pending.push(overlap);
+                                        overlapping.extend(storage_overlaps[overlap].iter().copied());
+                                    }
+                                }
                             }
                         }
                     }
@@ -895,6 +1065,7 @@ impl<'tcx> GlobalPointers<'tcx> {
                     unknown_memory = true;
                 }
             }
+            record_seeds(&pending, 64);
             let mut receivers = HashMap::<_, HashSet<_>>::new();
             for (node, sites) in backend
                 .assoc_calls
@@ -910,6 +1081,9 @@ impl<'tcx> GlobalPointers<'tcx> {
                     pending.push(group);
                 }
                 for site in sites {
+                    escaping_calls.entry(group).or_default().extend(site.args.iter()
+                        .filter_map(|path| backend.pag.get_node_id(path))
+                        .map(|node| node_groups[node.index()]));
                     receivers
                         .entry((site.func, site.location))
                         .or_default()
@@ -920,9 +1094,18 @@ impl<'tcx> GlobalPointers<'tcx> {
                     }
                 }
             }
+            record_seeds(&pending, 128);
             for sites in backend.call_sites.values() {
                 for site in sites {
-                    if backend.call_graph.get_callees(&site.into()).is_empty() {
+                    if (backend.call_graph.get_callees(&site.into()).is_empty()
+                        && !receivers.contains_key(&(site.func, site.location)))
+                        || backend.call_graph.get_callees(&site.into()).iter()
+                            .any(|callee| gap_functions.contains(&callee.func_id)
+                                || backend.acx.forbidden_externals.contains(&callee.func_id))
+                    {
+                        escaping.extend(site.args.iter()
+                            .filter_map(|path| backend.pag.get_node_id(path))
+                            .map(|node| (node_groups[node.index()], false)));
                         unknown_memory = true;
                         unknown_calls = true;
                         if let Some(destination) = backend.pag.get_node_id(&site.destination) {
@@ -931,6 +1114,7 @@ impl<'tcx> GlobalPointers<'tcx> {
                     }
                 }
             }
+            record_seeds(&pending, 256);
             for edges in &mut uses {
                 edges.sort_unstable();
                 edges.dedup();
@@ -940,20 +1124,106 @@ impl<'tcx> GlobalPointers<'tcx> {
                 .flat_map(|group| [group * 2, group * 2 + 1])
                 .collect();
             let mut unknown = vec![false; uses.len()];
+            let mut origins = vec![usize::MAX; uses.len()];
+            for &group in &pending { origins[group] = group; }
             let mut memory_invalidated = false;
             let mut parameters_invalidated = false;
+            let immutable: HashSet<_> = groups.iter().filter_map(|((_, path), &group)| {
+                let base = base_path(path);
+                let PathEnum::StaticVariable { def_id } = base.value else { return None; };
+                (!tcx.is_foreign_item(def_id) && !tcx.is_mutable_static(def_id)
+                    && tcx.type_of(def_id).skip_binder().is_freeze(tcx, ty::TypingEnv::fully_monomorphized()))
+                    .then_some(group)
+            }).collect();
+            let mut escaped = vec![false; groups.len()];
+            let mut exposed_values = vec![false; groups.len()];
+            let mut escape_origins = vec![usize::MAX; groups.len() * 2];
+            let record_escape = |queue: &mut Vec<(usize, bool)>, origins: &mut [usize],
+                from: usize, group: usize, storage: bool| {
+                let value = group * 2 + usize::from(storage);
+                if origins[value] == usize::MAX { origins[value] = from; }
+                queue.push((group, storage));
+            };
+            let mut opaque_callback = false;
+            let mut exposed_functions = HashSet::new();
             loop {
+                while let Some((group, storage)) = escaping.pop() {
+                    if !irq_check_rupta::limits::checkpoint() { break; }
+                    let origin = group * 2 + usize::from(storage);
+                    if escape_origins[origin] == usize::MAX { escape_origins[origin] = origin; }
+                    if storage {
+                        if std::mem::replace(&mut escaped[group], true) { continue; }
+                        if let Some(&function) = function_objects.get(&group)
+                            && exposed_functions.insert(function)
+                        {
+                            if callback_parameters.get(&function).is_some_and(|parameters| !parameters.is_empty()) {
+                                complete = false;
+                                call_complete = false;
+                            }
+                            for &parameter in callback_parameters.get(&function).into_iter().flatten() {
+                                seed_kinds[parameter] |= 1024;
+                                for value in [parameter * 2, parameter * 2 + 1] {
+                                    if origins[value] == usize::MAX { origins[value] = value; }
+                                    pending.push(value);
+                                }
+                                record_escape(&mut escaping, &mut escape_origins, origin, parameter, false);
+                            }
+                            for &returned in callback_returns.get(&function).into_iter().flatten() {
+                                record_escape(&mut escaping, &mut escape_origins, origin, returned, false);
+                            }
+                        }
+                        if let Some(reason) = opaque_objects.get(&group) {
+                            escape_gaps.insert(reason.clone());
+                            if !opaque_callback {
+                                opaque_callback = true;
+                                escaping.extend(memory.iter().map(|&group| (group, true)));
+                            }
+                        }
+                        if let Some(parent) = parents[group] {
+                            record_escape(&mut escaping, &mut escape_origins, origin, parent, true);
+                        }
+                        for &child in &children[group] {
+                            record_escape(&mut escaping, &mut escape_origins, origin, child, true);
+                        }
+                        for &overlap in &storage_overlaps[group] {
+                            record_escape(&mut escaping, &mut escape_origins, origin, overlap, true);
+                        }
+                        if memory_invalidated && !immutable.contains(&group) {
+                            seed_kinds[group] |= 512;
+                            for value in [group * 2, group * 2 + 1] {
+                                if origins[value] == usize::MAX { origins[value] = value; }
+                                pending.push(value);
+                            }
+                        }
+                    } else if std::mem::replace(&mut exposed_values[group], true) {
+                        continue;
+                    } else {
+                        for &child in &children[group] {
+                            record_escape(&mut escaping, &mut escape_origins, origin, child, false);
+                        }
+                    }
+                    for &target in &pointee_groups[group] {
+                        record_escape(&mut escaping, &mut escape_origins, origin, target, true);
+                    }
+                }
                 if unknown_calls && !parameters_invalidated {
                     parameters_invalidated = true;
-                    pending.extend(
-                        parameters
-                            .iter()
-                            .flat_map(|group| [group * 2, group * 2 + 1]),
-                    );
+                    for value in parameters.iter().flat_map(|group| [group * 2, group * 2 + 1]) {
+                        seed_kinds[value / 2] |= 1024;
+                        if origins[value] == usize::MAX { origins[value] = value; }
+                        pending.push(value);
+                    }
                 }
                 if (unknown_memory || unknown_calls) && !memory_invalidated {
                     memory_invalidated = true;
-                    pending.extend(memory.iter().flat_map(|group| [group * 2, group * 2 + 1]));
+                    for value in escaped.iter().enumerate()
+                        .filter(|(group, escaped)| **escaped && !immutable.contains(group))
+                        .flat_map(|(group, _)| [group * 2, group * 2 + 1])
+                    {
+                        seed_kinds[value / 2] |= 512;
+                        if origins[value] == usize::MAX { origins[value] = value; }
+                        pending.push(value);
+                    }
                 }
                 let Some(group) = pending.pop() else { break };
                 if !irq_check_rupta::limits::checkpoint() {
@@ -965,20 +1235,39 @@ impl<'tcx> GlobalPointers<'tcx> {
                 if integer_groups.contains(&(group / 2)) {
                     for &next in integer_uses.get(&(group / 2)).into_iter().flatten() {
                         for next in [next * 2, next * 2 + 1] {
+                            if origins[next] == usize::MAX { origins[next] = group; }
                             pending.push(next);
                         }
                     }
                     continue;
                 }
-                unknown_memory |= group % 2 == 0 && write_addresses.contains(&(group / 2));
-                unknown_calls |= group % 2 == 1 && call_receivers.contains(&(group / 2));
-                pending.extend(uses[group].iter().copied());
+                if group % 2 == 0 && write_addresses.contains(&(group / 2)) {
+                    unknown_memory = true;
+                    for &target in &pointee_groups[group / 2] {
+                        for next in [target * 2, target * 2 + 1] {
+                            if origins[next] == usize::MAX { origins[next] = group; }
+                            pending.push(next);
+                        }
+                    }
+                    escaping.extend(escaping_stores.get(&(group / 2)).into_iter().flatten()
+                        .map(|&source| (source, false)));
+                }
+                if group % 2 == 1 && call_receivers.contains(&(group / 2)) {
+                    unknown_calls = true;
+                    escaping.extend(escaping_calls.get(&(group / 2)).into_iter().flatten()
+                        .map(|&argument| (argument, false)));
+                }
+                for &next in &uses[group] {
+                    if origins[next] == usize::MAX { origins[next] = group; }
+                    pending.push(next);
+                }
             }
             let mut covered_calls = HashSet::new();
             let mut context_coverage = HashSet::new();
             let mut uncovered_calls = HashSet::new();
             for sites in backend.call_sites.values() {
                 for site in sites {
+                    if backend.callback_contexts.contains(&site.func.cid) { continue; }
                     let Some(&instance) = instances.get(&site.func.func_id) else {
                         continue;
                     };
@@ -1023,24 +1312,88 @@ impl<'tcx> GlobalPointers<'tcx> {
                     })
                     .count();
                 eprintln!(
-                    "irq-check: local pointer coverage covered_calls={} covered_indirect_calls={indirect} uncertain_nodes={} total_nodes={} unknown_memory={memory_invalidated} unknown_calls={parameters_invalidated}",
+                    "irq-check: local pointer coverage covered_calls={} covered_indirect_calls={indirect} uncertain_nodes={} total_nodes={} unknown_memory={memory_invalidated} unknown_calls={parameters_invalidated} escaped_groups={}",
                     covered_calls.len(),
                     uncertain_nodes.len(),
-                    node_groups.len()
+                    node_groups.len(),
+                    escaped.iter().filter(|escaped| **escaped).count()
                 );
             }
             if let Some(directory) = crate::reporting::configuration().directory.as_ref() {
+                let mut group_paths = vec![None; groups.len()];
+                for ((_, path), &group) in &groups { group_paths[group] = Some(path); }
                 let mut evidence: Vec<_> = receivers
                     .iter()
                     .filter_map(|((function, location), groups)| {
+                        if backend.callback_contexts.contains(&function.cid) { return None; }
                         let instance = instances.get(&function.func_id)?;
+                        let mut targets: Vec<_> = candidates.get(&(*instance, *location))
+                            .into_iter().flatten().map(ToString::to_string).collect();
+                        targets.sort_unstable();
+                        let mut causes = Vec::new();
+                        if let Some(&group) = groups.iter().find(|&&group| unknown[group * 2 + 1]) {
+                            let mut value = group * 2 + 1;
+                            let mut seen = HashSet::new();
+                            while value != usize::MAX && seen.insert(value) && causes.len() < 24 {
+                                if let Some(path) = group_paths[value / 2] {
+                                    let base = base_path(path);
+                                    let owner = match base.value {
+                                        PathEnum::Parameter { func_id, .. } | PathEnum::LocalVariable { func_id, .. }
+                                        | PathEnum::ReturnValue { func_id } | PathEnum::Auxiliary { func_id, .. }
+                                        | PathEnum::HeapObj { func_id, .. } => instances.get(&func_id).map(ToString::to_string),
+                                        _ => None,
+                                    };
+                                    let seeds: Vec<_> = [
+                                        "no-provenance", "external-input", "unmodeled-storage",
+                                        "unmodeled-value", "unmodeled-operation", "indirect-memory",
+                                        "scalar-write", "offset-call", "opaque-call-result",
+                                        "escaped-memory", "callback-input",
+                                    ].into_iter().enumerate().filter_map(|(bit, name)|
+                                        (seed_kinds[value / 2] & (1 << bit) != 0).then_some(name)).collect();
+                                    causes.push(format!("{path:?} context={:?} {} seeds={seeds:?}",
+                                        group_contexts[value / 2], owner.unwrap_or_default()));
+                                    if origins[value] == value && seed_kinds[value / 2] & 512 != 0 {
+                                        let mut escape = value / 2 * 2 + 1;
+                                        let mut escaped_seen = HashSet::new();
+                                        while escape != usize::MAX && escaped_seen.insert(escape) && causes.len() < 48 {
+                                            if let Some(path) = group_paths[escape / 2] {
+                                                let owner = base_path(path).get_containing_func()
+                                                    .and_then(|function| instances.get(&function)).map(ToString::to_string);
+                                                causes.push(format!("escape {}: {path:?} context={:?} {}",
+                                                    if escape % 2 == 1 { "storage" } else { "value" },
+                                                    group_contexts[escape / 2], owner.unwrap_or_default()));
+                                            }
+                                            escape = escape_origins[escape];
+                                        }
+                                    }
+                                }
+                                value = origins[value];
+                            }
+                        }
                         Some(format!(
-                            "{instance} at {location:?}: covered={} unknown_receiver={}",
+                            "{instance} at {location:?}: covered={} unknown_receiver={} targets={targets:?} causes={causes:?}",
                             covered_calls.contains(&(*instance, *location)),
                             groups.iter().any(|group| unknown[*group * 2 + 1])
                         ))
                     })
                     .collect();
+                for (&group, reason) in &opaque_objects {
+                    if !escaped[group] { continue; }
+                    let mut escape = group * 2 + 1;
+                    let mut seen = HashSet::new();
+                    let mut causes = Vec::new();
+                    while escape != usize::MAX && seen.insert(escape) && causes.len() < 32 {
+                        if let Some(path) = group_paths[escape / 2] {
+                            let owner = base_path(path).get_containing_func()
+                                .and_then(|function| instances.get(&function)).map(ToString::to_string);
+                            causes.push(format!("{path:?} context={:?} {}",
+                                group_contexts[escape / 2], owner.unwrap_or_default()));
+                        }
+                        escape = escape_origins[escape];
+                    }
+                    evidence.push(format!("escape trace: {reason} causes={causes:?}"));
+                }
+                evidence.extend(escape_gaps.into_iter().map(|gap| format!("escape limitation: {gap}")));
                 evidence.sort_unstable();
                 let directory = std::path::PathBuf::from(directory);
                 if let Err(error) = std::fs::create_dir_all(&directory).and_then(|_| {
@@ -1067,6 +1420,7 @@ impl<'tcx> GlobalPointers<'tcx> {
             use irq_check_rupta::mir::path::{PathEnum, PathSelector};
             let cx = ty::layout::LayoutCx::new(tcx, ty::TypingEnv::fully_monomorphized());
             for node in backend.pag.graph().node_indices() {
+                if backend.callback_contexts.contains(&backend.pag.node_path(node).cid) { continue; }
                 if !irq_check_rupta::limits::checkpoint() {
                     break;
                 }
@@ -1991,6 +2345,7 @@ impl<'tcx> GlobalPointers<'tcx> {
         let mut instance_contexts = HashMap::<_, Vec<_>>::new();
         let mut context_nodes = HashMap::new();
         for (function, node) in &backend.call_graph.func_nodes {
+            if backend.callback_contexts.contains(&function.cid) { continue; }
             if let Some(&instance) = instances.get(&function.func_id) {
                 instance_contexts.entry(instance).or_default().push(node.index());
                 context_nodes.insert(node.index(), instance);
@@ -2000,6 +2355,7 @@ impl<'tcx> GlobalPointers<'tcx> {
         let mut context_bindings = HashMap::<_, Vec<_>>::new();
         for sites in backend.call_sites.values() {
             for site in sites {
+                if backend.callback_contexts.contains(&site.func.cid) { continue; }
                 if !instances.contains_key(&site.func.func_id) { continue; }
                 let Some(node) = backend.call_graph.func_nodes.get(&site.func) else { continue; };
                 if !context_coverage.contains(&(node.index(), site.location)) { continue; }

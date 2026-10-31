@@ -17,7 +17,7 @@ use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
 use rustc_index::IndexVec;
 use rustc_middle::mir;
-use rustc_middle::mir::interpret::{AllocRange, GlobalAlloc, Scalar};
+use rustc_middle::mir::interpret::{GlobalAlloc, Scalar};
 use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty;
 use rustc_middle::ty::{Const, Ty, TyCtxt, TyKind, GenericArgsRef};
@@ -463,6 +463,13 @@ let gen_args = &self.tcx().instantiate_bound_regions_with_erased(*gen_args);
                         self.resolve_call(callee_def_id, gen_args, args, destination, location)
                     }
                     TyKind::FnPtr(..) => {
+                        let fn_item = if fn_item.is_deref_path() {
+                            let loaded = self.create_aux_local(fn_item_ty);
+                            self.add_load_edge(fn_item, loaded.clone());
+                            loaded
+                        } else {
+                            fn_item
+                        };
                         let args = self.visit_args(args);
                         let destination = self.get_path_for_place(destination);
                         let callsite = self.new_callsite(self.func_id, location, args, destination);
@@ -722,7 +729,7 @@ let gen_args = &self.tcx().instantiate_bound_regions_with_erased(*gen_args);
                         self.add_addr_edge(function, pointer.clone());
                         pointer
                     }
-                    Some(GlobalAlloc::Memory(_alloc)) => {
+                    Some(GlobalAlloc::Memory(allocation)) => {
                         let aux = self.create_aux_local(ty);
                         if let Some(pointee) = ty.builtin_deref(true).filter(|pointee|
                             !pointee.is_any_ptr() && type_util::get_pointer_projections(self.tcx(), *pointee).is_empty()) {
@@ -730,6 +737,16 @@ let gen_args = &self.tcx().instantiate_bound_regions_with_erased(*gen_args);
                             if !self.acx.get_value_projections(pointee).is_empty() {
                                 self.acx.value_unknown_paths.insert(storage.clone());
                             }
+                            self.add_addr_edge(storage, aux.clone());
+                        } else if let Some(pointee) = ty.builtin_deref(true)
+                            && self.tcx().layout_of(ty::TypingEnv::fully_monomorphized().as_query_input(pointee))
+                                .is_ok_and(|layout| layout.is_sized())
+                        {
+                            let storage = self.create_aux_local(pointee);
+                            self.fpag.add_constant_allocation(
+                                self.acx, storage.clone(), pointee, allocation,
+                                ptr.prov_and_relative_offset().1,
+                            );
                             self.add_addr_edge(storage, aux.clone());
                         } else {
                             self.acx.coverage_gaps.insert((self.func_id, Some(self.location),
@@ -778,25 +795,12 @@ let args = &self.tcx().instantiate_bound_regions_with_erased(*args);
             }
             mir::ConstValue::Indirect { alloc_id, offset } => {
                 let value = self.create_aux_local(ty);
-                let fields = type_util::flatten_fields(self.tcx(), ty::TypingEnv::fully_monomorphized(), value.clone(), ty);
-                let pointers: Vec<_> = fields.iter().filter(|(_, _, ty)| ty.is_any_ptr()
-                    || type_util::is_integer_carrier(self.tcx(), *ty)).collect();
-                let null_pointers = !pointers.is_empty()
-                    && matches!(self.tcx().try_get_global_alloc(alloc_id), Some(GlobalAlloc::Memory(memory))
-                        if pointers.iter().all(|(field, _, _)| {
-                            let Some(start) = offset.bytes().checked_add(*field as u64) else { return false; };
-                            let range = AllocRange { start: rustc_abi::Size::from_bytes(start),
-                                size: self.tcx().data_layout.pointer_size() };
-                            range.end().bytes() <= memory.inner().len() as u64
-                                && matches!(memory.inner().read_scalar(&self.tcx(), range, true),
-                                    Ok(Scalar::Int(bits)) if bits.to_bits(bits.size()) == 0)
-                        }));
-                if !null_pointers && (ty.is_any_ptr() || !type_util::get_pointer_projections(self.tcx(), ty).is_empty()) {
-                    self.acx.coverage_gaps.insert((self.func_id, Some(self.location),
-                        "constant pointer bytes require flow refinement".into()));
-                }
-                if !null_pointers && !self.acx.get_value_projections(ty).is_empty() {
+                if let Some(GlobalAlloc::Memory(allocation)) = self.tcx().try_get_global_alloc(alloc_id) {
+                    self.fpag.add_constant_allocation(self.acx, value.clone(), ty, allocation, offset);
+                } else if ty.is_any_ptr() || !self.acx.get_value_projections(ty).is_empty() {
                     self.acx.value_unknown_paths.insert(value.clone());
+                    self.acx.coverage_gaps.insert((self.func_id, Some(self.location),
+                        "constant allocation is unavailable".into()));
                 }
                 value
             }
@@ -2154,9 +2158,7 @@ let substs = &self.tcx().instantiate_bound_regions_with_erased(*substs);
             | mir::ProjectionElem::ConstantIndex { .. } => PathSelector::Index,
             mir::ProjectionElem::Downcast(_name, index) => PathSelector::Downcast(index.as_usize()),
             mir::ProjectionElem::Subslice { from, to, from_end } => PathSelector::Subslice {
-                from: *from,
-                to: *to,
-                from_end: *from_end,
+                bounds: std::sync::Arc::new((*from, *to, *from_end)),
             },
             mir::ProjectionElem::OpaqueCast(ty) | mir::ProjectionElem::UnwrapUnsafeBinder(ty) => {
                 PathSelector::Cast(self.acx.get_type_index(ty))

@@ -171,7 +171,7 @@ impl Debug for PathEnum {
 }
 
 /// The PathSelector denotes a de-referenced item, field, or element, or slice.
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub enum PathSelector {
     /// Given a path that denotes a reference, select the thing the reference points to.
     Deref,
@@ -214,7 +214,7 @@ pub enum PathSelector {
     ///
     /// If `from_end` is true `slice[from..slice.len() - to]`.
     /// Otherwise `array[from..to]`.
-    Subslice { from: u64, to: u64, from_end: bool },
+    Subslice { bounds: std::sync::Arc<(u64, u64, bool)> },
 
     /// "Downcast" to a variant of an ADT. Currently, MIR only introduces
     /// this for ADTs with more than one variant. The value is the ordinal of the variant.
@@ -243,8 +243,8 @@ impl Debug for PathSelector {
             //     min_length,
             //     from_end
             // } => f.write_fmt(format_args!("const_index#[{},{},{}]", offset, min_length, from_end)),
-            PathSelector::Subslice { from, to, from_end } => {
-                f.write_fmt(format_args!("subslice#[{}:{},{}]", from, to, from_end))
+            PathSelector::Subslice { bounds } => {
+                f.write_fmt(format_args!("subslice#[{}:{},{}]", bounds.0, bounds.1, bounds.2))
             }
             PathSelector::Downcast(index) => f.write_fmt(format_args!("as_variant#{}", *index)),
             PathSelector::Cast(index) => f.write_fmt(format_args!("cast#{}", *index)),
@@ -407,9 +407,10 @@ impl Path {
     pub fn append_projection_elem(path: &Rc<Path>, projection_elem: PathSelector) -> Rc<Path> {
         match &path.value {
             PathEnum::QualifiedPath { base, projection } => {
-                let mut projection = projection.clone();
-                projection.push(projection_elem);
-                Path::new_qualified(base.clone(), projection)
+                let mut extended = Vec::with_capacity(projection.len() + 1);
+                extended.extend_from_slice(projection);
+                extended.push(projection_elem);
+                Path::new_qualified(base.clone(), extended)
             }
             _ => Path::new_qualified(path.clone(), vec![projection_elem]),
         }
@@ -422,9 +423,10 @@ impl Path {
         }
         match &path.value {
             PathEnum::QualifiedPath { base, projection } => {
-                let mut projection = projection.clone();
-                projection.extend_from_slice(projection_elems);
-                Path::new_qualified(base.clone(), projection)
+                let mut extended = Vec::with_capacity(projection.len() + projection_elems.len());
+                extended.extend_from_slice(projection);
+                extended.extend_from_slice(projection_elems);
+                Path::new_qualified(base.clone(), extended)
             }
             _ => Path::new_qualified(path.clone(), projection_elems.clone()),
         }
@@ -564,6 +566,14 @@ impl PAGPath for Rc<Path> {
         Path::append_projection(self, projection_elems)
     }
 
+    fn intern(&self, paths: &mut std::collections::HashSet<Rc<Path>>) -> Self {
+        if let Some(path) = paths.get(self) {
+            return path.clone();
+        }
+        paths.insert(self.clone());
+        self.clone()
+    }
+
     fn add_offset(&self, offset: usize) -> Self {
         Path::add_offset(self, offset)
     }
@@ -677,6 +687,15 @@ impl PAGPath for Rc<CSPath> {
             self.cid, 
             Path::append_projection(&self.path, projection_elems)
         )
+    }
+
+    fn intern(&self, paths: &mut std::collections::HashSet<Rc<Path>>) -> Self {
+        let path = self.path.intern(paths);
+        if Rc::ptr_eq(&path, &self.path) {
+            self.clone()
+        } else {
+            CSPath::new_cs_path(self.cid, path)
+        }
     }
 
     fn add_offset(&self, offset: usize) -> Self {

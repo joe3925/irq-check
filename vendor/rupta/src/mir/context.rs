@@ -29,6 +29,7 @@ pub trait ContextElement: Clone + Eq + PartialEq + Debug + Hash {}
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Context<E: ContextElement> {
     pub(crate) context_elems: Vec<E>,
+    pub(crate) callback: bool,
 }
 
 impl<E: ContextElement> Debug for Context<E> {
@@ -41,11 +42,12 @@ impl<E: ContextElement> Context<E> {
     pub fn new_empty() -> Rc<Self> {
         Rc::new(Context {
             context_elems: Vec::new(),
+            callback: false,
         })
     }
 
     pub fn new(context_elems: Vec<E>) -> Rc<Self> {
-        Rc::new(Context { context_elems })
+        Rc::new(Context { context_elems, callback: false })
     }
 
     #[inline]
@@ -65,7 +67,7 @@ impl<E: ContextElement> Context<E> {
                 elems.extend_from_slice(&old_ctx.context_elems[..k - 1])
             }
         }
-        Rc::new(Context { context_elems: elems })
+        Rc::new(Context { context_elems: elems, callback: old_ctx.callback })
     }
 
     pub fn k_limited_context(ctx: &Rc<Context<E>>, k: usize) -> Rc<Self> {
@@ -73,7 +75,7 @@ impl<E: ContextElement> Context<E> {
             ctx.clone()
         } else {
             let elems = ctx.context_elems[..k].to_vec();
-            Rc::new(Context { context_elems: elems })
+            Rc::new(Context { context_elems: elems, callback: ctx.callback })
         }
     } 
     

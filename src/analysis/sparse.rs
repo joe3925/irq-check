@@ -3378,6 +3378,14 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
 
 
     fn preserves_storage(&mut self, instance: Instance<'tcx>, address: Address, requested: Ty<'tcx>) -> Result<bool, QueryStop> {
+        if let Object::Local(owner, local) = address.object {
+            let index = self.index(owner)?;
+            if instance != self.frames[owner].instance && !index.address_taken.contains(&local)
+                && index.clobbers.is_empty()
+            {
+                return Ok(true);
+            }
+        }
         let objects = self.pointer_objects(address.object);
         let read_range = self.tcx.layout_of(TypingEnv::fully_monomorphized().as_query_input(requested))
             .ok().filter(|layout| layout.is_sized()).and_then(|layout| {

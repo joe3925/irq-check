@@ -91,7 +91,6 @@ impl<'pta, 'tcx, 'compilation> AndersenPTA<'pta, 'tcx, 'compilation> {
                 );
                 if self.pag.build_func_pag(self.acx, func_id) {
                     self.add_fpag_edges(func_id);
-                    self.process_calls_in_fpag(func_id);
                 }
             }
         }
@@ -100,7 +99,7 @@ impl<'pta, 'tcx, 'compilation> AndersenPTA<'pta, 'tcx, 'compilation> {
     /// Adds internal edges of a function pag to the whole program's pag.
     /// The function pag for the given def_id should be built before calling this function.
     pub fn add_fpag_edges(&mut self, func_id: FuncId) {
-        if self.processed_funcs.contains(&func_id) {
+        if !self.processed_funcs.insert(func_id) {
             return;
         }
 
@@ -129,7 +128,7 @@ impl<'pta, 'tcx, 'compilation> AndersenPTA<'pta, 'tcx, 'compilation> {
             }
         }
 
-        self.processed_funcs.insert(func_id);
+        self.process_calls_in_fpag(func_id);
     }
 
     fn process_calls_in_fpag(&mut self, func_id: FuncId) {
@@ -263,6 +262,7 @@ impl<'pta, 'tcx, 'compilation> PointerAnalysis<'tcx, 'compilation> for AndersenP
                 self.process_new_call_instances(&new_call_instances);
             }
         }
+        self.pag.release_edge_indexes();
     }
 
     /// Finalize the analysis.

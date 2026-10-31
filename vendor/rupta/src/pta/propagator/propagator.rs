@@ -55,6 +55,8 @@ pub struct Propagator<'pta, 'tcx, 'compilation, F, P: PAGPath> {
     ///    of object-sensitive pointer analysis
     new_calls: &'pta mut Vec<(Rc<CallSiteS<F, P>>, FuncId)>,
     new_call_instances: &'pta mut Vec<(Rc<CallSiteS<F, P>>, P, FuncId)>,
+    queued_calls: HashSet<(Rc<CallSiteS<F, P>>, FuncId)>,
+    queued_instances: HashSet<(Rc<CallSiteS<F, P>>, P, FuncId)>,
 
     /// Iterator for address_of edges in pag
     addr_edge_iter: &'pta mut chunked_queue::IterCopied<EdgeId>,
@@ -88,12 +90,16 @@ where
         assoc_calls: &'pta mut AssocCallGroup<NodeId, F, P>,
         stack_filter: Option<&'pta mut StackFilter<F>>,
     ) -> Self {
+        let queued_calls = new_calls.iter().cloned().collect();
+        let queued_instances = new_call_instances.iter().cloned().collect();
         Propagator {
             acx,
             pt_data,
             pag,
             new_calls,
             new_call_instances,
+            queued_calls,
+            queued_instances,
             worklist: VecDeque::new(),
             current_delta: None,
             addr_edge_iter,
@@ -328,7 +334,7 @@ where
 
             if let Some(diff_pts) = self.get_diff_pts(node_id) {
                 let diff_pts = diff_pts.clone();
-                self.process_fnptr_call(&callsites, &diff_pts);
+                self.process_fnptr_call(&callsites, &diff_pts, node_id);
             }
         }
     }
@@ -517,7 +523,14 @@ where
         &mut self,
         callsites: &HashSet<Rc<CallSiteS<F, P>>>,
         fn_pts: &PointsTo<NodeId>,
+        receiver: NodeId,
     ) {
+        let receiver_ty = self.pag.node_path(receiver).try_eval_path_type(self.acx);
+        let extra = self.tcx().mk_type_list(&[]);
+        let caller_abi = receiver_ty.is_fn_ptr().then(|| {
+            self.tcx().fn_abi_of_fn_ptr(rustc_middle::ty::TypingEnv::fully_monomorphized()
+                .as_query_input((receiver_ty.fn_sig(self.tcx()), extra))).ok()
+        }).flatten();
         for fn_item_id in fn_pts {
             // The pointee of a function pointer can be classified into the following three kinds:
             // (a) a variable of FnDef type
@@ -547,6 +560,28 @@ where
                         let args = self.tcx().instantiate_bound_regions_with_erased(*args);
                         self.acx.get_func_id(*def_id, args)
                     };
+                    if let Some(caller) = caller_abi {
+                        let reference = self.acx.get_function_reference(func_id);
+                        let target = rustc_middle::ty::Instance {
+                            def: reference.kind,
+                            args: self.tcx().instantiate_bound_regions_with_erased(*args),
+                        };
+                        if let Ok(callee) = self.tcx().fn_abi_of_instance_no_deduced_attrs(
+                            rustc_middle::ty::TypingEnv::fully_monomorphized()
+                                .as_query_input((target, extra)))
+                            && !caller.c_variadic && !callee.c_variadic
+                            && (caller.conv != callee.conv
+                                || caller.args.len() != callee.args.len()
+                                || caller.args.iter().zip(callee.args.iter())
+                                    .any(|(source, destination)| !source.eq_abi(destination)
+                                        || source.layout.size != destination.layout.size)
+                                || !callee.ret.layout.ty.is_never()
+                                    && (!caller.ret.eq_abi(&callee.ret)
+                                        || caller.ret.layout.size != callee.ret.layout.size))
+                        {
+                            continue;
+                        }
+                    }
                     for callsite in callsites {
                         self.add_new_call(callsite, &func_id);
                     }
@@ -697,11 +732,11 @@ where
                         .collect::<HashSet<Rc<CallSiteS<F, P>>>>();
                     if let Some(propa) = self.get_propa_pts(pointee_id) {
                         let propa = propa.clone();
-                        self.process_fnptr_call(&callsites, &propa);
+                        self.process_fnptr_call(&callsites, &propa, pointee_id);
                     }
                     if let Some(diff) = self.get_diff_pts(pointee_id) {
                         let diff = diff.clone();
-                        self.process_fnptr_call(&callsites, &diff);
+                        self.process_fnptr_call(&callsites, &diff, pointee_id);
                     }
                     for callsite in callsites {
                         self.assoc_calls
@@ -934,6 +969,26 @@ where
 
         let dst_deref_ty = type_util::get_dereferenced_type(dst_ty);
         let src_pts = self.get_cloned_pts(src, propa_diff);
+        if dst_deref_ty.is_unit() && !src_ty.is_fn_ptr() {
+            for pointee in &src_pts {
+                changed |= self.pt_data.add_pts(dst, pointee);
+            }
+            if changed { self.worklist.push_back(dst); }
+            return;
+        }
+        if self.pag.format_bindings.contains(&cast_edge) {
+            for pointee in &src_pts {
+                let path = self.pag.node_path(pointee).clone();
+                let ty = path.try_eval_path_type(self.acx);
+                if type_util::equal_types(self.tcx(), ty, dst_deref_ty) {
+                    changed |= self.pt_data.add_pts(dst, pointee);
+                } else if ty.is_never() || ty.is_unit() {
+                    self.acx.unmodeled_paths.insert(Rc::new(Path { value: dst_path.value().clone() }));
+                }
+            }
+            if changed { self.worklist.push_back(dst); }
+            return;
+        }
 
         // Special handling for function pointers. Since the src type and dst type are non-equivalent for
         // cast edges, if the src(dst) type is function pointer type, the dst(src) must not be function
@@ -1143,8 +1198,14 @@ where
                         "heap storage has no initial pointer type"
                     } else { "pointer bytes share non-pointer storage" };
                     self.acx.unmodeled_flows.insert(format!("{reason}: {src_field:?} ({src_type:?}) -> {tgt_field:?} ({tgt_type:?})"));
-                    self.acx.unmodeled_paths.insert(Rc::new(Path { value: src_field.value().clone() }));
-                    self.acx.unmodeled_paths.insert(Rc::new(Path { value: tgt_field.value().clone() }));
+                    src_field.set_path_rustc_type(self.acx, *src_type);
+                    tgt_field.set_path_rustc_type(self.acx, *tgt_type);
+                    self.pag.get_or_insert_node(src_field);
+                    self.pag.get_or_insert_node(tgt_field);
+                    self.acx.storage_overlaps.insert((
+                        Rc::new(Path { value: src_field.value().clone() }),
+                        Rc::new(Path { value: tgt_field.value().clone() }),
+                    ));
                 }
                 if src_type.is_enum() && src_type == tgt_type {
                     // We do not flatten fields for enum type, therefore if src_type and tgt_type are the same enum types,
@@ -1308,7 +1369,12 @@ where
     }
 
     fn add_new_call(&mut self, callsite: &Rc<CallSiteS<F, P>>, callee_id: &FuncId) {
-        self.new_calls.push((callsite.clone(), *callee_id));
+        if self.queued_calls.insert((callsite.clone(), *callee_id)) {
+            self.new_calls.push((callsite.clone(), *callee_id));
+        }
+        if self.acx.analysis_options.rceus {
+            return;
+        }
 
         let callee_def_id = self.acx.get_function_reference(*callee_id).def_id;
         if util::has_self_ref_parameter(self.tcx(), callee_def_id) {
@@ -1330,8 +1396,11 @@ where
         instance: &P,
         callee_id: &FuncId,
     ) {
-        self.new_call_instances
-            .push((callsite.clone(), instance.clone(), *callee_id))
+        if self.acx.analysis_options.rceus {
+            self.add_new_call(callsite, callee_id);
+        } else if self.queued_instances.insert((callsite.clone(), instance.clone(), *callee_id)) {
+            self.new_call_instances.push((callsite.clone(), instance.clone(), *callee_id));
+        }
     }
 
     fn type_filter_pred()

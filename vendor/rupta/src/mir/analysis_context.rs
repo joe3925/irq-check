@@ -28,11 +28,13 @@ use crate::util::type_util::{
 /// Global information of the analysis
 pub struct AnalysisContext<'tcx, 'compilation> {
     pub linked_definitions: HashMap<String, Instance<'tcx>>,
+    pub callback_roots: HashSet<FuncId>,
     pub checked_crates: HashSet<rustc_hir::def_id::CrateNum>,
     pub coverage_gaps: HashSet<(FuncId, Option<rustc_middle::mir::Location>, String)>,
     pub forbidden_externals: HashSet<FuncId>,
     pub unmodeled_flows: HashSet<String>,
     pub unmodeled_paths: HashSet<Rc<Path>>,
+    pub storage_overlaps: HashSet<(Rc<Path>, Rc<Path>)>,
     pub value_unknown_paths: HashSet<Rc<Path>>,
     pub no_provenance_paths: HashSet<Rc<Path>>,
     pub offset_risks: HashSet<std::rc::Rc<Path>>,
@@ -96,11 +98,13 @@ impl<'tcx, 'compilation> AnalysisContext<'tcx, 'compilation> {
     ) -> Self {
         Self {
             linked_definitions: HashMap::new(),
+            callback_roots: HashSet::new(),
             checked_crates,
             coverage_gaps: HashSet::new(),
             forbidden_externals: HashSet::new(),
             unmodeled_flows: HashSet::new(),
             unmodeled_paths: HashSet::new(),
+            storage_overlaps: HashSet::new(),
             value_unknown_paths: HashSet::new(),
             no_provenance_paths: HashSet::new(),
             offset_risks: HashSet::new(),

@@ -3,10 +3,11 @@
 // This source code is licensed under the GNU license found in the
 // LICENSE file in the root directory of this source tree.
 
+use std::collections::{HashSet, hash_set};
 use std::fmt;
 use std::slice;
 
-use crate::util::bit_vec::{BitIter, BitVec, Idx};
+use crate::util::bit_vec::Idx;
 
 const SMALL_SET_CAPACITY: usize = 32;
 
@@ -29,8 +30,6 @@ pub trait PointsToSet<T> {
     fn iter<'a>(&'a self) -> Self::Iter<'a>;
 }
 
-/// Hybrid implementation of points to set,
-/// which uses an explicit array for small sets, and a bit vector for large sets.
 #[derive(Clone)]
 pub struct HybridPointsToSet<T> {
     points_to: HybridSet<T>,
@@ -40,7 +39,7 @@ impl<T> HybridPointsToSet<T> {
     pub fn storage_bytes(&self) -> usize {
         match &self.points_to {
             HybridSet::SmallSet(values) => values.capacity() * std::mem::size_of::<T>(),
-            HybridSet::LargeSet(values) => values.words.capacity() * std::mem::size_of::<u64>(),
+            HybridSet::LargeSet(values) => values.capacity() * (std::mem::size_of::<T>() + 1),
         }
     }
 }
@@ -122,7 +121,7 @@ impl<T: Idx> PointsToSet<T> for HybridPointsToSet<T> {
 #[derive(Clone)]
 pub enum HybridSet<T> {
     SmallSet(Vec<T>),
-    LargeSet(BitVec<T>),
+    LargeSet(HashSet<T>),
 }
 
 impl<T: Idx> fmt::Debug for HybridSet<T> {
@@ -153,7 +152,7 @@ impl<T: Idx> HybridSet<T> {
     pub fn count(&self) -> usize {
         match self {
             HybridSet::SmallSet(small) => small.len(),
-            HybridSet::LargeSet(large) => large.count(),
+            HybridSet::LargeSet(large) => large.len(),
         }
     }
 
@@ -161,7 +160,7 @@ impl<T: Idx> HybridSet<T> {
     pub fn contains(&self, elem: T) -> bool {
         match self {
             HybridSet::SmallSet(small) => small.contains(&elem),
-            HybridSet::LargeSet(large) => large.contains(elem),
+            HybridSet::LargeSet(large) => large.contains(&elem),
         }
     }
 
@@ -169,7 +168,7 @@ impl<T: Idx> HybridSet<T> {
     pub fn superset(&self, other: &HybridSet<T>) -> bool {
         match (self, other) {
             (HybridSet::LargeSet(self_large), HybridSet::LargeSet(other_large)) => {
-                self_large.superset(&other_large)
+                self_large.is_superset(other_large)
             }
             _ => other.iter().all(|elem| self.contains(elem)),
         }
@@ -196,7 +195,7 @@ impl<T: Idx> HybridSet<T> {
             }
             HybridSet::SmallSet(small) => {
                 // The set is small and full. Convert to a large set.
-                let mut large = BitVec::new_empty();
+                let mut large = HashSet::new();
                 for elem in small {
                     large.insert(*elem);
                 }
@@ -219,7 +218,7 @@ impl<T: Idx> HybridSet<T> {
                     false
                 }
             }
-            HybridSet::LargeSet(large) => large.remove(elem),
+            HybridSet::LargeSet(large) => large.remove(&elem),
         }
     }
 
@@ -233,7 +232,11 @@ impl<T: Idx> HybridSet<T> {
     pub fn union(&mut self, other: &HybridSet<T>) -> bool {
         match self {
             HybridSet::LargeSet(self_large) => match other {
-                HybridSet::LargeSet(other_large) => self_large.union(&other_large),
+                HybridSet::LargeSet(other_large) => {
+                    let count = self_large.len();
+                    self_large.extend(other_large.iter().copied());
+                    self_large.len() != count
+                },
                 HybridSet::SmallSet(other_small) => {
                     let mut changed = false;
                     for elem in other_small.iter() {
@@ -246,11 +249,13 @@ impl<T: Idx> HybridSet<T> {
                 match other {
                     HybridSet::LargeSet(other_large) => {
                         // convert self set to a large set
-                        let mut self_large = BitVec::new_empty();
+                        let mut self_large = HashSet::new();
                         for elem in self_small.iter() {
                             self_large.insert(*elem);
                         }
-                        let changed = self_large.union(&other_large);
+                        let count = self_large.len();
+                        self_large.extend(other_large.iter().copied());
+                        let changed = self_large.len() != count;
                         *self = HybridSet::LargeSet(self_large);
                         changed
                     }
@@ -269,11 +274,15 @@ impl<T: Idx> HybridSet<T> {
     pub fn subtract(&mut self, other: &HybridSet<T>) -> bool {
         match self {
             HybridSet::LargeSet(self_large) => match other {
-                HybridSet::LargeSet(other_large) => self_large.subtract(&other_large),
+                HybridSet::LargeSet(other_large) => {
+                    let count = self_large.len();
+                    self_large.retain(|element| !other_large.contains(element));
+                    self_large.len() != count
+                },
                 HybridSet::SmallSet(other_small) => {
                     let mut changed = false;
                     for &elem in other_small.iter() {
-                        changed |= self_large.remove(elem);
+                        changed |= self_large.remove(&elem);
                     }
                     changed
                 }
@@ -296,18 +305,16 @@ impl<T: Idx> HybridSet<T> {
         match self {
             HybridSet::LargeSet(self_large) => {
                 match other {
-                    HybridSet::LargeSet(other_large) => self_large.intersect(&other_large),
+                    HybridSet::LargeSet(other_large) => {
+                        let count = self_large.len();
+                        self_large.retain(|element| other_large.contains(element));
+                        self_large.len() != count
+                    },
                     HybridSet::SmallSet(other_small) => {
                         // convert self set to a small set
                         let mut self_small = other_small.clone();
-                        let mut changed = false;
-                        self_small.retain(|&elem| {
-                            let contains = self_large.contains(elem);
-                            if !contains {
-                                changed = true;
-                            }
-                            contains
-                        });
+                        self_small.retain(|elem| self_large.contains(elem));
+                        let changed = self_small.len() != self_large.len();
                         *self = HybridSet::SmallSet(self_small);
                         changed
                     }
@@ -330,7 +337,7 @@ impl<T: Idx> HybridSet<T> {
 
 pub enum HybridIter<'a, T: Idx> {
     SmallIter(slice::Iter<'a, T>),
-    LargeIter(BitIter<'a, T>),
+    LargeIter(hash_set::Iter<'a, T>),
 }
 
 impl<'a, T: Idx> Iterator for HybridIter<'a, T> {
@@ -339,7 +346,7 @@ impl<'a, T: Idx> Iterator for HybridIter<'a, T> {
     fn next(&mut self) -> Option<T> {
         match self {
             HybridIter::SmallIter(small) => small.next().copied(),
-            HybridIter::LargeIter(large) => large.next(),
+            HybridIter::LargeIter(large) => large.next().copied(),
         }
     }
 }
