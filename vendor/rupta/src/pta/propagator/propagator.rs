@@ -10,6 +10,7 @@ use std::rc::Rc;
 
 use rustc_hir::def_id::DefId;
 use rustc_middle::mir;
+use rustc_middle::ty::inherent::SliceLike;
 use rustc_middle::ty::{Ty, TyCtxt, TyKind};
 
 use crate::builder::call_graph_builder;
@@ -661,7 +662,7 @@ where
                             fn_item_ty,
                             *def_id,
                         );
-                        let callee_func_id = self.acx.get_func_id(*def_id, args);
+                        let callee_func_id = self.acx.get_func_id(*def_id, *args);
                         self.add_new_call(&closure_callsite, &callee_func_id);
                     }
                 }
@@ -711,7 +712,7 @@ where
                     let args = &self.acx.tcx.instantiate_bound_regions_with_erased(*args);
                     // try to devirtualize the def_id first
                     let (def_id, args) =
-                        call_graph_builder::resolve_fn_def(self.tcx(), *def_id, args);
+                        call_graph_builder::resolve_fn_def(self.tcx(), *def_id, *args);
                     let callee_func_id = self.acx.get_func_id(def_id, args);
                     for dynamic_fntrait_callsite in dynamic_fntrait_callsites {
                         let new_callsite = Rc::new(CallSiteS::new(
@@ -770,7 +771,7 @@ where
                             closure_args,
                             dynamic_fntrait_callsite.destination.clone(),
                         ));
-                        let callee_func_id = self.acx.get_func_id(*def_id, args);
+                        let callee_func_id = self.acx.get_func_id(*def_id, *args);
                         self.add_new_call(&closure_callsite, &callee_func_id);
                     }
                 }

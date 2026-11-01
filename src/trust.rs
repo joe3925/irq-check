@@ -1,4 +1,5 @@
 use crate::policy::{self, CrateData, Policy, ScopeMarks};
+use rustc_ast::attr::AttributeExt;
 use rustc_hir::def_id::{CrateNum, DefId, DefIndex, LOCAL_CRATE};
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{BlockCheckMode, ExprKind, HirId, Node, UnsafeSource};
@@ -107,6 +108,9 @@ impl Trust {
                         local_id: *local_id,
                     };
                     for attribute in *attributes {
+                        let rustc_attr_ir::Attribute::Tool(item) = attribute else {
+                            continue;
+                        };
                         let unreachable = attribute
                             .path_matches(&[Symbol::intern("irq"), Symbol::intern("unreachable")]);
                         let allow_incomplete = attribute
@@ -172,7 +176,7 @@ impl Trust {
                             });
                             if !valid_argument || !valid_block {
                                 let mut diagnostic = tcx.dcx().struct_span_err(
-                                    attribute.span(),
+                                    item.span,
                                     format!(
                                         "irq::{name}(unsafe) requires an explicit unsafe block"
                                     ),
@@ -186,7 +190,7 @@ impl Trust {
                             } else if !nonreturning
                             {
                                 let mut diagnostic = tcx.dcx().struct_span_err(
-                                    attribute.span(),
+                                    item.span,
                                     "irq::unreachable(unsafe) requires a block that cannot return",
                                 );
                                 diagnostic.help("use this mark only on a fatal error path that ends in panic, abort, or a non-returning call");
@@ -197,7 +201,7 @@ impl Trust {
                                     let mut error_path = ErrorPath::default();
                                     error_path.visit_expr(expression.unwrap());
                                     if !error_path.exits.is_empty() {
-                                        let mut diagnostic = tcx.dcx().struct_span_err(attribute.span(), "irq::unreachable(unsafe) cannot return or jump outside its error block");
+                                        let mut diagnostic = tcx.dcx().struct_span_err(item.span, "irq::unreachable(unsafe) cannot return or jump outside its error block");
                                         for span in error_path.exits {
                                             diagnostic.span_label(
                                                 span,
@@ -225,7 +229,7 @@ impl Trust {
                             if matches!(item.kind, rustc_hir::TraitItemKind::Fn(..)))
                         {
                             tcx.dcx().span_err(
-                            attribute.span(),
+                            item.span,
                             "irq::context is allowed only on functions, trait methods, and traits",
                         );
                             invalid = true;
@@ -242,7 +246,7 @@ impl Trust {
                                 if matches!(item.kind, rustc_hir::ForeignItemKind::Fn(..)))
                         {
                             tcx.dcx().span_err(
-                                attribute.span(),
+                                item.span,
                                 "irq::forbidden is allowed only on functions and trait methods",
                             );
                             invalid = true;

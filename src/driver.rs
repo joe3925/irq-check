@@ -2,6 +2,7 @@
 
 extern crate rustc_abi;
 extern crate rustc_ast;
+extern crate rustc_attr_ir;
 extern crate rustc_codegen_ssa;
 extern crate rustc_crate_store;
 extern crate rustc_data_structures;
@@ -54,7 +55,7 @@ struct Edge<'tcx> {
 }
 
 fn marked(tcx: TyCtxt<'_>, def: DefId, name: &str) -> bool {
-    tcx.get_attrs_by_path(def, &[Symbol::intern("irq"), Symbol::intern(name)])
+    tcx.tool_attrs(def, &[Symbol::intern("irq"), Symbol::intern(name)])
         .next()
         .is_some()
 }
@@ -625,5 +626,5 @@ fn main() -> std::process::ExitCode {
         "--cfg=irq_check".into(),
         "--check-cfg=cfg(irq_check)".into(),
     ]);
-    rustc_driver::catch_with_exit_code(|| rustc_driver::run_compiler(&args, &mut Checker))
+    rustc_driver::catch_with_exit_code(|| rustc_driver::compiler_entrypoint(&args, &mut Checker))
 }

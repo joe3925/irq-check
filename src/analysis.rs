@@ -716,7 +716,7 @@ impl<'tcx> Analysis<'tcx> {
                         if let Some(requirement) = ty::layout::ValidityRequirement::from_intrinsic(tcx.item_name(target.def_id())) {
                             if tcx.check_validity_requirement((requirement, TypingEnv::fully_monomorphized().as_query_input(target.args.type_at(0))))
                                 .is_ok_and(|valid| !valid) {
-                                if let Some(def) = tcx.lang_items().get(rustc_hir::attrs::lang_items::LangItem::PanicNounwind) {
+                                if let Some(def) = tcx.lang_items().get(rustc_attr_ir::lang_items::LangItem::PanicNounwind) {
                                     target = Instance::mono(tcx, def);
                                 }
                             }

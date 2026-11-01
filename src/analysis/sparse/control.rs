@@ -121,7 +121,7 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                     let at = Location { block, statement_index: data.statements.len() };
                     match &data.terminator().kind {
                         TerminatorKind::Return => { returns.insert(block); }
-                        TerminatorKind::Goto { target } => successors[block.as_usize()].push(*target),
+                        TerminatorKind::Goto { target, .. } => successors[block.as_usize()].push(*target),
                         TerminatorKind::SwitchInt { discr, targets } => {
                             let mut values = None;
                             if let Operand::Copy(place) | Operand::Move(place) = discr

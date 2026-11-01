@@ -6,7 +6,7 @@
 //! This module provides essential functions for resolving call targets.
 
 use rustc_hir::def_id::DefId;
-use rustc_middle::ty::{GenericArgsRef, TyCtxt, TyKind};
+use rustc_middle::ty::{GenericArgs, TyCtxt, TyKind};
 
 use crate::util;
 
@@ -17,8 +17,8 @@ use crate::util;
 pub fn resolve_fn_def<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
-    gen_args: GenericArgsRef<'tcx>,
-) -> (DefId, GenericArgsRef<'tcx>) {
+    gen_args: GenericArgs<'tcx>,
+) -> (DefId, GenericArgs<'tcx>) {
     if tcx.is_mir_available(def_id) && !util::is_trait_method(tcx, def_id) {
         (def_id, gen_args)
     } else if let Some((resolved_def_id, resolved_substs)) =
@@ -40,8 +40,8 @@ pub fn resolve_fn_def<'tcx>(
 pub fn try_to_devirtualize<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
-    gen_args: GenericArgsRef<'tcx>,
-) -> Option<(DefId, GenericArgsRef<'tcx>)> {
+    gen_args: GenericArgs<'tcx>,
+) -> Option<(DefId, GenericArgs<'tcx>)> {
     if !util::is_trait_method(tcx, def_id) {
         return None;
     }

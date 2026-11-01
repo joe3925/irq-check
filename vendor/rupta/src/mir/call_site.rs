@@ -8,7 +8,7 @@ use std::rc::Rc;
 
 use rustc_hir::def_id::DefId;
 use rustc_middle::mir::Location;
-use rustc_middle::ty::GenericArgsRef;
+use rustc_middle::ty::GenericArgs;
 
 use crate::mir::function::{FuncId, CSFuncId};
 use crate::mir::path::{Path, CSPath};
@@ -32,7 +32,7 @@ pub type CSBaseCallSite = BaseCallSiteS<CSFuncId>;
 pub type CallSite = CallSiteS<FuncId, Rc<Path>>;
 pub type CSCallSite = CallSiteS<CSFuncId, Rc<CSPath>>;
 
-pub type CalleeIdentifier<'tcx> = (DefId, GenericArgsRef<'tcx>);
+pub type CalleeIdentifier<'tcx> = (DefId, GenericArgs<'tcx>);
 
 /// A base callsite, consisting of the basic information, i.e. the call's location in the code. 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
@@ -72,11 +72,11 @@ impl<F, P> CallSiteS<F, P> {
 pub struct ExtCallSiteS<'tcx, F, P> {
     pub callsite: Rc<CallSiteS<F, P>>,
     pub callee_def_id: DefId,
-    pub callee_substs: GenericArgsRef<'tcx>,
+    pub callee_substs: GenericArgs<'tcx>,
 }
 
 impl<'tcx, F, P> ExtCallSiteS<'tcx, F, P> {
-    pub fn new(callsite: Rc<CallSiteS<F, P>>, callee_def_id: DefId, callee_substs: GenericArgsRef<'tcx>) -> Self {
+    pub fn new(callsite: Rc<CallSiteS<F, P>>, callee_def_id: DefId, callee_substs: GenericArgs<'tcx>) -> Self {
         ExtCallSiteS {
             callsite,
             callee_def_id,

@@ -105,7 +105,7 @@ impl FuncPAG {
                                     } else {
                                         Path::new_field(base.clone(), index.as_usize())
                                     };
-                                    pending.push((path, type_util::field_ty(tcx, definition_field, args),
+                                    pending.push((path, type_util::field_ty(tcx, definition_field, *args),
                                         field_offset + layout.fields.offset(index.as_usize()),
                                         1, rustc_abi::Size::ZERO));
                                 }

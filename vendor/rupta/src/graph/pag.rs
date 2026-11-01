@@ -542,7 +542,7 @@ impl<P: PAGPath> PAG<P> {
             && !crate::util::type_util::has_instance_mir(acx.tcx, reference.kind)
         {
             if acx.tcx.is_foreign_item(def_id)
-                && acx.tcx.get_attrs_by_path(def_id, &[
+                && acx.tcx.tool_attrs(def_id, &[
                     rustc_span::Symbol::intern("irq"), rustc_span::Symbol::intern("forbidden"),
                 ]).next().is_some()
             {

@@ -2,7 +2,7 @@ use petgraph::graph::{DefaultIx, NodeIndex};
 use petgraph::Graph;
 use rustc_middle::mir;
 use rustc_hir::def_id::DefId;
-use rustc_middle::ty::{Ty, TyKind, GenericArgsRef};
+use rustc_middle::ty::{Ty, TyKind, GenericArgs};
 use std::rc::Rc;
 use petgraph::visit::EdgeRef;
 use std::collections::{HashSet, VecDeque, HashMap};
@@ -572,12 +572,12 @@ let gen_args = &self.acx().tcx.instantiate_bound_regions_with_erased(*gen_args);
     fn resolve_call(
         &mut self,
         callee_def_id: &DefId,
-        gen_args: &GenericArgsRef<'tcx>,
+        gen_args: &GenericArgs<'tcx>,
         _args: &[Spanned<mir::Operand<'tcx>>],
         _destination: &mir::Place<'tcx>,
         location: mir::Location,
     ) {
-        let gen_args = self.substs_specializer.specialize_generic_args(gen_args);
+        let gen_args = self.substs_specializer.specialize_generic_args(*gen_args);
         let function_trait = self.acx().is_std_ops_fntrait_call(*callee_def_id);
         let dynamic = self.pfg.dispatch_relations && function_trait
             && gen_args.types().next().is_some_and(|ty|

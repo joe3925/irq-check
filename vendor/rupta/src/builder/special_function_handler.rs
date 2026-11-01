@@ -9,7 +9,7 @@ use std::rc::Rc;
 use rustc_hir::def_id::DefId;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::mir;
-use rustc_middle::ty::{GenericArgsRef, TyKind};
+use rustc_middle::ty::{GenericArgs, TyKind};
 use crate::builder::fpag_builder::FuncPAGBuilder;
 use crate::mir::analysis_context::AnalysisContext;
 use crate::mir::path::Path;
@@ -22,7 +22,7 @@ pub(crate) enum LibraryModel {
 }
 
 pub(crate) fn library_model<'tcx>(acx: &AnalysisContext<'tcx, '_>, def_id: DefId,
-    gen_args: GenericArgsRef<'tcx>) -> Option<LibraryModel> {
+    gen_args: GenericArgs<'tcx>) -> Option<LibraryModel> {
     if acx.tcx.def_kind(def_id) != rustc_hir::def::DefKind::AssocFn
         || !matches!(acx.tcx.item_name(def_id).as_str(),
             "next" | "next_back" | "get" | "get_mut" | "get_unchecked" | "get_unchecked_mut"
@@ -93,7 +93,7 @@ pub fn is_specially_handled_precision_critical_function(acx: &mut AnalysisContex
 pub fn handled_as_special_function_call<'tcx>(
     fpb: &mut FuncPAGBuilder<'_, 'tcx, '_>,
     callee_def_id: &DefId,
-    gen_args: &GenericArgsRef<'tcx>,
+    gen_args: &GenericArgs<'tcx>,
     args: &Vec<Rc<Path>>,
     destination: &Rc<Path>,
     location: mir::Location,
@@ -118,7 +118,7 @@ pub fn handled_as_special_function_call<'tcx>(
                 if tcx.def_path_str(definition.did()) != "alloc::sync::ArcInner" { return None; }
                 let (field, data) = definition.non_enum_variant().fields.iter().enumerate()
                     .find(|(_, field)| field.name.as_str() == "data")?;
-                if crate::util::type_util::field_ty(tcx, data, substitutions) != element { return None; }
+                if crate::util::type_util::field_ty(tcx, data, *substitutions) != element { return None; }
                 let destination = Path::append_projection(destination, projection);
                 fpb.acx.set_path_rustc_type(destination.clone(), *pointer_ty);
                 fpb.acx.container_casts.insert((source.clone(), destination.clone()), field);
@@ -130,7 +130,7 @@ pub fn handled_as_special_function_call<'tcx>(
             let TyKind::Adt(definition, substitutions) = iterator_ty.kind() else { return None; };
             let (index, field) = definition.non_enum_variant().fields.iter().enumerate()
                 .find(|(_, field)| field.name.as_str() == "ptr")?;
-            let field_ty = crate::util::type_util::field_ty(tcx, field, substitutions);
+            let field_ty = crate::util::type_util::field_ty(tcx, field, *substitutions);
             let fields = fpb.acx.get_pointer_projections(field_ty).clone();
             let [(projection, pointer_ty)] = fields.as_slice() else { return None; };
             let destination_ty = fpb.acx.get_path_rustc_type(destination)?;

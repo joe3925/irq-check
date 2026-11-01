@@ -20,12 +20,12 @@
 //! The calls to `foo(u)` and `foo(v)` can therefore be resolved to `foo::<i32>(u)` and 
 //! `foo::<f64>(v)` respectively.
 
-use rustc_middle::ty::{EarlyBinder, GenericArg, GenericArgsRef, Ty, TyCtxt, TypeVisitableExt, TypingEnv};
+use rustc_middle::ty::{EarlyBinder, GenericArg, GenericArgs, Ty, TyCtxt, TypeVisitableExt, TypingEnv};
 use crate::mir::function::GenericArgE;
 
 pub struct SubstsSpecializer<'tcx> {
     pub tcx: TyCtxt<'tcx>,
-    pub generic_args: GenericArgsRef<'tcx>,
+    pub generic_args: GenericArgs<'tcx>,
 }
 
 impl<'tcx> SubstsSpecializer<'tcx> {
@@ -38,7 +38,7 @@ impl<'tcx> SubstsSpecializer<'tcx> {
         Self { tcx, generic_args }
     }
 
-    pub fn specialize_generic_args(&self, args: GenericArgsRef<'tcx>) -> GenericArgsRef<'tcx> {
+    pub fn specialize_generic_args(&self, args: GenericArgs<'tcx>) -> GenericArgs<'tcx> {
         let value = EarlyBinder::bind(self.tcx, args).instantiate(self.tcx, self.generic_args);
         if value.skip_norm_wip().has_non_region_param() || value.skip_norm_wip().has_escaping_bound_vars() {
             self.tcx.erase_and_anonymize_regions(value.skip_norm_wip())

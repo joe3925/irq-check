@@ -8,7 +8,7 @@ use rustc_middle::ty::CoroutineArgsExt;
 
 use log::*;
 use rustc_hir::def_id::DefId;
-use rustc_middle::ty::{GenericArgKind, GenericArgsRef};
+use rustc_middle::ty::{GenericArgKind, GenericArgs};
 use rustc_middle::ty::{
     Const, ExistentialPredicate, FieldDef, TypingEnv, 
     PolyFnSig, Ty, TyCtxt, TyKind
@@ -37,7 +37,7 @@ pub fn constant_successors<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &mir::Body<'tcx>,
     block: mir::BasicBlock,
-    args: GenericArgsRef<'tcx>,
+    args: GenericArgs<'tcx>,
 ) -> Vec<mir::BasicBlock> {
     let data = &body.basic_blocks[block];
     let terminator = data.terminator();
@@ -296,7 +296,7 @@ impl<'tcx> FieldByteOffsetCache<'tcx> {
                         // match the source definition order.
                         for (field_idx, offset) in offsets.iter().enumerate() {
                             let field = &variant.fields[FieldIdx::from_usize(field_idx)];
-                            let field_ty = field_ty(tcx, field, args);
+                            let field_ty = field_ty(tcx, field, *args);
                             let byte_offset = offset.bytes_usize();
                             let proj = vec![PathSelector::Field(field_idx)];
                             fields_byte_offsets.insert(proj.clone(), byte_offset);
@@ -310,7 +310,7 @@ impl<'tcx> FieldByteOffsetCache<'tcx> {
                 let variant = adt_def.variants().iter().next().expect("at least one variant");
                 // All fields start at no offset.
                 for (field_idx, field) in variant.fields.iter().enumerate() {
-                    let field_ty = field_ty(tcx, field, args);
+                    let field_ty = field_ty(tcx, field, *args);
                     let byte_offset = 0;
                     let proj = vec![PathSelector::UnionField(field_idx)];
                     fields_byte_offsets.insert(proj.clone(), byte_offset);
@@ -595,7 +595,7 @@ pub fn get_field_type<'tcx>(tcx: TyCtxt<'tcx>, base_ty: Ty<'tcx>, ordinal: usize
             let variant = def.variants().iter().next().expect("at least one variant");
             assert!(ordinal < variant.fields.len(), "field {ordinal} is outside {base_ty} with {} fields", variant.fields.len());
             let field = &variant.fields[FieldIdx::from_usize(ordinal)];
-            let ft = field_ty(tcx, field, args);
+            let ft = field_ty(tcx, field, *args);
             return ft;
         } else {
             warn!("Getting the field type with ordinal {:?} for a Enum type {:?} ", ordinal, base_ty);
@@ -630,7 +630,7 @@ pub fn get_downcast_type<'tcx>(tcx: TyCtxt<'tcx>, base_ty: Ty<'tcx>, variant_idx
         } else {
             def.variant(variant_idx)
         };
-        let field_tys = variant.fields.iter().map(|field| field_ty(tcx, field, args));
+        let field_tys = variant.fields.iter().map(|field| field_ty(tcx, field, *args));
         Ty::new_tup_from_iter(tcx, field_tys)
     } else if let TyKind::Coroutine(def_id, args) = base_ty.kind() {
         let mut tuple_types = args.as_coroutine().state_tys(*def_id, tcx);
@@ -649,7 +649,7 @@ pub fn get_downcast_type<'tcx>(tcx: TyCtxt<'tcx>, base_ty: Ty<'tcx>, variant_idx
     }
 }
 
-pub fn field_ty<'tcx>(tcx: TyCtxt<'tcx>, field: &FieldDef, generic_args: GenericArgsRef<'tcx>) -> Ty<'tcx> {
+pub fn field_ty<'tcx>(tcx: TyCtxt<'tcx>, field: &FieldDef, generic_args: GenericArgs<'tcx>) -> Ty<'tcx> {
     // let ft = field.ty(tcx, generic_args);
     let field_ty = tcx.type_of(field.did).skip_binder();
     let substs_specializer =
@@ -658,7 +658,7 @@ pub fn field_ty<'tcx>(tcx: TyCtxt<'tcx>, field: &FieldDef, generic_args: Generic
 }
 
 /// Returns false if any of the generic arguments are themselves generic
-pub fn are_concrete(generic_args: GenericArgsRef<'_>) -> bool {
+pub fn are_concrete(generic_args: GenericArgs<'_>) -> bool {
     for gen_arg in generic_args.iter() {
         if let GenericArgKind::Type(ty) = gen_arg.kind() {
             if !is_concrete(ty.kind()) {
@@ -677,7 +677,7 @@ pub fn is_concrete(ty_kind: &TyKind<'_>) -> bool {
         | TyKind::Coroutine(_, gen_args)
         | TyKind::CoroutineWitness(_, gen_args)
         | TyKind::Alias(_, rustc_middle::ty::AliasTy { args: gen_args, .. }) => {
-            are_concrete(gen_args)
+            are_concrete(*gen_args)
         }
         TyKind::FnDef(_, args) => are_concrete(args.skip_binder()),
         TyKind::Tuple(types) => types.iter().all(|t| is_concrete(t.kind())),
@@ -803,9 +803,9 @@ pub fn remove_transparent_wrapper<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Opti
                 });
                 if let Some((i, field)) = non_zst_field {
                     if def.is_union() {
-                        return Some((PathSelector::UnionField(i), field_ty(tcx, field, args)));
+                        return Some((PathSelector::UnionField(i), field_ty(tcx, field, *args)));
                     } else {
-                        return Some((PathSelector::Field(i), field_ty(tcx, field, args)));
+                        return Some((PathSelector::Field(i), field_ty(tcx, field, *args)));
                     }
                 }
             }
@@ -822,7 +822,7 @@ pub fn is_transparent_wrapper(ty: Ty) -> bool {
     };
 }
 
-pub fn function_return_type<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, gen_args: GenericArgsRef<'tcx>) -> Ty<'tcx> {
+pub fn function_return_type<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, gen_args: GenericArgs<'tcx>) -> Ty<'tcx> {
     let fn_sig = tcx.fn_sig(def_id);
     let ret_type = fn_sig.skip_binder().output().skip_binder();
     let generic_args = gen_args.iter().map(|t| GenericArgE::from(&t)).collect();
@@ -830,7 +830,7 @@ pub fn function_return_type<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, gen_args: Ge
     substs_specializer.specialize_generic_argument_type(ret_type)
 }
 
-pub fn closure_return_type<'tcx>(tcx: TyCtxt<'tcx>, _def_id: DefId, gen_args: GenericArgsRef<'tcx>) -> Ty<'tcx> {
+pub fn closure_return_type<'tcx>(tcx: TyCtxt<'tcx>, _def_id: DefId, gen_args: GenericArgs<'tcx>) -> Ty<'tcx> {
     let fn_sig = gen_args.as_closure().sig();
     let ret_type = fn_sig.skip_binder().output();
     let generic_args = gen_args.iter().map(|t| GenericArgE::from(&t)).collect();
@@ -864,7 +864,7 @@ pub fn projections_and_types<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Vec<(Proj
             // If this adt is a struct or union, there will be a single variant containing all the fields.
             let variant = adt_def.variants().iter().next().expect("at least one variant");
             for (i, field) in variant.fields.iter().enumerate() {
-                let field_ty = field_ty(tcx, field, args);
+                let field_ty = field_ty(tcx, field, *args);
                 let field = if adt_def.is_struct() {
                     PathSelector::Field(i)
                 } else {
@@ -888,7 +888,7 @@ pub fn projections_and_types<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Vec<(Proj
                     .for_each(|(variant_idx, variant)| {
                         let downcast = PathSelector::Downcast(variant_idx);
                         for (i, field) in variant.fields.iter().enumerate() {
-                            let field_ty = field_ty(tcx, field, args);
+                            let field_ty = field_ty(tcx, field, *args);
                             let field = PathSelector::Field(i);
                             fields.push((vec![downcast.clone(), field.clone()], field_ty));
                             // recursively get the subfields of this field
@@ -979,7 +979,7 @@ pub fn get_value_projections<'tcx>(
             // If this adt is a struct or union, there will be a single variant containing all the fields.
             let variant = adt_def.variants().iter().next().expect("at least one variant");
             for (i, field) in variant.fields.iter().enumerate() {
-                let field_ty = field_ty(tcx, field, args);
+                let field_ty = field_ty(tcx, field, *args);
                 let field = if adt_def.is_struct() {
                     PathSelector::Field(i)
                 } else {
@@ -1005,7 +1005,7 @@ pub fn get_value_projections<'tcx>(
                     .for_each(|(variant_idx, variant)| {
                         let downcast = PathSelector::Downcast(variant_idx);
                         for (i, field) in variant.fields.iter().enumerate() {
-                            let field_ty = field_ty(tcx, field, args);
+                            let field_ty = field_ty(tcx, field, *args);
                             let field = PathSelector::Field(i);
                             if field_ty.is_any_ptr() {
                                 ptr_projs.push((vec![downcast.clone(), field.clone()], field_ty));
@@ -1143,7 +1143,7 @@ fn flatten_fields_recursively<'tcx>(
                     let layout = layout.for_variant(&cx, variant);
                     let base = Path::new_downcast(path.clone(), variant.as_usize());
                     for (field, definition) in definition.fields.iter_enumerated() {
-                        let ty = field_ty(tcx, definition, args);
+                        let ty = field_ty(tcx, definition, *args);
                         let offset = base_offset + layout.fields.offset(field.as_usize()).bytes_usize();
                         flatten_fields_recursively(tcx, param_env,
                             Path::new_field(base.clone(), field.as_usize()), ty, offset, flattened_fields);
@@ -1155,7 +1155,7 @@ fn flatten_fields_recursively<'tcx>(
                 let variant = adt_def.variants().iter().next().expect("at least one variant");
                 for (i, field) in variant.fields.iter().enumerate() {
                     let field_path = Path::new_union_field(path.clone(), i);
-                    let field_ty = field_ty(tcx, field, args);
+                    let field_ty = field_ty(tcx, field, *args);
                     flatten_fields_recursively(
                         tcx,
                         param_env,
@@ -1184,7 +1184,7 @@ fn flatten_fields_recursively<'tcx>(
                             let index = index.index();
                             let field = &variant.fields[FieldIdx::from_usize(index)];
                             let field_path = Path::new_field(path.clone(), index);
-                            let field_ty = field_ty(tcx, field, args);
+                            let field_ty = field_ty(tcx, field, *args);
                             let offset = offsets[FieldIdx::from_usize(index)].bytes_usize() + base_offset;
                             flatten_fields_recursively(
                                 tcx,
@@ -1300,7 +1300,7 @@ fn find_fields_at_start_location<'tcx>(
                 let variant = adt_def.variants().iter().next().expect("at least one variant");
                 variant.fields.iter().enumerate().for_each(|(i, field)| {
                     let field_path = Path::new_union_field(path.clone(), i);
-                    let field_ty = field_ty(tcx, field, args);
+                    let field_ty = field_ty(tcx, field, *args);
                     fields_at_start_location.push((field_path.clone(), field_ty));
                     find_fields_at_start_location(
                         tcx,
@@ -1333,7 +1333,7 @@ fn find_fields_at_start_location<'tcx>(
                             if offset == 0 {
                                 let field = &variant.fields[FieldIdx::from_usize(index)];
                                 let field_path = Path::new_field(path.clone(), index);
-                                let field_ty = field_ty(tcx, field, args);
+                                let field_ty = field_ty(tcx, field, *args);
                                 fields_at_start_location.push((field_path.clone(), field_ty));
                                 find_fields_at_start_location(
                                     tcx,
@@ -1455,12 +1455,12 @@ pub fn equivalent_ptr_types<'tcx>(tcx: TyCtxt<'tcx>, ty1: Ty<'tcx>, ty2: Ty<'tcx
         let fields = &def1.non_enum_variant().fields;
         let Some(tail) = fields.iter().last() else { break; };
         if !fields.iter().take(fields.len() - 1).all(|field|
-            field_ty(tcx, field, args1) == field_ty(tcx, field, args2))
+            field_ty(tcx, field, *args1) == field_ty(tcx, field, *args2))
         {
             break;
         }
-        tail1 = field_ty(tcx, tail, args1);
-        tail2 = field_ty(tcx, tail, args2);
+        tail1 = field_ty(tcx, tail, *args1);
+        tail2 = field_ty(tcx, tail, *args2);
         if tail1.is_trait() || tail2.is_trait() { return true; }
     }
     if !deref_ty1.is_any_ptr() || !deref_ty2.is_any_ptr() {

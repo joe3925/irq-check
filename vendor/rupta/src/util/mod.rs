@@ -5,7 +5,7 @@
 
 use rustc_hir::def_id::DefId;
 use rustc_middle::mir;
-use rustc_middle::ty::{GenericArgsRef, TyCtxt, TyKind};
+use rustc_middle::ty::{GenericArgs, TyCtxt, TyKind};
 use std::rc::Rc;
 
 use crate::mir::function::GenericArgE;
@@ -76,7 +76,7 @@ pub fn has_self_ref_parameter(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
 pub fn is_dynamic_call<'tcx>(
     tcx: TyCtxt<'tcx>,
     callee_def_id: DefId,
-    callee_substs: GenericArgsRef<'tcx>,
+    callee_substs: GenericArgs<'tcx>,
 ) -> bool {
     if !is_trait_method(tcx, callee_def_id) {
         return false;
@@ -94,7 +94,7 @@ pub fn is_dynamic_call<'tcx>(
 
 
 #[inline]
-pub fn customize_generic_args<'tcx>(_tcx: TyCtxt<'tcx>, generic_args: GenericArgsRef<'tcx>) -> Vec<GenericArgE<'tcx>> {
+pub fn customize_generic_args<'tcx>(_tcx: TyCtxt<'tcx>, generic_args: GenericArgs<'tcx>) -> Vec<GenericArgE<'tcx>> {
     generic_args.iter().map(|arg| GenericArgE::from(&arg)).collect()
 }
 

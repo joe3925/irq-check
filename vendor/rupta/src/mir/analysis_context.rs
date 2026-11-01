@@ -7,7 +7,7 @@ use log::*;
 use rustc_hir::def_id::DefId;
 use rustc_index::IndexVec;
 use rustc_middle::mir::Promoted;
-use rustc_middle::ty::{GenericArgsRef, Instance, Ty, TyCtxt};
+use rustc_middle::ty::{GenericArgs, Instance, Ty, TyCtxt};
 use rustc_session::Session;
 
 use std::collections::hash_map::Entry;
@@ -252,7 +252,7 @@ impl<'tcx, 'compilation> AnalysisContext<'tcx, 'compilation> {
         self.functions.get(func_id).unwrap().clone()
     }
 
-    pub fn get_func_id(&mut self, def_id: DefId, gen_args: GenericArgsRef<'tcx>) -> FuncId {
+    pub fn get_func_id(&mut self, def_id: DefId, gen_args: GenericArgs<'tcx>) -> FuncId {
         if matches!(
             self.tcx.def_kind(def_id),
             rustc_hir::def::DefKind::Fn | rustc_hir::def::DefKind::AssocFn
@@ -304,7 +304,7 @@ impl<'tcx, 'compilation> AnalysisContext<'tcx, 'compilation> {
         &mut self,
         callsite: BaseCallSite,
         callee_id: DefId,
-        gen_args: GenericArgsRef<'tcx>,
+        gen_args: GenericArgs<'tcx>,
     ) {
         self.dyn_callsite_cache
             .insert(callsite, (callee_id, gen_args));

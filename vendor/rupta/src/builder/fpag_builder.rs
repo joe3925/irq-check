@@ -20,7 +20,7 @@ use rustc_middle::mir;
 use rustc_middle::mir::interpret::{GlobalAlloc, Scalar};
 use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty;
-use rustc_middle::ty::{Const, Ty, TyCtxt, TyKind, GenericArgsRef};
+use rustc_middle::ty::{Const, Ty, TyCtxt, TyKind, GenericArgs};
 use rustc_span::Spanned;
 use rustc_abi::FieldIdx;
 use crate::builder::{call_graph_builder, special_function_handler};
@@ -351,7 +351,7 @@ impl<'pta, 'tcx, 'compilation> FuncPAGBuilder<'pta, 'tcx, 'compilation> {
                             } else {
                                 PathSelector::Field(index)
                             });
-                            pending.push((type_util::field_ty(self.tcx(), field, args), field_projection));
+                            pending.push((type_util::field_ty(self.tcx(), field, *args), field_projection));
                         }
                     }
                 }
@@ -414,7 +414,7 @@ impl<'pta, 'tcx, 'compilation> FuncPAGBuilder<'pta, 'tcx, 'compilation> {
                 self.visit_call(func, args, &mir::Place::from(mir::RETURN_PLACE), location);
             }
             mir::TerminatorKind::Assert { msg, .. } => {
-                use rustc_hir::attrs::lang_items::LangItem;
+                use rustc_attr_ir::lang_items::LangItem;
                 let (lang_item, operands) = match &**msg {
                     mir::AssertKind::BoundsCheck { len, index } => {
                         (LangItem::PanicBoundsCheck, vec![index, len])
@@ -837,7 +837,7 @@ let gen_args = &self.tcx().instantiate_bound_regions_with_erased(*gen_args);
                     }
                     TyKind::FnDef(def_id, args) => {
 let args = &self.tcx().instantiate_bound_regions_with_erased(*args);
-                        self.visit_function_reference(*def_id, args)
+                        self.visit_function_reference(*def_id, *args)
                     }
                     _ => Path::new_constant(),
                 }
@@ -1068,7 +1068,7 @@ let args = &self.tcx().instantiate_bound_regions_with_erased(*args);
                             .expect("Expect a FnDef type");
                         if let TyKind::FnDef(def_id, substs) = rh_ty.kind() {
 let substs = &self.tcx().instantiate_bound_regions_with_erased(*substs);
-                            rh_path = self.visit_function_reference(*def_id, substs);
+                            rh_path = self.visit_function_reference(*def_id, *substs);
                         } else {
                             unreachable!("Unexpected type of operand in ReifyFnPointer cast!");
                         }
@@ -1322,7 +1322,7 @@ let substs = &self.tcx().instantiate_bound_regions_with_erased(*substs);
                 let adt_def = self.tcx().adt_def(*def);
                 let variant_def = &adt_def.variants()[*variant_idx];
                 // let adt_ty = self.tcx().type_of(def).skip_binder();
-                let args = self.substs_specializer.specialize_generic_args(args);
+                let args = self.substs_specializer.specialize_generic_args(*args);
                 if adt_def.is_union() {
                     let case_index = case_index.unwrap_or(0usize.into());
                     let field_path = Path::new_union_field(path, case_index.into());
@@ -1369,13 +1369,13 @@ let substs = &self.tcx().instantiate_bound_regions_with_erased(*substs);
     fn resolve_call(
         &mut self,
         callee_def_id: &DefId,
-        gen_args: &GenericArgsRef<'tcx>,
+        gen_args: &GenericArgs<'tcx>,
         args: &[Spanned<mir::Operand<'tcx>>],
         destination: &mir::Place<'tcx>,
         location: mir::Location,
     ) {
         // Specialize callee's substs from known generic types
-        let gen_args = self.substs_specializer.specialize_generic_args(gen_args);
+        let gen_args = self.substs_specializer.specialize_generic_args(*gen_args);
         let args = self.visit_args(args);
         let destination = self.get_path_for_place(destination);
         debug!("Call func {:?}, generic_args: {:?}", callee_def_id, gen_args);
@@ -1549,7 +1549,7 @@ let substs = &self.tcx().instantiate_bound_regions_with_erased(*substs);
     fn resolve_fntrait_call(
         &mut self,
         callee_def_id: &DefId,
-        gen_args: &GenericArgsRef<'tcx>,
+        gen_args: &GenericArgs<'tcx>,
         args: Vec<Rc<Path>>,
         destination: Rc<Path>,
         location: mir::Location,
@@ -1567,7 +1567,7 @@ let substs = &self.tcx().instantiate_bound_regions_with_erased(*substs);
             return;
         }
         let resolved_instance =
-            rustc_middle::ty::Instance::try_resolve(self.tcx(), param_env, *callee_def_id, gen_args);
+            rustc_middle::ty::Instance::try_resolve(self.tcx(), param_env, *callee_def_id, *gen_args);
         if let Ok(Some(instance)) = resolved_instance {
             let resolved_def_id = instance.def.def_id();
 
@@ -1647,7 +1647,7 @@ let substs = &self.tcx().instantiate_bound_regions_with_erased(*substs);
     pub fn inline_indirectly_called_function(
         &mut self,
         callee_def_id: &DefId,
-        gen_args: &GenericArgsRef<'tcx>,
+        gen_args: &GenericArgs<'tcx>,
         args: Vec<Rc<Path>>,
         destination: Rc<Path>,
         location: mir::Location,
@@ -1693,7 +1693,7 @@ let substs = &self.tcx().instantiate_bound_regions_with_erased(*substs);
 let substs = &self.tcx().instantiate_bound_regions_with_erased(*substs);
                 // Fn*::call* itself cannot be the first argument as it is a trait method without
                 // a implementation, therefore we do not need to worry about the recursive std_ops_func_call.
-                let (def_id, substs) = call_graph_builder::resolve_fn_def(self.tcx(), *def_id, substs);
+                let (def_id, substs) = call_graph_builder::resolve_fn_def(self.tcx(), *def_id, *substs);
                 let callee_func_id = self.acx.get_func_id(def_id, substs);
                 // Set up a callsite
                 let callsite = self.new_callsite(self.func_id, location, actual_args, destination);
@@ -1728,7 +1728,7 @@ let substs = &self.tcx().instantiate_bound_regions_with_erased(*substs);
 
                 // Set up a callsite
                 let callsite = self.new_callsite(self.func_id, location, actual_args, destination);
-                let callee_func_id = self.acx.get_func_id(*def_id, substs);
+                let callee_func_id = self.acx.get_func_id(*def_id, *substs);
                 self.fpag.add_static_dispatch_callsite(callsite, callee_func_id);
             }
             TyKind::FnPtr(..) => {
@@ -1753,7 +1753,7 @@ let substs = &self.tcx().instantiate_bound_regions_with_erased(*substs);
                 // Use the original args instead of the actual args
                 let dyn_fn_obj = args[0].clone();
                 let dyn_callsite = self.new_callsite(self.func_id, location, args, destination);
-                self.acx.add_dyn_callsite(dyn_callsite.clone().into(), *callee_def_id, gen_args);
+                self.acx.add_dyn_callsite(dyn_callsite.clone().into(), *callee_def_id, *gen_args);
                 // This call maybe a dyn FnOnce call, in which case the dyn_fn_obj would be
                 // of dyn FnOnce type instead a reference type (occurs for a function call
                 // via a Box<dyn FnOnce> object). In this case, the first argument would be a
@@ -1857,7 +1857,7 @@ let substs = &self.tcx().instantiate_bound_regions_with_erased(*substs);
                             .specialize_generic_argument_type(type_util::field_ty(
                                 self.tcx(),
                                 source_field,
-                                substs,
+                                *substs,
                             ));
                     let source_path = Path::new_union_field(union_path.clone(), field_index);
                     self.acx.set_path_rustc_type(source_path.clone(), source_type);
@@ -1866,7 +1866,7 @@ let substs = &self.tcx().instantiate_bound_regions_with_erased(*substs);
                             continue;
                         }
                         let target_type = self.substs_specializer.specialize_generic_argument_type(
-                            type_util::field_ty(self.tcx(), field, substs),
+                            type_util::field_ty(self.tcx(), field, *substs),
                         );
                         let target_path = Path::new_union_field(union_path.clone(), i);
                         self.acx.set_path_rustc_type(target_path.clone(), target_type);
@@ -2073,7 +2073,7 @@ let substs = &self.tcx().instantiate_bound_regions_with_erased(*substs);
     // Returns a Function path for the given `def_id` and `gen_args`, no matter if the corresponding mir
     // is unavailable.
     // If the function refers to a specific implementation of a trait method, devirtualize it.
-    fn visit_function_reference(&mut self, def_id: DefId, gen_args: GenericArgsRef<'tcx>) -> Rc<Path> {
+    fn visit_function_reference(&mut self, def_id: DefId, gen_args: GenericArgs<'tcx>) -> Rc<Path> {
         // Specialize substs from current generic types
         let substs = self.substs_specializer.specialize_generic_args(gen_args);
         let (def_id, substs) = call_graph_builder::resolve_fn_def(self.tcx(), def_id, substs);
@@ -2088,7 +2088,7 @@ let substs = &self.tcx().instantiate_bound_regions_with_erased(*substs);
     fn new_closure_path(&mut self, closure_ty: Ty<'tcx>) -> Rc<Path> { 
         let closure_ty = self.substs_specializer.specialize_generic_argument_type(closure_ty);
         if let TyKind::Closure(def_id, args) = closure_ty.kind() {
-            let func_id = self.acx.get_func_id(*def_id, args);
+            let func_id = self.acx.get_func_id(*def_id, *args);
             let path = Path::new_function(func_id);
             self.acx
                 .set_path_rustc_type(path.clone(), closure_ty);
@@ -2173,7 +2173,7 @@ let substs = &self.tcx().instantiate_bound_regions_with_erased(*substs);
                             let mut aliases = HashMap::new();
                             let environment = ty::TypingEnv::fully_monomorphized();
                             if let TyKind::Coroutine(definition, args) = coroutine_ty.kind()
-                                && let Ok(layout) = tcx.coroutine_layout(*definition, args)
+                                && let Ok(layout) = tcx.coroutine_layout(*definition, *args)
                                 && let Ok(storage) = tcx.layout_of(environment.as_query_input(coroutine_ty))
                             {
                                 let cx = ty::layout::LayoutCx::new(tcx, environment);

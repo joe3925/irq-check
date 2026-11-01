@@ -3,7 +3,8 @@ use std::time::{Instant, Duration};
 use log::*;
 
 use rustc_hir::def_id::DefId;
-use rustc_middle::ty::{PolyFnSig, GenericArgsRef, Ty, TyCtxt};
+use rustc_middle::ty::{PolyFnSig, GenericArgs, Ty, TyCtxt};
+use rustc_middle::ty::inherent::SliceLike;
 
 use crate::builder::call_graph_builder;
 use crate::graph::call_graph::CallGraph;
@@ -30,8 +31,8 @@ pub struct RapidTypeAnalysis<'a, 'tcx, 'compilation> {
 
 
     pub static_callsites: HashSet<BaseCallSite>,
-    pub dyn_callsites: HashMap<Ty<'tcx>, HashSet<(BaseCallSite, DefId, GenericArgsRef<'tcx>)>>,
-    pub dyn_fntrait_callsites: HashMap<Ty<'tcx>, HashSet<(BaseCallSite, DefId, GenericArgsRef<'tcx>)>>,
+    pub dyn_callsites: HashMap<Ty<'tcx>, HashSet<(BaseCallSite, DefId, GenericArgs<'tcx>)>>,
+    pub dyn_fntrait_callsites: HashMap<Ty<'tcx>, HashSet<(BaseCallSite, DefId, GenericArgs<'tcx>)>>,
     pub fnptr_callsites: HashMap<Ty<'tcx>, HashSet<BaseCallSite>>,
 
     pub dynamic_to_possible_concrete_types: HashMap<Ty<'tcx>, HashSet<Ty<'tcx>>>,
@@ -168,7 +169,7 @@ impl<'a, 'tcx, 'compilation> RapidTypeAnalysis<'a, 'tcx, 'compilation> {
             &*{&self.dynamic_to_possible_concrete_types as *const HashMap<Ty<'tcx>, HashSet<Ty<'tcx>>>}
         };
         let dyn_callsites = unsafe {
-            &*{&self.dyn_callsites as *const HashMap<Ty<'tcx>, HashSet<(BaseCallSite, DefId, GenericArgsRef<'tcx>)>>}
+            &*{&self.dyn_callsites as *const HashMap<Ty<'tcx>, HashSet<(BaseCallSite, DefId, GenericArgs<'tcx>)>>}
         };
         for (dyn_ty, concrete_types) in dynamic_to_possible_concrete_types {
             if let Some(dyn_callsites_tuple) = dyn_callsites.get(dyn_ty) {
@@ -199,7 +200,7 @@ impl<'a, 'tcx, 'compilation> RapidTypeAnalysis<'a, 'tcx, 'compilation> {
             &*{&self.dynamic_to_possible_concrete_types as *const HashMap<Ty<'tcx>, HashSet<Ty<'tcx>>>}
         };
         let dyn_fntrait_callsites = unsafe {
-            &*{&self.dyn_fntrait_callsites as *const HashMap<Ty<'tcx>, HashSet<(BaseCallSite, DefId, GenericArgsRef<'tcx>)>>}
+            &*{&self.dyn_fntrait_callsites as *const HashMap<Ty<'tcx>, HashSet<(BaseCallSite, DefId, GenericArgs<'tcx>)>>}
         };
         for (dyn_fntrait_ty, callsites_tuple) in dyn_fntrait_callsites {
             if let Some(concrete_types) = dynamic_to_possible_concrete_types.get(dyn_fntrait_ty) {
@@ -208,7 +209,7 @@ impl<'a, 'tcx, 'compilation> RapidTypeAnalysis<'a, 'tcx, 'compilation> {
                         rustc_middle::ty::TyKind::Closure(def_id, substs) | rustc_middle::ty::TyKind::Coroutine(def_id, substs) => {
                             for (callsite, _, _) in callsites_tuple {
                                 // try to devirtualize the def_id first
-                                let (def_id, substs) = call_graph_builder::resolve_fn_def(self.tcx(), *def_id, substs);
+                                let (def_id, substs) = call_graph_builder::resolve_fn_def(self.tcx(), *def_id, *substs);
                                 let func_id = self.acx.get_func_id(def_id, substs);
                                 self.add_call_edge(*callsite, func_id);
                             }
@@ -217,7 +218,7 @@ rustc_middle::ty::TyKind::FnDef(def_id, substs) => {
 let substs = &self.tcx().instantiate_bound_regions_with_erased(*substs);
                             for (callsite, _, _) in callsites_tuple {
                                 // try to devirtualize the def_id first
-                                let (def_id, substs) = call_graph_builder::resolve_fn_def(self.tcx(), *def_id, substs);
+                                let (def_id, substs) = call_graph_builder::resolve_fn_def(self.tcx(), *def_id, *substs);
                                 let func_id = self.acx.get_func_id(def_id, substs);
                                 self.add_call_edge(*callsite, func_id);
                             }
@@ -279,12 +280,12 @@ let fn_sig = fnptr_type.fn_sig(self.tcx());
                             for fn_item_ty in possible_targets {
                                 match fn_item_ty.kind() {
                                     rustc_middle::ty::TyKind::Closure(def_id, substs) | rustc_middle::ty::TyKind::Coroutine(def_id, substs) => {
-                                        let func_id = self.acx.get_func_id(*def_id, substs);
+                                        let func_id = self.acx.get_func_id(*def_id, *substs);
                                         self.add_call_edge(*callsite, func_id);
                                     }
 rustc_middle::ty::TyKind::FnDef(def_id, substs) => {
 let substs = &self.tcx().instantiate_bound_regions_with_erased(*substs);
-                                        let func_id = self.acx.get_func_id(*def_id, substs);
+                                        let func_id = self.acx.get_func_id(*def_id, *substs);
                                         self.add_call_edge(*callsite, func_id);
                                     }
                                     _ => {
@@ -331,7 +332,7 @@ let substs = &self.tcx().instantiate_bound_regions_with_erased(*substs);
         self.set_callsite_type(callsite, CallType::StaticDispatch);
     }
 
-    pub fn add_dyn_callsite(&mut self, callsite: BaseCallSite, callee_def_id: DefId, callee_substs: GenericArgsRef<'tcx>) {
+    pub fn add_dyn_callsite(&mut self, callsite: BaseCallSite, callee_def_id: DefId, callee_substs: GenericArgs<'tcx>) {
         let dyn_type = type_util::strip_auto_traits(
             self.tcx(), 
             self.tcx().erase_and_anonymize_regions(callee_substs[0].expect_ty())
@@ -342,7 +343,7 @@ let substs = &self.tcx().instantiate_bound_regions_with_erased(*substs);
         self.set_callsite_type(callsite, CallType::DynamicDispatch);
     }
 
-    pub fn add_dyn_fntrait_callsite(&mut self, callsite: BaseCallSite, callee_def_id: DefId, callee_substs: GenericArgsRef<'tcx>) {
+    pub fn add_dyn_fntrait_callsite(&mut self, callsite: BaseCallSite, callee_def_id: DefId, callee_substs: GenericArgs<'tcx>) {
         let dyn_fntrait_type = type_util::strip_auto_traits(
             self.tcx(), 
             self.tcx().erase_and_anonymize_regions(callee_substs[0].expect_ty())

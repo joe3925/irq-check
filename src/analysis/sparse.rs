@@ -2573,7 +2573,7 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                     msg,
                     ..
                 } => {
-                    use rustc_hir::attrs::lang_items::LangItem;
+                    use rustc_attr_ir::lang_items::LangItem;
                     let condition_ty = self.ty(point.frame, cond.ty(index.body, self.tcx));
                     let item = match &**msg {
                         mir::AssertKind::BoundsCheck { .. } => LangItem::PanicBoundsCheck,

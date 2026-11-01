@@ -1820,7 +1820,7 @@ impl<'tcx> GlobalPointers<'tcx> {
                         }
                     }
                     TerminatorKind::Assert { msg, .. } => {
-                        use rustc_hir::attrs::lang_items::LangItem;
+                        use rustc_attr_ir::lang_items::LangItem;
                         let item = match &**msg {
                             rustc_middle::mir::AssertKind::BoundsCheck { .. } => {
                                 LangItem::PanicBoundsCheck
@@ -2332,7 +2332,7 @@ impl<'tcx> GlobalPointers<'tcx> {
                             .then(|| Instance::resolve_drop_glue(tcx, ty))
                     }
                     rustc_middle::mir::TerminatorKind::Assert { msg, .. } => {
-                        use rustc_hir::attrs::lang_items::LangItem;
+                        use rustc_attr_ir::lang_items::LangItem;
                         let item = match &**msg {
                             rustc_middle::mir::AssertKind::BoundsCheck { .. } => {
                                 LangItem::PanicBoundsCheck

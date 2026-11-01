@@ -1074,7 +1074,7 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                 self.budget.scratch = scratch.saturating_add(self.effects.pending_bytes.saturating_sub(retained));
                 self.budget.reserve(bytes)?;
                 match &data.terminator().kind {
-                    TerminatorKind::Goto { target } => block = *target,
+                    TerminatorKind::Goto { target, .. } => block = *target,
                     TerminatorKind::InlineAsm { options, operands, targets, .. }
                         if options.intersects(rustc_ast::InlineAsmOptions::NOMEM | rustc_ast::InlineAsmOptions::READONLY)
                             && targets.len() == 1 => {

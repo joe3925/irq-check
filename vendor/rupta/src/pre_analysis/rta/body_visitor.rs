@@ -1,8 +1,8 @@
 use rustc_hir::def_id::DefId;
-use rustc_hir::attrs::lang_items::LangItem;
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_middle::mir;
 use rustc_middle::mir::interpret::{GlobalAlloc, Scalar};
-use rustc_middle::ty::{Ty, TyCtxt, TyKind, GenericArgsRef};
+use rustc_middle::ty::{Ty, TyCtxt, TyKind, GenericArgs};
 use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_span::Spanned;
 
@@ -287,12 +287,12 @@ let callee_substs = &self.tcx().instantiate_bound_regions_with_erased(*callee_su
     fn resolve_call(
         &mut self, 
         callee_def_id: &DefId, 
-        gen_args: &GenericArgsRef<'tcx>,
+        gen_args: &GenericArgs<'tcx>,
         location: mir::Location,
         _args: &[Spanned<mir::Operand<'tcx>>],
     ) {
         // Specialize callee's substs from known generic types
-        let gen_args = self.substs_specializer.specialize_generic_args(gen_args);
+        let gen_args = self.substs_specializer.specialize_generic_args(*gen_args);
         debug!("Call func {:?}, generic_args: {:?}", callee_def_id, gen_args);
 
         if special_function_handler::is_specially_handled_function(self.acx(), *callee_def_id) {
@@ -359,7 +359,7 @@ let callee_substs = &self.tcx().instantiate_bound_regions_with_erased(*callee_su
     fn resolve_fntrait_call(
         &mut self, 
         callee_def_id: &DefId, 
-        gen_args: &GenericArgsRef<'tcx>,
+        gen_args: &GenericArgs<'tcx>,
         location: mir::Location,
     ) {
         // The fn_traits feature allows for implementation of the Fn* traits for 
@@ -376,7 +376,7 @@ let callee_substs = &self.tcx().instantiate_bound_regions_with_erased(*callee_su
             self.tcx(),
             param_env,
             *callee_def_id,
-            gen_args,
+            *gen_args,
         );
         if let Ok(Some(instance)) = resolved_instance {
             let resolved_def_id = instance.def.def_id();
@@ -427,7 +427,7 @@ let callee_substs = &self.tcx().instantiate_bound_regions_with_erased(*callee_su
     fn inline_indirectly_called_function(
         &mut self, 
         callee_def_id: &DefId, 
-        gen_args: &GenericArgsRef<'tcx>,
+        gen_args: &GenericArgs<'tcx>,
         location: mir::Location,
     ) {
         // If the first substution is a closure or FnDef, we can inline the closure call directly.
@@ -438,7 +438,7 @@ let callee_substs = &self.tcx().instantiate_bound_regions_with_erased(*callee_su
 let substs = &self.tcx().instantiate_bound_regions_with_erased(*substs);
                 // Fn*::call* itself cannot be the first argument as it is a trait method without 
                 // a implementation, therefore we do not need to worry about the recursive std_ops_func_call.
-                let (def_id, substs) = call_graph_builder::resolve_fn_def(self.tcx(), *def_id, substs);
+                let (def_id, substs) = call_graph_builder::resolve_fn_def(self.tcx(), *def_id, *substs);
                 let callee_func_id = self.acx().get_func_id(def_id, substs);
                 // Set up a callsite
                 let callsite = BaseCallSite::new(self.func_id, location);
@@ -449,7 +449,7 @@ let substs = &self.tcx().instantiate_bound_regions_with_erased(*substs);
             | TyKind::Coroutine(def_id, substs) => {        
                 // Set up a callsite
                 let callsite = BaseCallSite::new(self.func_id, location);
-                let callee_func_id = self.acx().get_func_id(*def_id, substs);
+                let callee_func_id = self.acx().get_func_id(*def_id, *substs);
                 self.rta.add_static_callsite(callsite);
                 self.rta.add_call_edge(callsite, callee_func_id);
             }
@@ -461,7 +461,7 @@ let substs = &self.tcx().instantiate_bound_regions_with_erased(*substs);
             // e.g. &dyn FnMut(..)
             TyKind::Dynamic(..) => {
                 let callsite = BaseCallSite::new(self.func_id, location);
-                self.rta.add_dyn_fntrait_callsite(callsite, *callee_def_id, gen_args);
+                self.rta.add_dyn_fntrait_callsite(callsite, *callee_def_id, *gen_args);
             }
             _ => {
                 error!("Unexpected first argument type in std::ops::call!");
@@ -501,7 +501,7 @@ let substs = &self.tcx().instantiate_bound_regions_with_erased(*substs);
             TyKind::FnDef(def_id, gen_args) => {
 let gen_args = &self.tcx().instantiate_bound_regions_with_erased(*gen_args);
                 // let gen_args = self.substs_specializer.specialize_generic_args(gen_args);
-                let (def_id, gen_args) = call_graph_builder::resolve_fn_def(self.tcx(), *def_id, gen_args);
+                let (def_id, gen_args) = call_graph_builder::resolve_fn_def(self.tcx(), *def_id, *gen_args);
                 Ty::new_fn_def(self.tcx(), def_id, rustc_middle::ty::Binder::dummy(gen_args))
             }
             _ => ty,
