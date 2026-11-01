@@ -561,7 +561,13 @@ fn main() -> std::process::ExitCode {
             }
         }
     }
-    if args.get(1).is_some_and(|arg| arg == "--version") {
+    if args.get(1).is_some_and(|arg| arg == "--version" || arg == "--self-check") {
+        if args[1] == "--self-check" {
+            if let Err(error) = irq_check_rupta::limits::install_process_limit() {
+                eprintln!("error: {error}");
+                return std::process::ExitCode::from(2);
+            }
+        }
         println!(
             "irq-check {} {TOOLCHAIN} {COMMIT} {}",
             env!("CARGO_PKG_VERSION"),

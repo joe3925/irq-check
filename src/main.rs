@@ -104,7 +104,7 @@ fn main() -> ExitCode {
         command.env(variable, env::join_paths(paths).unwrap());
     }
     if self_check {
-        return match command.arg("--version").output() {
+        return match command.arg("--self-check").output() {
             Ok(output) if output.status.success() => {
                 let expected = format!(
                     "irq-check {} {} {} {}",
@@ -145,7 +145,8 @@ fn main() -> ExitCode {
     });
     if args
         .iter()
-        .any(|arg| arg == "proc-macro" || arg == "build_script_build")
+        .any(|arg| arg == "proc-macro" || arg == "build_script_build"
+            || arg == "--version" || arg == "-V" || arg == "-vV" || arg == "-Vv")
     {
         return match Command::new(&rustc)
             .args(&args[1..])

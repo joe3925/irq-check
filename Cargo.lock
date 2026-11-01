@@ -50,7 +50,7 @@ dependencies = [
 
 [[package]]
 name = "irq-check"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "irq-check-rupta",
  "serde",
@@ -67,6 +67,7 @@ dependencies = [
  "humantime",
  "itertools",
  "lazy_static",
+ "libc",
  "log",
  "petgraph",
  "windows-sys",
@@ -92,6 +93,12 @@ name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
+
+[[package]]
+name = "libc"
+version = "0.2.191"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "log"

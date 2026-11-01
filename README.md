@@ -13,7 +13,7 @@ Add the Cargo bin directory to `PATH`. The rustOS `xtask irq-check` command uses
 
 Use the same installed nightly for the checker and the checked project. If you select another installed nightly, use its name in both commands. The checker records its build compiler identity. The launcher checks the selected compiler and the identity stored in the driver file before it loads the driver. A driver file without matching identity data is rejected. After a compiler update, rebuild and install both binaries. Compiler API changes can also require source changes.
 
-Run `irq-check --version` to read the build identity without loading the driver. Run `irq-check --self-check` to check the selected compiler and load the driver.
+Run `irq-check --version` to read the build identity without loading the driver. Run `irq-check --self-check` to check the selected compiler, load the driver, and start its memory and time monitor. The command fails if the host cannot apply the memory limit or start the monitor.
 
 irq-check is licensed under GPL-3.0-only. See LICENSE and NOTICE.
 
@@ -82,7 +82,7 @@ For primitive integer and Boolean root arguments, the checker first tries two se
 
 An unreachable block cuts IRQ queries before its pointer operations are evaluated. Global initialization discovery can still inspect that code. There is no fallback to the old context and flow solver, and no feedback loop from IRQ queries into Rupta.
 
-On Windows, each driver has a committed-memory limit of at most 10 GiB. A Job Object applies the limit before compiler work starts. The default time limit is two hours. A process limit rejects the complete analysis. Partial results cannot pass.
+On Windows, each driver has a committed-memory limit of at most 10 GiB. A Job Object applies the limit before compiler work starts. On Linux, `RLIMIT_AS` limits each driver's virtual address space to at most 10 GiB. An inherited lower limit is retained. This Linux limit includes reserved address space and file mappings. The monitor reads `VmSize` from `/proc/self/status` every 100 ms. It requests a stop at seven-eighths of the effective limit. If analysis does not stop within two seconds, the monitor exits the process with status 2. The default time limit is two hours. A process limit rejects the complete analysis. Partial results cannot pass.
 
 Each pointer query starts with 100,000 transfer steps. It can retry once with an increased allowance. The precise-query counter is retained, and conservative fallback has a separate bounded allowance. Each case retains at most 32 alternatives. Scratch accounting defaults to 256 MiB per query and 16 MiB per function. Query caches have a combined 1 GiB budget. Up to four workers process independent IRQ roots by default.
 
