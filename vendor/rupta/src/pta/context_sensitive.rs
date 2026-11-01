@@ -42,7 +42,7 @@ pub struct ContextSensitivePTA<'tcx, 'compilation, S: ContextStrategy> {
     /// The analysis context
     pub acx: AnalysisContext<'tcx, 'compilation>,
     /// Points-to data
-    pub(crate) pt_data: DiffPTDataTy,
+    pub pt_data: DiffPTDataTy,
     /// Pointer Assignment Graph
     pub pag: PAG<Rc<CSPath>>,
     /// Call graph
@@ -123,6 +123,21 @@ impl<'tcx, 'compilation, S: ContextStrategy> ContextSensitivePTA<'tcx, 'compilat
     #[inline]
     pub fn get_empty_context_id(&mut self) -> ContextId {
         self.ctx_strategy.get_empty_context_id()
+    }
+
+    pub fn analyze_callbacks(&mut self, callbacks: HashSet<FuncId>) {
+        if std::env::var_os("IRQ_CHECK_RUPTA_STATS").is_some() {
+            eprintln!("irq-check: RUPTA analyzing {} additional callback bodies", callbacks.len());
+        }
+        let context = self.get_context_id(&Rc::new(Context {
+            context_elems: Vec::new(), callback: true,
+        }));
+        self.callback_contexts.insert(context);
+        for function in callbacks {
+            self.acx.callback_roots.insert(function);
+            self.call_graph.add_node(CSFuncId::new(context, function));
+        }
+        self.process_reach_funcs();
     }
 
     /// Process statements in reachable functions.
@@ -490,23 +505,12 @@ impl<'tcx, 'compilation, S: ContextStrategy> PointerAnalysis<'tcx, 'compilation>
                         let declaration = rustc_middle::ty::Instance::mono(self.tcx(), reference.def_id);
                         self.acx.linked_definitions.contains_key(self.tcx().symbol_name(declaration).name)
                     } else {
-                        crate::util::type_util::has_instance_mir(self.tcx(), reference.kind)
+                        false
                     };
                     available.then_some(function)
                 }).collect();
                 if callbacks.is_empty() { break; }
-                if std::env::var_os("IRQ_CHECK_RUPTA_STATS").is_some() {
-                    eprintln!("irq-check: RUPTA analyzing {} additional callback bodies", callbacks.len());
-                }
-                let context = self.get_context_id(&Rc::new(Context {
-                    context_elems: Vec::new(), callback: true,
-                }));
-                self.callback_contexts.insert(context);
-                for function in callbacks {
-                    self.acx.callback_roots.insert(function);
-                    self.call_graph.add_node(CSFuncId::new(context, function));
-                }
-                self.process_reach_funcs();
+                self.analyze_callbacks(callbacks);
             } else {
                 // Note: RCEUS is for call-site sensitivity only,
                 // so new call instances become normal new calls there.
@@ -516,7 +520,6 @@ impl<'tcx, 'compilation, S: ContextStrategy> PointerAnalysis<'tcx, 'compilation>
                 }
             }
         }
-        self.pag.release_edge_indexes();
     }
 
     /// Finalize the analysis.

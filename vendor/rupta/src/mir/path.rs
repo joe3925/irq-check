@@ -566,6 +566,10 @@ impl PAGPath for Rc<Path> {
         Path::append_projection(self, projection_elems)
     }
 
+    fn truncate_projection(&self, len: usize) -> Self {
+        Path::truncate_projection_elems(self, len)
+    }
+
     fn intern(&self, paths: &mut std::collections::HashSet<Rc<Path>>) -> Self {
         if let Some(path) = paths.get(self) {
             return path.clone();
@@ -687,6 +691,10 @@ impl PAGPath for Rc<CSPath> {
             self.cid, 
             Path::append_projection(&self.path, projection_elems)
         )
+    }
+
+    fn truncate_projection(&self, len: usize) -> Self {
+        CSPath::new_cs_path(self.cid, Path::truncate_projection_elems(&self.path, len))
     }
 
     fn intern(&self, paths: &mut std::collections::HashSet<Rc<Path>>) -> Self {

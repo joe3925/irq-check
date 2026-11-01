@@ -20,7 +20,6 @@ $start.RedirectStandardError = $true
 $start.EnvironmentVariables['RUSTUP_TOOLCHAIN'] = 'nightly'
 $start.EnvironmentVariables['IRQ_CHECK_STATS'] = '1'
 $start.EnvironmentVariables['IRQ_CHECK_REQUIRED_CRATE'] = 'context_growth'
-$start.EnvironmentVariables['IRQ_CHECK_ANALYSIS_ID'] = $RunName
 $start.EnvironmentVariables['CARGO_TARGET_DIR'] = Join-Path $root 'target/context-growth-memory-cargo'
 $start.EnvironmentVariables.Remove('IRQ_CHECK_DUMP_DIR')
 $start.EnvironmentVariables.Remove('IRQ_CHECK_TRACE_HAVOC')

@@ -1,4 +1,4 @@
-param([string]$Toolchain = 'nightly', [string[]]$Scenario = @('formatting', 'mixed-dyn', 'correlated-dyn', 'erased-records', 'pointer-alias'), [switch]$VerifyCache, [string]$Features = '', [switch]$Fast, [string]$Checker = '', [string]$CargoTargetDirectory = '')
+param([string]$Toolchain = 'nightly', [string[]]$Scenario = @('formatting', 'mixed-dyn', 'correlated-dyn', 'erased-records', 'pointer-alias'), [Alias('VerifyCache')][switch]$VerifyFreshRun, [string]$Features = '', [switch]$Fast, [string]$Checker = '', [string]$CargoTargetDirectory = '')
 
 function Invoke-CheckerProcess($StartInfo, [string]$Log) {
     $process = New-Object System.Diagnostics.Process
@@ -138,13 +138,12 @@ try {
                 $covered = if ('coverage-write' -in $featuresForRun -or $expectUnknown) { 'false' } else { 'true' }
                 $accepted = $accepted -and (Test-Path -LiteralPath $coverageFile) -and (Get-Content -Raw -LiteralPath $coverageFile) -match "(?m)^irq_entry at .*: covered=$covered "
             }
-            if ($VerifyCache -and !$negative -and !$expectInvalid -and !$expectUnknown -and $accepted) {
+            if ($VerifyFreshRun -and !$negative -and !$expectInvalid -and !$expectUnknown -and $accepted) {
                 $evidenceTime = (Get-Item -LiteralPath $evidenceFile).LastWriteTimeUtc
-                $evidenceHash = (Get-FileHash -LiteralPath $evidenceFile -Algorithm SHA256).Hash
-                $cached = Invoke-CheckerProcess $start (Join-Path $logDirectory "$name-cache.log")
-                $cacheAccepted = $cached.ExitCode -eq 0 -and (Get-Item -LiteralPath $evidenceFile).LastWriteTimeUtc -eq $evidenceTime -and (Get-FileHash -LiteralPath $evidenceFile -Algorithm SHA256).Hash -eq $evidenceHash
-                Write-Output "$name cache exit=$($cached.ExitCode) accepted=$cacheAccepted"
-                $accepted = $accepted -and $cacheAccepted
+                $repeat = Invoke-CheckerProcess $start (Join-Path $logDirectory "$name-repeat.log")
+                $freshAccepted = $repeat.ExitCode -eq 0 -and (Get-Item -LiteralPath $evidenceFile).LastWriteTimeUtc -gt $evidenceTime
+                Write-Output "$name fresh repeat exit=$($repeat.ExitCode) accepted=$freshAccepted"
+                $accepted = $accepted -and $freshAccepted
             }
             Write-Output "$name $variant exit=$result accepted=$accepted log=$log"
             if (!$accepted) { $failed += "$name/$variant" }

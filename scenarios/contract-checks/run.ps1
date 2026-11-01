@@ -78,17 +78,16 @@ try {
                 if ($case.Expected -eq 'accepted') {
                     $gaps = @(Get-Content -Raw -LiteralPath (Join-Path $env:IRQ_CHECK_DUMP_DIR 'contract_checks-accepted-gaps.json') | ConvertFrom-Json)
                     $accepted = $accepted -and $gaps.Count -gt 0 -and 'irq_entry' -notin $evidence.safe_summaries
-                    $before = Get-FileHash -LiteralPath $evidenceFile
                     $time = (Get-Item -LiteralPath $evidenceFile).LastWriteTimeUtc
-                    $cached = [Diagnostics.Process]::new()
-                    $cached.StartInfo = $start
-                    if (!$cached.Start()) { throw 'Cannot start cache check' }
-                    $cachedOut = $cached.StandardOutput.ReadToEndAsync()
-                    $cachedErr = $cached.StandardError.ReadToEndAsync()
-                    $cached.WaitForExit()
-                    [IO.File]::WriteAllText((Join-Path $run "$name-cache.log"), $cachedOut.Result + $cachedErr.Result)
-                    $accepted = $accepted -and $cached.ExitCode -eq 0 -and (Get-FileHash -LiteralPath $evidenceFile).Hash -eq $before.Hash -and (Get-Item -LiteralPath $evidenceFile).LastWriteTimeUtc -eq $time
-                    $cached.Dispose()
+                    $repeat = [Diagnostics.Process]::new()
+                    $repeat.StartInfo = $start
+                    if (!$repeat.Start()) { throw 'Cannot start repeated check' }
+                    $repeatOut = $repeat.StandardOutput.ReadToEndAsync()
+                    $repeatErr = $repeat.StandardError.ReadToEndAsync()
+                    $repeat.WaitForExit()
+                    [IO.File]::WriteAllText((Join-Path $run "$name-repeat.log"), $repeatOut.Result + $repeatErr.Result)
+                    $accepted = $accepted -and $repeat.ExitCode -eq 0 -and (Get-Item -LiteralPath $evidenceFile).LastWriteTimeUtc -gt $time
+                    $repeat.Dispose()
                 }
             }
         }

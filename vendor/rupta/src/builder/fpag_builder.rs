@@ -122,6 +122,18 @@ impl<'pta, 'tcx, 'compilation> FuncPAGBuilder<'pta, 'tcx, 'compilation> {
 
     /// Builds the PAG. 
     pub fn build(&mut self) {
+        let def_id = self.def_id();
+        let generic_args = self.substs_specializer.generic_args;
+        if special_function_handler::library_model(self.acx, def_id, generic_args).is_some() {
+            let args: Vec<_> = self.mir.args_iter()
+                .map(|local| self.get_path_for_place(&mir::Place::from(local))).collect();
+            let destination = self.get_path_for_place(&mir::Place::from(mir::RETURN_PLACE));
+            if special_function_handler::handled_as_special_function_call(
+                self, &def_id, &generic_args, &args, &destination, mir::START_BLOCK.start_location(), true,
+            ) {
+                return;
+            }
+        }
         self.visit_body();
 
         // Add extra edges between the return value and the promoted_path/static_path
@@ -286,9 +298,7 @@ impl<'pta, 'tcx, 'compilation> FuncPAGBuilder<'pta, 'tcx, 'compilation> {
 
         // convert it to `` let aux = *src_ptr; *dst_ptr = aux ``
         let deref_ty = type_util::get_dereferenced_type(self.acx.get_path_rustc_type(&src_ptr).unwrap());
-        if !deref_ty.is_any_ptr() && !type_util::is_integer_carrier(self.tcx(), deref_ty) {
-            self.acx.scalar_writes.insert((dst_ptr.clone(), Vec::new()));
-        }
+        self.record_scalar_writes(dst_ptr.clone(), deref_ty);
         let aux = self.create_aux_local(deref_ty);
         let src_deref = Path::new_deref(src_ptr);
         self.acx.set_path_rustc_type(src_deref.clone(), deref_ty);
@@ -314,6 +324,52 @@ impl<'pta, 'tcx, 'compilation> FuncPAGBuilder<'pta, 'tcx, 'compilation> {
         _place: &mir::Place<'tcx>,
         _variant_index: rustc_abi::VariantIdx,
     ) {
+    }
+
+    fn record_scalar_writes(&mut self, pointer: Rc<Path>, ty: Ty<'tcx>) {
+        let mut pending = vec![(ty, Vec::new())];
+        while let Some((ty, projection)) = pending.pop() {
+            if ty.is_any_ptr() || ty.is_fn_ptr() || type_util::is_integer_carrier(self.tcx(), ty)
+                || self.tcx().layout_of(ty::TypingEnv::fully_monomorphized().as_query_input(ty))
+                    .is_ok_and(|layout| layout.size.bytes() == 0)
+            {
+                continue;
+            }
+            if self.acx.get_value_projections(ty).is_empty() {
+                self.acx.scalar_writes.insert((pointer.clone(), projection));
+                continue;
+            }
+            match ty.kind() {
+                TyKind::Adt(definition, args) => {
+                    for (variant, fields) in definition.variants().iter_enumerated() {
+                        let mut base = projection.clone();
+                        if definition.is_enum() { base.push(PathSelector::Downcast(variant.as_usize())); }
+                        for (index, field) in fields.fields.iter().enumerate() {
+                            let mut field_projection = base.clone();
+                            field_projection.push(if definition.is_union() {
+                                PathSelector::UnionField(index)
+                            } else {
+                                PathSelector::Field(index)
+                            });
+                            pending.push((type_util::field_ty(self.tcx(), field, args), field_projection));
+                        }
+                    }
+                }
+                TyKind::Array(element, _) | TyKind::Slice(element) => {
+                    let mut element_projection = projection;
+                    element_projection.push(PathSelector::Index);
+                    pending.push((*element, element_projection));
+                }
+                TyKind::Tuple(fields) => {
+                    for (index, field) in fields.iter().enumerate() {
+                        let mut field_projection = projection.clone();
+                        field_projection.push(PathSelector::Field(index));
+                        pending.push((field, field_projection));
+                    }
+                }
+                _ => { self.acx.scalar_writes.insert((pointer.clone(), projection)); }
+            }
+        }
     }
 
     /// Start a live range for the storage of the local.
@@ -1208,6 +1264,15 @@ let substs = &self.tcx().instantiate_bound_regions_with_erased(*substs);
                 if let Some((source, source_ty)) = source {
                     let destination_ty = self.acx.get_path_rustc_type(&lh_path).unwrap();
                     if source_ty.is_raw_ptr() && destination_ty.is_raw_ptr() {
+                        let source = if destination_ty.builtin_deref(true)
+                            .is_some_and(|ty| matches!(ty.kind(), TyKind::Slice(_)))
+                        {
+                            let offset = self.create_aux_local(source_ty);
+                            self.add_offset_edge(source, offset.clone());
+                            offset
+                        } else {
+                            source
+                        };
                         self.transmute_pointers(source, source_ty, lh_path, destination_ty);
                     } else {
                         self.acx.coverage_gaps.insert((self.func_id, Some(self.location),
@@ -1406,9 +1471,7 @@ let substs = &self.tcx().instantiate_bound_regions_with_erased(*substs);
                     let target_path = self.create_dereference(args[target].clone(), target_ty);
                     self.add_internal_edges(source_path, source_pointee, temporary.clone(), source_pointee);
                     self.add_internal_edges(temporary, source_pointee, target_path, target_pointee);
-                    if !source_pointee.is_any_ptr() && !type_util::is_integer_carrier(self.tcx(), source_pointee) {
-                        self.acx.scalar_writes.insert((args[target].clone(), Vec::new()));
-                    }
+                    self.record_scalar_writes(args[target].clone(), source_pointee);
                     copied += 1;
                 }
             }
@@ -1428,6 +1491,7 @@ let substs = &self.tcx().instantiate_bound_regions_with_erased(*substs);
             &args,
             &destination,
             location,
+            false,
         ) {
             let callsite = self.new_callsite(self.func_id, location, args, destination);
             let (callee_def_id, gen_args) = match call_graph_builder::try_to_devirtualize(
@@ -2077,9 +2141,11 @@ let substs = &self.tcx().instantiate_bound_regions_with_erased(*substs);
         let mut ty = base_ty;
         let mut base_path = base_path;
         let mut selectors = ProjectionElems::with_capacity(projection.len());
+        let mut coroutine_variant = None;
         for elem in projection.iter() {
             if matches!(elem, mir::ProjectionElem::PhantomDeref) { continue; }
-            let selector = self.visit_projection_elem(ty, elem);
+            let mut selector = self.visit_projection_elem(ty, elem);
+            let previous_coroutine = coroutine_variant.take();
             match elem {
                 // We don't need to specialize the type during iteration, as the type must be specific
                 // enough when it has projections.
@@ -2100,7 +2166,39 @@ let substs = &self.tcx().instantiate_bound_regions_with_erased(*substs);
                     }
                     ty = type_util::get_dereferenced_type(ty);
                 }
-                mir::ProjectionElem::Field(_, field_ty) => {
+                mir::ProjectionElem::Field(field, field_ty) => {
+                    if let Some((coroutine_ty, variant)) = previous_coroutine {
+                        let tcx = self.tcx();
+                        let aliases = self.acx.coroutine_fields.entry(coroutine_ty).or_insert_with(|| {
+                            let mut aliases = HashMap::new();
+                            let environment = ty::TypingEnv::fully_monomorphized();
+                            if let TyKind::Coroutine(definition, args) = coroutine_ty.kind()
+                                && let Ok(layout) = tcx.coroutine_layout(*definition, args)
+                                && let Ok(storage) = tcx.layout_of(environment.as_query_input(coroutine_ty))
+                            {
+                                let cx = ty::layout::LayoutCx::new(tcx, environment);
+                                let mut first = HashMap::new();
+                                for (variant, fields) in layout.variant_fields.iter_enumerated() {
+                                    let state_layout = storage.for_variant(&cx, variant);
+                                    let state_ty = type_util::get_downcast_type(tcx, coroutine_ty, variant);
+                                    for field in 0..fields.len() {
+                                        if field >= state_layout.fields.count() { continue; }
+                                        let field_ty = type_util::get_field_type(tcx, state_ty, field);
+                                        let key = (state_layout.fields.offset(field), field_ty);
+                                        let canonical = first.entry(key).or_insert((variant.as_usize(), field));
+                                        aliases.insert((variant.as_usize(), field), *canonical);
+                                    }
+                                }
+                            }
+                            aliases
+                        });
+                        if let Some(&(variant, field)) = aliases.get(&(variant, field.as_usize()))
+                            && let Some(previous) = selectors.last_mut()
+                        {
+                            *previous = PathSelector::Downcast(variant);
+                            selector = PathSelector::Field(field);
+                        }
+                    }
                     // Cache the base path if it is union type
                     if ty.is_union() {
                         let union_path = if selectors.is_empty() {
@@ -2117,6 +2215,9 @@ let substs = &self.tcx().instantiate_bound_regions_with_erased(*substs);
                     ty = type_util::get_element_type(self.tcx(), ty);
                 }
                 mir::ProjectionElem::Downcast(_, variant_idx) => {
+                    if ty.is_coroutine() {
+                        coroutine_variant = Some((ty, variant_idx.as_usize()));
+                    }
                     ty = type_util::get_downcast_type(self.tcx(), ty, *variant_idx);
                 }
                 mir::ProjectionElem::Subslice { .. } => {

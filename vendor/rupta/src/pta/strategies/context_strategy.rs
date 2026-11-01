@@ -312,7 +312,7 @@ impl ContextStrategy for SimpleHybridContextSensitive {
 pub struct RCEUSCallSiteSensitive {
     inner: KCallSiteSensitive,
     cs_funcs: HashSet<FuncId>,
-    func_pfg_map: HashMap<FuncId, FuncPFG>,
+    func_pfg_map: HashMap<FuncId, HashSet<rustc_middle::mir::Location>>,
 }
 
 impl RCEUSCallSiteSensitive {
@@ -334,13 +334,13 @@ impl RCEUSCallSiteSensitive {
     fn rceus_context(
         inner: &mut KCallSiteSensitive,
         callsite: &Rc<CSCallSite>,
-        caller_pfg: &FuncPFG,
+        caller_pfg: &HashSet<rustc_middle::mir::Location>,
     ) -> ContextId {
         let caller_ctx = inner.get_context_by_id(callsite.func.cid);
         let caller_ctx_elem = &caller_ctx.context_elems;
         let callsite_location = callsite.location;
 
-        let flow_entry = if !caller_pfg.is_cs_callsite(&callsite_location) {
+        let flow_entry = if !caller_pfg.contains(&callsite_location) {
             // callsite_location ⇒ 𝑓 ∉ CTXFuncs — this callsite is the flow entry.
             callsite.into()
         } else {
@@ -402,6 +402,7 @@ impl ContextStrategy for RCEUSCallSiteSensitive {
 
     fn set_prec_crit_fn_ident_data(&mut self, cs_funcs: HashSet<FuncId>, func_pfg_map: HashMap<FuncId, FuncPFG>) {
         self.cs_funcs = cs_funcs;
-        self.func_pfg_map = func_pfg_map;
+        self.func_pfg_map = func_pfg_map.into_iter()
+            .map(|(function, flow)| (function, flow.cs_callsites)).collect();
     }
 }

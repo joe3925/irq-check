@@ -32,7 +32,6 @@ $start.RedirectStandardError = $true
 $start.EnvironmentVariables['RUSTUP_TOOLCHAIN'] = 'nightly'
 $start.EnvironmentVariables['IRQ_CHECK_STATS'] = '1'
 $start.EnvironmentVariables['IRQ_CHECK_REQUIRED_CRATE'] = $Scenario.Replace('-', '_')
-$start.EnvironmentVariables['IRQ_CHECK_ANALYSIS_ID'] = Split-Path $run -Leaf
 $start.EnvironmentVariables['CARGO_TARGET_DIR'] = if ($CargoTargetDirectory) { [IO.Path]::GetFullPath($CargoTargetDirectory) } else { Join-Path $root 'target/memory-scenario-cargo' }
 $start.EnvironmentVariables.Remove('IRQ_CHECK_DUMP_DIR')
 if ($DumpDirectory) { $start.EnvironmentVariables['IRQ_CHECK_DUMP_DIR'] = [IO.Path]::GetFullPath($DumpDirectory) }

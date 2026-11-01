@@ -52,6 +52,7 @@ pub trait PAGPath: Clone + PartialEq + Eq + Hash + Debug {
     ) -> Self;
     fn value(&self) -> &PathEnum;
     fn append_projection(&self, projection_elems: &ProjectionElems) -> Self;
+    fn truncate_projection(&self, len: usize) -> Self;
     fn intern(&self, paths: &mut HashSet<Rc<Path>>) -> Self;
     fn add_offset(&self, offset: usize) -> Self;
     fn dyn_ptr_metadata(&self) -> Self;
@@ -123,8 +124,9 @@ fn insert_indexed_edge(edges: &mut EdgeMap, node: PAGNodeId, edge: PAGEdgeId) {
 }
 
 pub struct PAG<P: PAGPath> {
+    pub offset_risks: HashSet<PAGNodeId>,
     /// The graph structure capturing assignment relations between nodes.
-    pub(crate) graph: Graph<PAGNode<P>, PAGEdge>,
+    pub graph: Graph<PAGNode<P>, PAGEdge>,
     pub(crate) format_bindings: HashSet<PAGEdgeId>,
     /// A map from values to node id.
     pub(crate) values: HashMap<P, PAGNodeId>,
@@ -152,6 +154,7 @@ impl<P: PAGPath> PAG<P> {
     /// Constructor
     pub fn new() -> Self {
         PAG {
+            offset_risks: HashSet::new(),
             graph: Graph::<PAGNode<P>, PAGEdge>::new(),
             format_bindings: HashSet::new(),
             values: HashMap::new(),
@@ -230,7 +233,7 @@ impl<P: PAGPath> PAG<P> {
         node_id
     }
 
-    pub(crate) fn release_edge_indexes(&mut self) {
+    pub fn reset_edge_indexes(&mut self, populate: bool) {
         self.direct_out_edges = EdgeMap::new();
         self.load_out_edges = EdgeMap::new();
         self.store_in_edges = EdgeMap::new();
@@ -238,6 +241,21 @@ impl<P: PAGPath> PAG<P> {
         self.cast_out_edges = EdgeMap::new();
         self.offset_out_edges = EdgeMap::new();
         self.paths = HashSet::new();
+        if populate {
+            for edge in self.graph.edge_indices() {
+                let (source, destination) = self.graph.edge_endpoints(edge).unwrap();
+                let (index, node) = match &self.graph[edge].kind {
+                    PAGEdgeEnum::DirectPAGEdge => (&mut self.direct_out_edges, source),
+                    PAGEdgeEnum::LoadPAGEdge(_) => (&mut self.load_out_edges, source),
+                    PAGEdgeEnum::StorePAGEdge(_) => (&mut self.store_in_edges, destination),
+                    PAGEdgeEnum::GepPAGEdge(_) => (&mut self.gep_out_edges, source),
+                    PAGEdgeEnum::CastPAGEdge => (&mut self.cast_out_edges, source),
+                    PAGEdgeEnum::OffsetPAGEdge => (&mut self.offset_out_edges, source),
+                    PAGEdgeEnum::AddrPAGEdge => continue,
+                };
+                insert_indexed_edge(index, node, edge);
+            }
+        }
     }
 
     /// Returns true if the edge from `src` to `dst` of the `kind` exists.

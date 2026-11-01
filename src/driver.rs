@@ -3,6 +3,7 @@
 extern crate rustc_abi;
 extern crate rustc_ast;
 extern crate rustc_codegen_ssa;
+extern crate rustc_crate_store;
 extern crate rustc_data_structures;
 extern crate rustc_driver;
 extern crate rustc_errors;
@@ -106,6 +107,19 @@ fn known_intrinsic<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> bool {
 }
 
 impl Callbacks for Checker {
+    fn config(&mut self, config: &mut rustc_interface::interface::Config) {
+        config.override_queries = Some(|session, providers| {
+            if !session.opts.output_types.should_codegen() {
+                providers.queries.reachable_non_generics = |tcx, _| {
+                    rustc_codegen_ssa::back::symbol_export::reachable_non_generics_helper(tcx)
+                };
+                providers.queries.exported_non_generic_symbols = |tcx, _| {
+                    rustc_codegen_ssa::back::symbol_export::exported_non_generic_symbols_helper(tcx)
+                };
+            }
+        });
+    }
+
     fn after_analysis<'tcx>(&mut self, _: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
         let trust = trust::Trust::collect(tcx);
         if trust.invalid {

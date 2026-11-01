@@ -262,51 +262,69 @@ pub fn launch(args: &[OsString]) -> Result<ExitCode, String> {
         .packages
         .sort_by(|left, right| left.id.cmp(&right.id));
     let policy = serde_json::to_string(&policy).map_err(|error| error.to_string())?;
-    let driver =
-        executable.with_file_name(format!("irq-check-driver{}", std::env::consts::EXE_SUFFIX));
-    let fingerprint = format!(
-        "{:016x}",
-        policy::hash((
-            policy::INTERFACE,
-            &policy,
-            std::env::var_os("IRQ_CHECK_REQUIRED_CRATE"),
-            std::env::var_os("IRQ_CHECK_ANALYSIS_ID"),
-            crate::limits::configuration()?,
-            std::fs::read(&executable).map_err(|error| error.to_string())?,
-            std::fs::read(driver).map_err(|error| error.to_string())?
-        ))
-    );
-    let target = target_directory
+    crate::limits::configuration()?;
+    let policy_hash = format!("{:016x}", policy::hash((policy::INTERFACE, &policy)));
+    let directory = target_directory
         .or_else(|| std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from(graph["target_directory"].as_str().unwrap_or("target")))
-        .join("irq-check-policy")
-        .join(&fingerprint);
-    let mut command = Command::new(cargo);
-    command
-        .args(forwarded)
-        .env("RUSTC_WRAPPER", executable)
-        .env("IRQ_CHECK_POLICY", policy)
-        .env("IRQ_CHECK_POLICY_HASH", fingerprint)
-        .env("CARGO_TARGET_DIR", target)
-        .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("cannot start Cargo: {error}"))?;
-    let stderr = child.stderr.take().ok_or("cannot read Cargo errors")?;
-    let forwarding = std::thread::spawn(move || -> std::io::Result<()> {
-        let mut stderr_output = std::io::stderr().lock();
-        for line in BufReader::new(stderr).split(b'\n') {
-            let line = line?;
-            stderr_output.write_all(&line)?;
-            stderr_output.write_all(b"\n")?;
-            stderr_output.flush()?;
-        }
-        Ok(())
-    });
-    let status = child.wait().map_err(|error| error.to_string())?;
-    forwarding
-        .join()
-        .map_err(|_| "cannot forward Cargo errors")?
+        .join("irq-check-runs");
+    let directory = std::path::absolute(directory).map_err(|error| error.to_string())?;
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| format!("cannot create {}: {error}", directory.display()))?;
+    let parent = std::fs::canonicalize(&directory).map_err(|error| error.to_string())?;
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .map_err(|error| error.to_string())?;
-    Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
+    let target = directory.join(format!("{}-{}", std::process::id(), started.as_nanos()));
+    std::fs::create_dir(&target)
+        .map_err(|error| format!("cannot create {}: {error}", target.display()))?;
+    let result = (|| {
+        let options = forwarded.iter().position(|argument| argument == "--").unwrap_or(forwarded.len());
+        forwarded.splice(options..options, [
+            OsString::from("--target-dir"), target.clone().into_os_string(),
+            OsString::from("--config"),
+            OsString::from(format!("build.build-dir={}", toml::Value::String(target.to_string_lossy().into_owned()))),
+        ]);
+        let mut command = Command::new(cargo);
+        command
+            .args(forwarded)
+            .env("RUSTC_WRAPPER", executable)
+            .env("IRQ_CHECK_POLICY", policy)
+            .env("IRQ_CHECK_POLICY_HASH", policy_hash)
+            .env("CARGO_TARGET_DIR", &target)
+            .env("CARGO_BUILD_BUILD_DIR", &target)
+            .env("CARGO_INCREMENTAL", "0")
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("cannot start Cargo: {error}"))?;
+        let stderr = child.stderr.take().ok_or("cannot read Cargo errors")?;
+        let forwarding = std::thread::spawn(move || -> std::io::Result<()> {
+            let mut stderr_output = std::io::stderr().lock();
+            for line in BufReader::new(stderr).split(b'\n') {
+                let line = line?;
+                stderr_output.write_all(&line)?;
+                stderr_output.write_all(b"\n")?;
+                stderr_output.flush()?;
+            }
+            Ok(())
+        });
+        let status = child.wait().map_err(|error| error.to_string())?;
+        forwarding
+            .join()
+            .map_err(|_| "cannot forward Cargo errors")?
+            .map_err(|error| error.to_string())?;
+        Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
+    })();
+    let cleanup = std::fs::canonicalize(&target).and_then(|path| {
+        if path.parent() != Some(parent.as_path()) {
+            return Err(std::io::Error::other("temporary directory is outside its parent"));
+        }
+        std::fs::remove_dir_all(path)
+    }).map_err(|error| format!("cannot remove temporary checker output {}: {error}", target.display()));
+    match (result, cleanup) {
+        (Ok(status), Ok(())) => Ok(status),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(cleanup)) => Err(format!("{error}\n{cleanup}")),
+    }
 }

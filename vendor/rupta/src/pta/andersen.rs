@@ -262,7 +262,7 @@ impl<'pta, 'tcx, 'compilation> PointerAnalysis<'tcx, 'compilation> for AndersenP
                 self.process_new_call_instances(&new_call_instances);
             }
         }
-        self.pag.release_edge_indexes();
+        self.pag.reset_edge_indexes(false);
     }
 
     /// Finalize the analysis.

@@ -451,20 +451,86 @@ where
     /// `Vec::push` and when iterating a vec).
     fn process_offset(&mut self, offset_edge: EdgeId) {
         let (source, destination) = self.pag.graph().edge_endpoints(offset_edge).unwrap();
+        let source_path = Rc::new(Path { value: self.pag.node_path(source).value().clone() });
+        let destination_path = Rc::new(Path { value: self.pag.node_path(destination).value().clone() });
+        let non_wrapping = !self.acx.wrapping_offsets.contains(&(source_path.clone(), destination_path));
+        let element_ty = self.acx.get_path_rustc_type(&source_path)
+            .or_else(|| type_util::try_eval_path_type(self.acx, &source_path))
+            .and_then(|ty| ty.builtin_deref(true));
         for pointee in &self.get_cloned_pts(source, false) {
             let path = self.pag.node_path(pointee).remove_cast();
+            let contained_array = 'array: {
+                if !non_wrapping { break 'array false; }
+                let Some(element_ty) = element_ty else { break 'array false; };
+                let PathEnum::QualifiedPath { base, projection } = path.value() else {
+                    break 'array false;
+                };
+                if !matches!(projection.last(), Some(PathSelector::Index))
+                    || !matches!(base.value, PathEnum::StaticVariable { .. }
+                        | PathEnum::LocalVariable { .. } | PathEnum::Parameter { .. }
+                        | PathEnum::ReturnValue { .. } | PathEnum::Auxiliary { .. }
+                        | PathEnum::PromotedConstant { .. })
+                {
+                    break 'array false;
+                }
+                if let PathEnum::StaticVariable { def_id } = base.value
+                    && self.tcx().is_foreign_item(def_id)
+                {
+                    break 'array false;
+                }
+                let Some(root_ty) = self.acx.get_path_rustc_type(base)
+                    .or_else(|| type_util::try_eval_path_type(self.acx, base))
+                else { break 'array false; };
+                let environment = rustc_middle::ty::TypingEnv::fully_monomorphized();
+                let Ok(root_layout) = self.tcx().layout_of(environment.as_query_input(root_ty)) else {
+                    break 'array false;
+                };
+                let mut array_ty = root_ty;
+                let mut prefix = 0u64;
+                for selector in &projection[..projection.len() - 1] {
+                    let PathSelector::Field(field) = *selector else { break 'array false; };
+                    match array_ty.kind() {
+                        TyKind::Adt(definition, _) if definition.is_struct() => {}
+                        TyKind::Tuple(_) => {}
+                        _ => break 'array false,
+                    }
+                    let Ok(layout) = self.tcx().layout_of(environment.as_query_input(array_ty)) else {
+                        break 'array false;
+                    };
+                    if field >= layout.fields.count() { break 'array false; }
+                    let Some(next) = prefix.checked_add(layout.fields.offset(field).bytes()) else {
+                        break 'array false;
+                    };
+                    prefix = next;
+                    array_ty = type_util::get_field_type(self.tcx(), array_ty, field);
+                }
+                let TyKind::Array(array_element, _) = array_ty.kind() else { break 'array false; };
+                if *array_element != element_ty { break 'array false; }
+                if path.truncate_projection(projection.len() - 1).try_eval_path_type(self.acx) != array_ty {
+                    break 'array false;
+                }
+                let (Ok(array_layout), Ok(element_layout)) = (
+                    self.tcx().layout_of(environment.as_query_input(array_ty)),
+                    self.tcx().layout_of(environment.as_query_input(element_ty)),
+                ) else { break 'array false; };
+                let stride = element_layout.size.bytes();
+                let Some(end) = prefix.checked_add(array_layout.size.bytes()) else { break 'array false; };
+                let Some(suffix) = root_layout.size.bytes().checked_sub(end) else { break 'array false; };
+                stride != 0 && array_layout.size.bytes() != 0 && prefix < stride && suffix == 0
+            };
+            if contained_array { continue; }
             let mut value = path.value();
             let mut field = false;
             while let PathEnum::QualifiedPath { base, projection } = value {
                 field |= projection.iter().any(|part| matches!(part, PathSelector::Field(_) | PathSelector::UnionField(_) | PathSelector::Downcast(_)));
                 if field && self.acx.get_path_rustc_type(base).is_none_or(|ty|
                     ty.is_any_ptr() || !type_util::get_pointer_projections(self.tcx(), ty).is_empty()) {
-                    self.acx.offset_risks.insert(Rc::new(crate::mir::path::Path { value: self.pag.node_path(destination).value().clone() }));
+                    self.pag.offset_risks.insert(destination);
                 }
                 value = &base.value;
             }
             if matches!(value, PathEnum::OffsetPath { .. }) {
-                self.acx.offset_risks.insert(Rc::new(crate::mir::path::Path { value: self.pag.node_path(destination).value().clone() }));
+                self.pag.offset_risks.insert(destination);
             }
         }
         // We don't check whether src and dst have the same type here, as the propagate function will
@@ -962,13 +1028,36 @@ where
     fn propagate_cast(&mut self, cast_edge: EdgeId, propa_diff: bool) {
         let mut changed = false;
         let (src, dst) = self.pag.graph().edge_endpoints(cast_edge).unwrap();
-        let (_src_path, src_ty) = self.node_path_and_ty(src);
+        let (src_path, src_ty) = self.node_path_and_ty(src);
         let (dst_path, dst_ty) = self.node_path_and_ty(dst);
         // debug!("Propagating cast from {:?}({:?}) -> {:?}({:?})", src_path, src_ty, dst_path, dst_ty);
         assert!(src_ty.is_any_ptr() && dst_ty.is_any_ptr());
 
         let dst_deref_ty = type_util::get_dereferenced_type(dst_ty);
         let src_pts = self.get_cloned_pts(src, propa_diff);
+        let pair = (
+            Rc::new(Path { value: src_path.value().clone() }),
+            Rc::new(Path { value: dst_path.value().clone() }),
+        );
+        if let Some(&field) = self.acx.container_casts.get(&pair) {
+            for pointee in &src_pts {
+                let path = self.pag.node_path(pointee).clone().remove_cast();
+                if let PathEnum::QualifiedPath { projection, .. } = path.value()
+                    && projection.last() == Some(&PathSelector::Field(field))
+                {
+                    let parent = path.truncate_projection(projection.len() - 1);
+                    if parent.try_eval_path_type(self.acx) == dst_deref_ty {
+                        let parent = self.pag.get_or_insert_node(&parent);
+                        changed |= self.pt_data.add_pts(dst, parent);
+                        continue;
+                    }
+                }
+                self.acx.unmodeled_paths.insert(pair.1.clone());
+                self.acx.unmodeled_flows.insert(format!("container pointer has no matching parent: {path:?} -> {dst_deref_ty:?}"));
+            }
+            if changed { self.worklist.push_back(dst); }
+            return;
+        }
         if dst_deref_ty.is_unit() && !src_ty.is_fn_ptr() {
             for pointee in &src_pts {
                 changed |= self.pt_data.add_pts(dst, pointee);

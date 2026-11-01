@@ -17,7 +17,7 @@ pub(super) enum PointerObject<'tcx> {
 pub(super) struct PointerNode<'tcx> {
     pub object: Option<PointerObject<'tcx>>,
     pub context: Option<usize>,
-    pub projection: Vec<irq_check_rupta::mir::path::PathSelector>,
+    pub projected: bool,
     pub offset: usize,
     pub ty: Option<ty::Ty<'tcx>>,
     pub function: Option<Instance<'tcx>>,
@@ -126,11 +126,16 @@ impl<'tcx> GlobalPointers<'tcx> {
             let local_definitions = exported.len();
             let dependencies = tcx.dependency_formats(());
             for &krate in tcx.crates(()) {
-                if !dependencies.values().any(|list| {
-                    list.get(krate).is_some_and(|linkage| {
-                        *linkage != rustc_middle::middle::dependency_format::Linkage::NotLinked
+                let required = if tcx.sess.opts.output_types.should_link() {
+                    dependencies.values().any(|list| {
+                        list.get(krate).is_some_and(|linkage| {
+                            *linkage != rustc_middle::middle::dependency_format::Linkage::NotLinked
+                        })
                     })
-                }) {
+                } else {
+                    tcx.crate_dep_kind(krate) == rustc_crate_store::CrateDepKind::Unconditional
+                };
+                if !required {
                     continue;
                 }
                 for &(symbol, _) in tcx.exported_non_generic_symbols(krate) {
@@ -233,6 +238,8 @@ impl<'tcx> GlobalPointers<'tcx> {
         backend.pre_analysis();
         backend.initialize();
         backend.propagate();
+        loop {
+        backend.pag.reset_edge_indexes(false);
         let mut scalar_writes = HashMap::<_, Vec<_>>::new();
         for (base, projection) in &backend.acx.scalar_writes {
             scalar_writes
@@ -240,7 +247,7 @@ impl<'tcx> GlobalPointers<'tcx> {
                 .or_default()
                 .push(projection);
         }
-        if !backend.acx.offset_risks.is_empty() {
+        if !backend.pag.offset_risks.is_empty() {
             use irq_check_rupta::graph::pag::PAGEdgeEnum;
             let mut uses = HashMap::<_, Vec<_>>::new();
             let mut sensitive: HashSet<_> = backend
@@ -278,7 +285,7 @@ impl<'tcx> GlobalPointers<'tcx> {
                 if scalar_writes.contains_key(path) {
                     sensitive.insert(node);
                 }
-                if backend.acx.offset_risks.contains(path) {
+                if backend.pag.offset_risks.contains(&node) {
                     pending.push(node);
                 }
             }
@@ -426,6 +433,7 @@ impl<'tcx> GlobalPointers<'tcx> {
         let mut pointees = HashMap::<_, HashSet<_>>::new();
         let mut pointee_ranges = HashMap::<_, HashSet<_>>::new();
         let mut uncertain = HashSet::new();
+        let mut callbacks_to_analyze = HashSet::new();
         let (mut covered_calls, context_coverage, uncertain_nodes, range_offsets) = {
             use irq_check_rupta::graph::pag::PAGEdgeEnum;
             use irq_check_rupta::mir::path::{Path, PathEnum};
@@ -473,54 +481,64 @@ impl<'tcx> GlobalPointers<'tcx> {
                     }
                 }
             }
-            let mut uses = vec![Vec::new(); groups.len() * 2];
+            let mut uses = Vec::new();
             for (group, overlaps) in storage_overlaps.iter().enumerate() {
                 for &overlap in overlaps {
-                    uses[group * 2].push(overlap * 2);
-                    uses[group * 2 + 1].push(overlap * 2 + 1);
+                    uses.push((group * 2, overlap * 2));
+                    uses.push((group * 2 + 1, overlap * 2 + 1));
                 }
             }
             let mut children = vec![Vec::new(); groups.len()];
             let mut parents = vec![None; groups.len()];
-            let mut pointee_groups = vec![Vec::new(); groups.len()];
+            let mut group_nodes = vec![None; groups.len()];
             let mut escaping = Vec::new();
             let mut escaping_calls = HashMap::<_, Vec<_>>::new();
             let mut escaping_stores = HashMap::<_, Vec<_>>::new();
-            let mut callable_functions = HashSet::new();
+            let mut dynamic_callbacks = HashMap::<_, HashSet<_>>::new();
             let mut function_objects = HashMap::new();
             let unavailable_functions: HashSet<_> = backend.acx.coverage_gaps.iter()
                 .filter(|gap| gap.1.is_none() && !covered(gap)).map(|gap| gap.0).collect();
-            let analyzed_functions: HashSet<_> = backend.call_graph.func_nodes.keys()
-                .map(|function| function.func_id)
+            let processed_functions: HashSet<_> = backend.call_graph.func_nodes.keys()
+                .map(|function| function.func_id).collect();
+            let analyzed_functions: HashSet<_> = processed_functions.iter().copied()
                 .filter(|function| !unavailable_functions.contains(function)).collect();
+            let mut available_callbacks = HashMap::new();
             let mut opaque_objects = HashMap::new();
             for node in backend.pag.graph().node_indices() {
                 let group = node_groups[node.index()];
+                group_nodes[group] = Some(node);
                 if let PathEnum::Function(function) = backend.pag.node_path(node).path.value {
                     function_objects.insert(group, function);
                     if !analyzed_functions.contains(&function) {
                         opaque_objects.insert(group, format!("escaped callback has no analyzed body: {}",
                             backend.acx.get_function_reference(function).to_string()));
+                        let reference = backend.acx.get_function_reference(function);
+                        if !processed_functions.contains(&function)
+                            && !tcx.is_foreign_item(reference.def_id)
+                            && irq_check_rupta::util::type_util::has_instance_mir(tcx, reference.kind)
+                        {
+                            available_callbacks.insert(group, function);
+                        }
                     }
                 } else if matches!(backend.pag.node_path(node).path.value, PathEnum::Type(_)) {
                     opaque_objects.insert(group, format!("escaped type has no concrete allocation: {:?}",
                         backend.pag.node_path(node).path));
-                }
-                if let Some(points) = backend.get_pt_data().get_propa_pts(node) {
-                    pointee_groups[group].extend(points.iter().map(|target| node_groups[target.index()]));
                 }
             }
             for sites in backend.assoc_calls.dynamic_dispatch_calls.values()
                 .chain(backend.assoc_calls.dynamic_fntrait_calls.values())
             {
                 for site in sites {
-                    callable_functions.extend(backend.call_graph.get_callees(&site.into())
-                        .iter().map(|callee| callee.func_id));
+                    if let Some(receiver) = site.args.first().and_then(|path| backend.pag.get_node_id(path))
+                        && let Some(points) = backend.get_pt_data().get_propa_pts(receiver)
+                    {
+                        for target in points.iter() {
+                            dynamic_callbacks.entry(node_groups[target.index()]).or_default()
+                                .extend(backend.call_graph.get_callees(&site.into())
+                                    .iter().map(|callee| callee.func_id));
+                        }
+                    }
                 }
-            }
-            for points in &mut pointee_groups {
-                points.sort_unstable();
-                points.dedup();
             }
             for ((context, path), &group) in &groups {
                 if let PathEnum::QualifiedPath { base, .. } | PathEnum::OffsetPath { base, .. } =
@@ -529,8 +547,8 @@ impl<'tcx> GlobalPointers<'tcx> {
                     let parent = groups[&(*context, base.clone())];
                     children[parent].push(group);
                     parents[group] = Some(parent);
-                    uses[parent * 2].push(group * 2);
-                    uses[parent * 2 + 1].push(group * 2 + 1);
+                    uses.push((parent * 2, group * 2));
+                    uses.push((parent * 2 + 1, group * 2 + 1));
                 }
             }
             let mut pending = Vec::new();
@@ -582,15 +600,13 @@ impl<'tcx> GlobalPointers<'tcx> {
             }
             record_seeds(&pending, 1);
             let mut offset_nodes = HashSet::new();
+            let mut offset_origins = HashMap::new();
             let mut offset_pending: Vec<_> = backend
                 .pag
                 .graph()
                 .node_indices()
                 .filter(|node| {
-                    backend
-                        .acx
-                        .offset_risks
-                        .contains(&backend.pag.node_path(*node).path)
+                    backend.pag.offset_risks.contains(node)
                 })
                 .collect();
             while let Some(node) = offset_pending.pop() {
@@ -598,7 +614,11 @@ impl<'tcx> GlobalPointers<'tcx> {
                     break;
                 }
                 if offset_nodes.insert(node) {
-                    offset_pending.extend(value_uses.get(&node).into_iter().flatten().copied());
+                    offset_origins.entry(node).or_insert(node);
+                    for &next in value_uses.get(&node).into_iter().flatten() {
+                        offset_origins.entry(next).or_insert(node);
+                        offset_pending.push(next);
+                    }
                 }
             }
             let mut range_offsets = offset_nodes.clone();
@@ -621,7 +641,6 @@ impl<'tcx> GlobalPointers<'tcx> {
             }
             drop(value_uses);
             let mut memory = HashSet::new();
-            let mut parameters = HashSet::new();
             let mut callback_parameters = HashMap::<_, Vec<_>>::new();
             let mut callback_returns = HashMap::<_, Vec<_>>::new();
             let mut write_addresses = HashSet::new();
@@ -644,9 +663,6 @@ impl<'tcx> GlobalPointers<'tcx> {
                         };
                         if entry_context || !(external_root || backend.acx.callback_roots.contains(&func_id)) {
                             callback_parameters.entry(func_id).or_default().push(group);
-                        }
-                        if callable_functions.contains(&func_id) && (!external_root || entry_context) {
-                            parameters.insert(group);
                         }
                         if external_root && entry_context {
                             complete = false;
@@ -865,7 +881,11 @@ impl<'tcx> GlobalPointers<'tcx> {
                                 pending.extend(groups.iter().copied());
                                 if place.is_indirect() {
                                     for &group in groups {
-                                        pending.extend(pointee_groups[group].iter().copied());
+                                        if let Some(points) = group_nodes[group]
+                                            .and_then(|node| backend.get_pt_data().get_propa_pts(node))
+                                        {
+                                            pending.extend(points.iter().map(|target| node_groups[target.index()]));
+                                        }
                                     }
                                 }
                             }
@@ -940,6 +960,8 @@ impl<'tcx> GlobalPointers<'tcx> {
                 unknown_calls = true;
             }
             record_seeds(&pending, 16);
+            drop(path_groups);
+            let mut untracked_loads = HashMap::new();
             for edge in backend.pag.graph().edge_indices() {
                 if !irq_check_rupta::limits::checkpoint() {
                     break;
@@ -960,7 +982,7 @@ impl<'tcx> GlobalPointers<'tcx> {
                     | PAGEdgeEnum::CastPAGEdge
                     | PAGEdgeEnum::GepPAGEdge(_)
                     | PAGEdgeEnum::OffsetPAGEdge => {
-                        uses[from * 2].push(to * 2);
+                        uses.push((from * 2, to * 2));
                         let fixed_vtable = backend.acx.fixed_vtable_edges.contains(&(
                             backend.pag.node_path(source).path.clone(),
                             backend.pag.node_path(destination).path.clone(),
@@ -987,13 +1009,14 @@ impl<'tcx> GlobalPointers<'tcx> {
                                     })
                             });
                         if !fixed_vtable {
-                            uses[from * 2 + 1].push(to * 2 + 1);
+                            uses.push((from * 2 + 1, to * 2 + 1));
                         }
                     }
                     PAGEdgeEnum::LoadPAGEdge(_) => {
-                        uses[from * 2].extend([to * 2, to * 2 + 1]);
+                        uses.extend([(from * 2, to * 2), (from * 2, to * 2 + 1)]);
                         if offset_nodes.contains(&source) {
                             pending.push(to);
+                            untracked_loads.entry(to).or_insert((source, "subobject offset"));
                         }
                         if backend
                             .get_pt_data()
@@ -1002,6 +1025,7 @@ impl<'tcx> GlobalPointers<'tcx> {
                             && !no_provenance.contains(&source)
                         {
                             pending.push(to);
+                            untracked_loads.entry(to).or_insert((source, "empty pointer set"));
                         }
                     }
                     PAGEdgeEnum::StorePAGEdge(_) => {
@@ -1028,6 +1052,7 @@ impl<'tcx> GlobalPointers<'tcx> {
                 }
             }
             record_seeds(&pending, 32);
+            let mut scalar_write_sources = HashMap::new();
             for node in backend.pag.graph().node_indices() {
                 let Some(projections) = scalar_writes.get(&backend.pag.node_path(node).path) else {
                     continue;
@@ -1040,7 +1065,9 @@ impl<'tcx> GlobalPointers<'tcx> {
                 {
                     for target in points.iter() {
                         if offset_nodes.contains(&node) {
-                            pending.push(groups[&(backend.pag.node_path(target).cid, base_path(&backend.pag.node_path(target).path))]);
+                            let group = groups[&(backend.pag.node_path(target).cid, base_path(&backend.pag.node_path(target).path))];
+                            pending.push(group);
+                            scalar_write_sources.entry(group).or_insert((node, true));
                             continue;
                         }
                         for projection in projections {
@@ -1050,11 +1077,13 @@ impl<'tcx> GlobalPointers<'tcx> {
                             );
                             if let Some(&group) = groups.get(&(backend.pag.node_path(target).cid, stored)) {
                                 pending.push(group);
+                                scalar_write_sources.entry(group).or_insert((node, false));
                                 let mut overlapping = storage_overlaps[group].clone();
                                 let mut seen = HashSet::new();
                                 while let Some(overlap) = overlapping.pop() {
                                     if seen.insert(overlap) {
                                         pending.push(overlap);
+                                        scalar_write_sources.entry(overlap).or_insert((node, false));
                                         overlapping.extend(storage_overlaps[overlap].iter().copied());
                                     }
                                 }
@@ -1090,7 +1119,7 @@ impl<'tcx> GlobalPointers<'tcx> {
                         .insert(group);
                     if let Some(destination) = backend.pag.get_node_id(&site.destination) {
                         let destination = node_groups[destination.index()];
-                        uses[group * 2 + 1].extend([destination * 2, destination * 2 + 1]);
+                        uses.extend([(group * 2 + 1, destination * 2), (group * 2 + 1, destination * 2 + 1)]);
                     }
                 }
             }
@@ -1115,19 +1144,24 @@ impl<'tcx> GlobalPointers<'tcx> {
                 }
             }
             record_seeds(&pending, 256);
-            for edges in &mut uses {
-                edges.sort_unstable();
-                edges.dedup();
+            uses.sort_unstable();
+            uses.dedup();
+            let mut use_offsets = vec![0usize; groups.len() * 2 + 1];
+            for &(source, _) in &uses {
+                use_offsets[source + 1] += 1;
             }
+            for index in 1..use_offsets.len() {
+                use_offsets[index] += use_offsets[index - 1];
+            }
+            let uses: Box<[_]> = uses.into_iter().map(|(_, target)| target).collect();
             let mut pending: Vec<_> = pending
                 .into_iter()
                 .flat_map(|group| [group * 2, group * 2 + 1])
                 .collect();
-            let mut unknown = vec![false; uses.len()];
-            let mut origins = vec![usize::MAX; uses.len()];
+            let mut unknown = vec![false; groups.len() * 2];
+            let mut origins = vec![usize::MAX; groups.len() * 2];
             for &group in &pending { origins[group] = group; }
             let mut memory_invalidated = false;
-            let mut parameters_invalidated = false;
             let immutable: HashSet<_> = groups.iter().filter_map(|((_, path), &group)| {
                 let base = base_path(path);
                 let PathEnum::StaticVariable { def_id } = base.value else { return None; };
@@ -1153,9 +1187,10 @@ impl<'tcx> GlobalPointers<'tcx> {
                     if escape_origins[origin] == usize::MAX { escape_origins[origin] = origin; }
                     if storage {
                         if std::mem::replace(&mut escaped[group], true) { continue; }
-                        if let Some(&function) = function_objects.get(&group)
-                            && exposed_functions.insert(function)
+                        for function in function_objects.get(&group).copied().into_iter()
+                            .chain(dynamic_callbacks.get(&group).into_iter().flatten().copied())
                         {
+                            if !exposed_functions.insert(function) { continue; }
                             if callback_parameters.get(&function).is_some_and(|parameters| !parameters.is_empty()) {
                                 complete = false;
                                 call_complete = false;
@@ -1173,10 +1208,14 @@ impl<'tcx> GlobalPointers<'tcx> {
                             }
                         }
                         if let Some(reason) = opaque_objects.get(&group) {
-                            escape_gaps.insert(reason.clone());
-                            if !opaque_callback {
-                                opaque_callback = true;
-                                escaping.extend(memory.iter().map(|&group| (group, true)));
+                            if let Some(&function) = available_callbacks.get(&group) {
+                                callbacks_to_analyze.insert(function);
+                            } else {
+                                escape_gaps.insert(reason.clone());
+                                if !opaque_callback {
+                                    opaque_callback = true;
+                                    escaping.extend(memory.iter().map(|&group| (group, true)));
+                                }
                             }
                         }
                         if let Some(parent) = parents[group] {
@@ -1202,16 +1241,12 @@ impl<'tcx> GlobalPointers<'tcx> {
                             record_escape(&mut escaping, &mut escape_origins, origin, child, false);
                         }
                     }
-                    for &target in &pointee_groups[group] {
-                        record_escape(&mut escaping, &mut escape_origins, origin, target, true);
-                    }
-                }
-                if unknown_calls && !parameters_invalidated {
-                    parameters_invalidated = true;
-                    for value in parameters.iter().flat_map(|group| [group * 2, group * 2 + 1]) {
-                        seed_kinds[value / 2] |= 1024;
-                        if origins[value] == usize::MAX { origins[value] = value; }
-                        pending.push(value);
+                    if let Some(points) = group_nodes[group]
+                        .and_then(|node| backend.get_pt_data().get_propa_pts(node))
+                    {
+                        for target in points.iter() {
+                            record_escape(&mut escaping, &mut escape_origins, origin, node_groups[target.index()], true);
+                        }
                     }
                 }
                 if (unknown_memory || unknown_calls) && !memory_invalidated {
@@ -1243,10 +1278,15 @@ impl<'tcx> GlobalPointers<'tcx> {
                 }
                 if group % 2 == 0 && write_addresses.contains(&(group / 2)) {
                     unknown_memory = true;
-                    for &target in &pointee_groups[group / 2] {
-                        for next in [target * 2, target * 2 + 1] {
-                            if origins[next] == usize::MAX { origins[next] = group; }
-                            pending.push(next);
+                    if let Some(points) = group_nodes[group / 2]
+                        .and_then(|node| backend.get_pt_data().get_propa_pts(node))
+                    {
+                        for target in points.iter() {
+                            let target = node_groups[target.index()];
+                            for next in [target * 2, target * 2 + 1] {
+                                if origins[next] == usize::MAX { origins[next] = group; }
+                                pending.push(next);
+                            }
                         }
                     }
                     escaping.extend(escaping_stores.get(&(group / 2)).into_iter().flatten()
@@ -1257,7 +1297,7 @@ impl<'tcx> GlobalPointers<'tcx> {
                     escaping.extend(escaping_calls.get(&(group / 2)).into_iter().flatten()
                         .map(|&argument| (argument, false)));
                 }
-                for &next in &uses[group] {
+                for &next in &uses[use_offsets[group]..use_offsets[group + 1]] {
                     if origins[next] == usize::MAX { origins[next] = group; }
                     pending.push(next);
                 }
@@ -1312,16 +1352,26 @@ impl<'tcx> GlobalPointers<'tcx> {
                     })
                     .count();
                 eprintln!(
-                    "irq-check: local pointer coverage covered_calls={} covered_indirect_calls={indirect} uncertain_nodes={} total_nodes={} unknown_memory={memory_invalidated} unknown_calls={parameters_invalidated} escaped_groups={}",
+                    "irq-check: local pointer coverage covered_calls={} covered_indirect_calls={indirect} uncertain_nodes={} total_nodes={} unknown_memory={memory_invalidated} unknown_calls={unknown_calls} escaped_groups={}",
                     covered_calls.len(),
                     uncertain_nodes.len(),
                     node_groups.len(),
                     escaped.iter().filter(|escaped| **escaped).count()
                 );
             }
-            if let Some(directory) = crate::reporting::configuration().directory.as_ref() {
+            if callbacks_to_analyze.is_empty()
+                && let Some(directory) = crate::reporting::configuration().directory.as_ref()
+            {
                 let mut group_paths = vec![None; groups.len()];
                 for ((_, path), &group) in &groups { group_paths[group] = Some(path); }
+                let describe_context = |context| {
+                    let entry = backend.get_context_by_id(context);
+                    match entry.first_context_element() {
+                        Some(site) => format!("{context:?}: {} at {:?}",
+                            backend.acx.get_function_reference(site.func).to_string(), site.location),
+                        None => format!("{context:?}"),
+                    }
+                };
                 let mut evidence: Vec<_> = receivers
                     .iter()
                     .filter_map(|((function, location), groups)| {
@@ -1334,7 +1384,7 @@ impl<'tcx> GlobalPointers<'tcx> {
                         if let Some(&group) = groups.iter().find(|&&group| unknown[group * 2 + 1]) {
                             let mut value = group * 2 + 1;
                             let mut seen = HashSet::new();
-                            while value != usize::MAX && seen.insert(value) && causes.len() < 24 {
+                            while value != usize::MAX && seen.insert(value) && causes.len() < 128 {
                                 if let Some(path) = group_paths[value / 2] {
                                     let base = base_path(path);
                                     let owner = match base.value {
@@ -1351,7 +1401,37 @@ impl<'tcx> GlobalPointers<'tcx> {
                                     ].into_iter().enumerate().filter_map(|(bit, name)|
                                         (seed_kinds[value / 2] & (1 << bit) != 0).then_some(name)).collect();
                                     causes.push(format!("{path:?} context={:?} {} seeds={seeds:?}",
-                                        group_contexts[value / 2], owner.unwrap_or_default()));
+                                        group_contexts[value / 2].map(&describe_context), owner.unwrap_or_default()));
+                                    if seed_kinds[value / 2] & 64 != 0
+                                        && let Some(&(source, offset)) = scalar_write_sources.get(&(value / 2))
+                                    {
+                                        let source_path = backend.pag.node_path(source);
+                                        let owner = base_path(&source_path.path).get_containing_func()
+                                            .and_then(|function| instances.get(&function)).map(ToString::to_string);
+                                        causes.push(format!("scalar write source: {source_path:?} {} offset={offset}",
+                                            owner.unwrap_or_default()));
+                                        if offset {
+                                            let mut origin = source;
+                                            let mut seen = HashSet::new();
+                                            while seen.len() < 48 && seen.insert(origin) {
+                                                let path = backend.pag.node_path(origin);
+                                                let owner = base_path(&path.path).get_containing_func()
+                                                    .and_then(|function| instances.get(&function)).map(ToString::to_string);
+                                                causes.push(format!("offset flow: {path:?} {}", owner.unwrap_or_default()));
+                                                let Some(&previous) = offset_origins.get(&origin) else { break; };
+                                                origin = previous;
+                                            }
+                                        }
+                                    }
+                                    if origins[value] == value
+                                        && let Some(&(source, reason)) = untracked_loads.get(&(value / 2))
+                                    {
+                                        let points: Vec<_> = backend.get_pt_data().get_propa_pts(source)
+                                            .into_iter().flat_map(|points| points.iter()).take(4)
+                                            .map(|node| format!("{:?}", backend.pag.node_path(node))).collect();
+                                        causes.push(format!("load source: {:?} reason={reason} points={points:?}",
+                                            backend.pag.node_path(source)));
+                                    }
                                     if origins[value] == value && seed_kinds[value / 2] & 512 != 0 {
                                         let mut escape = value / 2 * 2 + 1;
                                         let mut escaped_seen = HashSet::new();
@@ -1361,7 +1441,7 @@ impl<'tcx> GlobalPointers<'tcx> {
                                                     .and_then(|function| instances.get(&function)).map(ToString::to_string);
                                                 causes.push(format!("escape {}: {path:?} context={:?} {}",
                                                     if escape % 2 == 1 { "storage" } else { "value" },
-                                                    group_contexts[escape / 2], owner.unwrap_or_default()));
+                                                    group_contexts[escape / 2].map(&describe_context), owner.unwrap_or_default()));
                                             }
                                             escape = escape_origins[escape];
                                         }
@@ -1387,7 +1467,7 @@ impl<'tcx> GlobalPointers<'tcx> {
                             let owner = base_path(path).get_containing_func()
                                 .and_then(|function| instances.get(&function)).map(ToString::to_string);
                             causes.push(format!("{path:?} context={:?} {}",
-                                group_contexts[escape / 2], owner.unwrap_or_default()));
+                                group_contexts[escape / 2].map(&describe_context), owner.unwrap_or_default()));
                         }
                         escape = escape_origins[escape];
                     }
@@ -1412,6 +1492,17 @@ impl<'tcx> GlobalPointers<'tcx> {
             }
             (covered_calls, context_coverage, uncertain_nodes, range_offsets)
         };
+        if !callbacks_to_analyze.is_empty() && irq_check_rupta::limits::checkpoint() {
+            drop(covered_calls);
+            drop(context_coverage);
+            drop(uncertain_nodes);
+            drop(range_offsets);
+            drop(scalar_writes);
+            backend.pag.reset_edge_indexes(true);
+            backend.analyze_callbacks(callbacks_to_analyze);
+            backend.propagate();
+            continue;
+        }
         complete &= !uncertain_nodes.iter().any(|node| {
             backend.acx.get_path_rustc_type(&backend.pag.node_path(*node).path)
                 .is_some_and(|ty| ty.is_any_ptr())
@@ -1567,19 +1658,23 @@ impl<'tcx> GlobalPointers<'tcx> {
             pointees.retain(|key, values| !uncertain.contains(key) && !values.is_empty());
             pointee_ranges.retain(|key, _| pointees.contains_key(key));
         }
-        let mut nodes = Vec::with_capacity(backend.pag.graph().node_count());
+        let pointer_bytes = backend.get_pt_data().storage_bytes();
+        let (pag_nodes, _) = std::mem::replace(&mut backend.pag,
+            irq_check_rupta::graph::pag::PAG::new()).graph.into_nodes_edges();
+        let mut nodes = Vec::with_capacity(pag_nodes.len());
         let mut local_nodes = HashMap::<_, Vec<_>>::new();
-        for node in backend.pag.graph().node_indices() {
+        for (ordinal, node) in pag_nodes.into_iter().enumerate() {
             if !irq_check_rupta::limits::checkpoint() { break; }
             use irq_check_rupta::mir::path::PathEnum;
-            let source = backend.pag.node_path(node);
+            let source = node.weight.path();
+            let node = irq_check_rupta::pta::NodeId::new(ordinal);
             let mut base = &source.path;
-            let mut pieces = Vec::new();
+            let mut projected = false;
             let mut offset = 0usize;
             loop {
                 match &base.value {
                     PathEnum::QualifiedPath { base: parent, projection } => {
-                        pieces.push(projection.as_slice());
+                        projected |= !projection.is_empty();
                         base = parent;
                     }
                     PathEnum::OffsetPath { base: parent, offset: bytes } => {
@@ -1588,10 +1683,6 @@ impl<'tcx> GlobalPointers<'tcx> {
                     }
                     _ => break,
                 }
-            }
-            let mut projection = Vec::new();
-            for piece in pieces.into_iter().rev() {
-                projection.extend_from_slice(piece);
             }
             let (function_id, object, function) = match base.value {
                 PathEnum::LocalVariable { func_id, ordinal }
@@ -1620,19 +1711,29 @@ impl<'tcx> GlobalPointers<'tcx> {
             let context = function_id.and_then(|func_id| backend.call_graph.func_nodes.get(
                 &irq_check_rupta::mir::function::CSFuncId::new(source.cid, func_id)
             )).map(|node| node.index());
-            let targets: Vec<_> = backend.get_pt_data().get_propa_pts(node)
-                .into_iter().flat_map(|points| points.iter()).map(|target| target.index()).collect();
-            if let (Some(context), Some(PointerObject::Local(_, local))) = (context, object) {
+            let ty = backend.acx.get_path_rustc_type(&source.path);
+            let local_pointer = !projected && offset == 0 && context.is_some()
+                && matches!(object, Some(PointerObject::Local(..)))
+                && ty.is_some_and(|ty| ty.is_any_ptr());
+            let mut targets = Vec::new();
+            if let Some(points) = backend.pt_data.get_mut_propa_pts(node) {
+                if local_pointer {
+                    targets.reserve_exact(points.count());
+                    targets.extend(points.iter().map(|target| target.index()));
+                }
+                *points = irq_check_rupta::pta::PointsTo::new();
+            }
+            if local_pointer && let (Some(context), Some(PointerObject::Local(_, local))) = (context, object) {
                 local_nodes.entry((context, local)).or_default().push(node.index());
             }
             nodes.push(PointerNode {
-                object, context, projection, offset,
-                ty: backend.acx.get_path_rustc_type(&source.path),
+                object, context, projected, offset, ty,
                 function,
                 complete: !uncertain_nodes.contains(&node) && !targets.is_empty(),
                 targets,
             });
         }
+        backend.pt_data = irq_check_rupta::pta::DiffPTDataTy::new();
         let mut pending: Vec<_> = instances
             .values()
             .chain(exported.values())
@@ -1824,7 +1925,7 @@ impl<'tcx> GlobalPointers<'tcx> {
                 candidates.len(),
                 backend.call_bindings.len(),
                 backend.acx.coverage_gaps.len(),
-                backend.get_pt_data().storage_bytes()
+                pointer_bytes
             );
         }
         let binding_independent = visited.difference(&binding_dependent).copied().collect();
@@ -2507,7 +2608,7 @@ impl<'tcx> GlobalPointers<'tcx> {
             pointees,
             pointee_ranges,
         };
-        Self {
+        break Self {
             exported,
             roots: ordered,
             candidates,
@@ -2515,6 +2616,7 @@ impl<'tcx> GlobalPointers<'tcx> {
             binding_independent,
             diagnostic_independent,
             facts,
+        };
         }
     }
 }

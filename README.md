@@ -25,7 +25,7 @@ Run the five paired Cargo scenarios from this checkout:
 .\scenarios\run.ps1 -Toolchain nightly
 ```
 
-The runner uses the installed checker. It checks the exit status, compiler identity, target, selected crates, expected forbidden target, and an indirect call reachable from the IRQ root. It uses a new Cargo output directory for each run under `target/scenarios`. A compiler error or a checker crash does not count as an expected rejection. Add `-VerifyCache` to repeat each safe build and check that Cargo reuses its result without changing the analysis evidence.
+The runner uses the installed checker. It checks the exit status, compiler identity, target, selected crates, expected forbidden target, and an indirect call reachable from the IRQ root. It saves reports under `target/scenarios`. A compiler error or a checker crash does not count as an expected rejection. Add `-VerifyFreshRun` to repeat each safe build and check that it writes new analysis evidence. `-VerifyCache` remains an alias for this option.
 
 Normal analysis uses Rust compiler diagnostics. Optional reports use the following settings. The driver reads them once per process. They do not change the policy or select another backend.
 
@@ -50,23 +50,9 @@ The command uses the platform target, default-feature selection, and feature lis
 
 For a direct metadata-only check, use `irq-check --cargo check` with the same manifest, package, target, features, and build-std options as the build. Build scripts and procedural macros still compile for the host.
 
-To force fresh analysis through Cargo or xtask, set a new process-local cache ID before the build:
+Each `irq-check --cargo` invocation uses a new temporary build directory under `<target-directory>/irq-check-runs`. This also applies to `xtask irq-check`. Dependency metadata and compiler output exist only for that invocation. The launcher removes the directory after Cargo exits, on success or failure. Every invocation runs analysis again. `IRQ_CHECK_ANALYSIS_ID` is no longer used.
 
-```powershell
-$previousAnalysisId = $env:IRQ_CHECK_ANALYSIS_ID
-$previousToolchain = $env:RUSTUP_TOOLCHAIN
-try {
-    $env:RUSTUP_TOOLCHAIN = 'nightly'
-    $env:IRQ_CHECK_ANALYSIS_ID = [guid]::NewGuid().ToString()
-    cargo +nightly run -p xtask -- irq-check --platform x86_64-uefi --release
-    if ($LASTEXITCODE -ne 0) { throw 'Kernel IRQ check failed' }
-} finally {
-    $env:IRQ_CHECK_ANALYSIS_ID = $previousAnalysisId
-    $env:RUSTUP_TOOLCHAIN = $previousToolchain
-}
-```
-
-Run this example from the rustOS checkout. Keep the same ID to check cache reuse. A new ID selects a new Cargo output directory. It does not delete existing output or change the analysis policy.
+Normal project build output and saved analysis reports remain available. In-memory query caches remain active during each analysis. If the launcher is forcibly stopped, temporary files can remain, but a later invocation does not reuse them.
 
 ## Solver
 
@@ -102,7 +88,7 @@ Each pointer query starts with 100,000 transfer steps. It can retry once with an
 
 Optional refinement has a default 1,000-step allowance within the pointer-query budget. A stopped request retains its stop status. It is not a completed unknown value. Required binding work uses the main query allowance. Read-cache keys include the refinement owner, index choices, and explicit caller choices. The work queue processes dependencies of the active request.
 
-Set `IRQ_CHECK_MEMORY_MIB` to a positive value no greater than 10240. Set `IRQ_CHECK_TIMEOUT_SECONDS` to a positive timeout. Set `IRQ_CHECK_QUERY_STEPS`, `IRQ_CHECK_SCALAR_STEPS`, and `IRQ_CHECK_ALTERNATIVES` to positive work limits. `IRQ_CHECK_CALL_DEPTH` defaults to 256. `IRQ_CHECK_FUNCTION_SCRATCH_MIB` defaults to 16, and `IRQ_CHECK_QUERY_SCRATCH_MIB` defaults to 256. Local scratch limits cannot exceed the process memory allowance. `IRQ_CHECK_WORKERS` selects the worker limit. The cache key includes all resource settings and both checker binaries.
+Set `IRQ_CHECK_MEMORY_MIB` to a positive value no greater than 10240. Set `IRQ_CHECK_TIMEOUT_SECONDS` to a positive timeout. Set `IRQ_CHECK_QUERY_STEPS`, `IRQ_CHECK_SCALAR_STEPS`, and `IRQ_CHECK_ALTERNATIVES` to positive work limits. `IRQ_CHECK_CALL_DEPTH` defaults to 256. `IRQ_CHECK_FUNCTION_SCRATCH_MIB` defaults to 16, and `IRQ_CHECK_QUERY_SCRATCH_MIB` defaults to 256. Local scratch limits cannot exceed the process memory allowance. `IRQ_CHECK_WORKERS` selects the worker limit.
 
 Identify the exact stop before increasing a limit. Keep each run bounded and record its settings. An increased query limit also changes retry and refinement allowances. More work does not prove that the implementation is correct.
 
@@ -200,4 +186,4 @@ Selection uses Cargo's resolved package identity. It respects dependency renames
 
 There is no crate-wide exclusion. Use a narrow explicit unsafe block when a reviewed analysis gap must be accepted. `core`, `alloc`, and `std` retain their built-in checks.
 
-Internal metadata stores block scopes and package selection. The interface is `strict-blocks-4`. The build cache changes when the policy, limits, or checker binaries change.
+Internal metadata stores block scopes and package selection for the current invocation. The interface is `strict-blocks-4`. Checker build output is temporary and is not reused by later invocations.

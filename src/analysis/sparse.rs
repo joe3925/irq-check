@@ -327,7 +327,7 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
                 let mut covered = false;
                 for &node in nodes {
                     let source = &self.facts.nodes[node];
-                    if !source.projection.is_empty() || source.offset != 0
+                    if source.projected || source.offset != 0
                         || !source.ty.is_some_and(|ty| ty.is_any_ptr()) { continue; }
                     covered = true;
                     if !source.complete { complete = false; break; }
