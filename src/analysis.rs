@@ -8,6 +8,7 @@ use rustc_middle::mir::{self, Location, TerminatorKind};
 use rustc_middle::ty::{self, Instance, InstanceKind, TyCtxt, TypingEnv};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use query::{Guard, QueryStop, ReadOutcome, RequestMode};
 use sparse::{Alternative, Frame, Point, Solver, Value};
 
@@ -134,8 +135,12 @@ pub struct Analysis<'tcx> {
 
 impl<'tcx> Analysis<'tcx> {
     pub fn build(tcx: TyCtxt<'tcx>, trust: &Trust, instances: &[Instance<'tcx>], roots: &[Instance<'tcx>]) -> Self {
+        let started = std::time::Instant::now();
+        let global_cpu = crate::reporting::cpu_seconds();
         let global::GlobalPointers { exported, roots: discovery_roots, candidates, failure, binding_independent, diagnostic_independent, facts } =
             global::GlobalPointers::build(tcx, trust, instances, roots);
+        let global_seconds = started.elapsed().as_secs_f64();
+        let global_cpu = global_cpu.zip(crate::reporting::cpu_seconds()).map(|(start, end)| end - start);
         let mut output = Self {
             roots: HashMap::new(), graph: HashMap::new(), sites: Vec::new(), free_sites: HashSet::new(),
             incomplete: failure.is_some(), limit_detail: failure.unwrap_or_default(), precision_loss: HashMap::new(),
@@ -144,13 +149,62 @@ impl<'tcx> Analysis<'tcx> {
             diagnostic_cutoff: false,
         };
         if output.incomplete { return output; }
-        let workers = crate::worker_limit().min(roots.len().max(1));
-        let tasks: Vec<_> = (0..workers).collect();
-        let results: Vec<_> = rustc_data_structures::sync::par_map(tasks, |worker| {
-            let roots: Vec<_> = roots.iter().copied().skip(worker).step_by(workers).collect();
-            Self::check_roots(tcx, trust, &exported, &candidates, &binding_independent, &diagnostic_independent, &facts, &discovery_roots, &roots, 1024 * 1024 * 1024 / workers, worker, None)
+        let mut forbidden_distance = HashMap::new();
+        let mut callers = HashMap::<_, HashSet<_>>::new();
+        for (&(caller, _), targets) in &facts.safe_candidates {
+            for &target in targets {
+                callers.entry(target).or_default().insert(caller);
+                if crate::forbidden(tcx, target).is_some() { forbidden_distance.insert(target, 0usize); }
+            }
+        }
+        let mut pending: VecDeque<_> = forbidden_distance.keys().copied().collect();
+        while let Some(target) = pending.pop_front() {
+            if !irq_check_rupta::limits::checkpoint() { break; }
+            let distance = forbidden_distance[&target] + 1;
+            for &caller in callers.get(&target).into_iter().flatten() {
+                if let std::collections::hash_map::Entry::Vacant(entry) = forbidden_distance.entry(caller) {
+                    entry.insert(distance);
+                    pending.push_back(caller);
+                }
+            }
+        }
+        drop(callers);
+        let workers = crate::worker_limit().min(8).min(roots.len().max(1));
+        let mut callees = HashMap::<_, HashSet<_>>::new();
+        for (&(caller, _), targets) in &facts.safe_candidates {
+            callees.entry(caller).or_default().extend(targets.iter().copied());
+        }
+        let mut ordered_roots = Vec::new();
+        for (ordinal, &root) in roots.iter().enumerate() {
+            let mut reachable = HashSet::new();
+            let mut pending = vec![root];
+            while let Some(instance) = pending.pop() {
+                if reachable.insert(instance) {
+                    pending.extend(callees.get(&instance).into_iter().flatten().copied());
+                }
+            }
+            ordered_roots.push((reachable.len(), ordinal, root));
+        }
+        ordered_roots.sort_unstable_by_key(|&(cost, ordinal, _)| (std::cmp::Reverse(cost), ordinal));
+        let mut groups = vec![(0usize, Vec::new()); workers];
+        for (cost, ordinal, root) in ordered_roots {
+            let worker = groups.iter().enumerate().min_by_key(|&(worker, (load, _))| (*load, worker)).unwrap().0;
+            groups[worker].0 = groups[worker].0.saturating_add(cost);
+            groups[worker].1.push((ordinal, root));
+        }
+        let active_workers = AtomicUsize::new(workers);
+        let started = std::time::Instant::now();
+        let root_cpu = crate::reporting::cpu_seconds();
+        let results: Vec<_> = rustc_data_structures::sync::par_map(groups.into_iter().enumerate(), |(worker, (_, roots))| {
+            let instances: Vec<_> = roots.iter().map(|&(_, instance)| instance).collect();
+            let result = Self::check_roots(tcx, trust, &exported, &candidates, &binding_independent, &diagnostic_independent,
+                &facts, &discovery_roots, &forbidden_distance, &instances, &active_workers, None);
+            active_workers.fetch_sub(1, Ordering::Relaxed);
+            (worker, result)
         });
-        for (worker, mut result) in results.into_iter().enumerate() {
+        let root_seconds = started.elapsed().as_secs_f64();
+        let root_cpu = root_cpu.zip(crate::reporting::cpu_seconds()).map(|(start, end)| end - start);
+        for (worker, mut result) in results {
             let site_offset = output.sites.len();
             let convert = |node: Node<'tcx>| Node {
                 instance: node.instance,
@@ -178,6 +232,9 @@ impl<'tcx> Analysis<'tcx> {
             output.specialized_safe.extend(result.specialized_safe.into_iter().map(convert));
             for (key, count) in result.covered_calls { *output.covered_calls.entry(key).or_default() += count; }
         }
+        if crate::reporting::configuration().stats {
+            eprintln!("irq-check: analysis timing global_seconds={global_seconds:.3} global_cpu_seconds={global_cpu:?} root_seconds={root_seconds:.3} root_cpu_seconds={root_cpu:?} roots={} workers={workers}", roots.len());
+        }
         output
     }
 
@@ -190,9 +247,9 @@ impl<'tcx> Analysis<'tcx> {
         diagnostic_independent: &HashSet<Instance<'tcx>>,
         facts: &global::PointerFacts<'tcx>,
         discovery_roots: &[Instance<'tcx>],
+        forbidden_distance: &HashMap<Instance<'tcx>, usize>,
         roots: &[Instance<'tcx>],
-        cache_limit: usize,
-        worker: usize,
+        active_workers: &AtomicUsize,
         witness_value: Option<u128>,
     ) -> Self {
         let scalar_witness = witness_value.is_some();
@@ -206,7 +263,8 @@ impl<'tcx> Analysis<'tcx> {
         let limits = irq_check_rupta::limits::configuration().expect("validated analysis limits");
         let mut solver = Solver::new(tcx, trust, exported, facts);
         solver.discovery_roots = discovery_roots.to_vec();
-        solver.cache_limit = cache_limit;
+        solver.cache_pool = Some((active_workers, if scalar_witness { crate::worker_limit().min(2) } else { 1 }));
+        solver.begin_query(0);
         let mut queue = VecDeque::new();
         let mut deferred = VecDeque::new();
         let mut queued = HashMap::<usize, Vec<Vec<(usize, Guard)>>>::new();
@@ -216,26 +274,6 @@ impl<'tcx> Analysis<'tcx> {
         let mut diagnostic_inputs = HashMap::<Instance<'tcx>, HashMap<Point, usize>>::new();
         let mut diagnostic_reuse = 0usize;
         let mut diagnostic_widened = 0usize;
-        let mut forbidden_distance = HashMap::new();
-        let mut callers = HashMap::<_, HashSet<_>>::new();
-        for (&(caller, _), targets) in &facts.safe_candidates {
-            for &target in targets {
-                callers.entry(target).or_default().insert(caller);
-                if crate::forbidden(tcx, target).is_some() { forbidden_distance.insert(target, 0usize); }
-            }
-        }
-        let mut pending: VecDeque<_> = forbidden_distance.keys().copied().collect();
-        while let Some(target) = pending.pop_front() {
-            if !irq_check_rupta::limits::checkpoint() { break; }
-            let distance = forbidden_distance[&target] + 1;
-            for &caller in callers.get(&target).into_iter().flatten() {
-                if let std::collections::hash_map::Entry::Vacant(entry) = forbidden_distance.entry(caller) {
-                    entry.insert(distance);
-                    pending.push_back(caller);
-                }
-            }
-        }
-        drop(callers);
         let mut call_orders = HashMap::new();
         for &instance in roots {
             let context = solver.frame(Frame { instance, caller: None, irq: true, unknown_entry: false });
@@ -247,9 +285,15 @@ impl<'tcx> Analysis<'tcx> {
             solver.index(root.context).is_ok_and(|index| index.body.args_iter().any(|local|
                 matches!(solver.ty(root.context, index.body.local_decls[local].ty).kind(), ty::Int(_) | ty::Uint(_) | ty::Bool)))
         }) {
-            for value in [0, 1] {
-                let witness = Self::check_roots(tcx, trust, exported, candidates, binding_independent, diagnostic_independent, facts,
-                    discovery_roots, roots, cache_limit, worker, Some(value));
+            let witnesses: Vec<_> = rustc_data_structures::sync::par_map([0, 1], |value|
+                Self::check_roots(tcx, trust, exported, candidates, binding_independent, diagnostic_independent, facts,
+                    discovery_roots, forbidden_distance, roots, active_workers, Some(value)));
+            if let Some(reason) = irq_check_rupta::limits::stop_reason() {
+                output.incomplete = true;
+                output.limit_detail = reason.into();
+                return output;
+            }
+            for witness in witnesses {
                 if witness.diagnostic_cutoff && !witness.incomplete { return witness; }
             }
         }

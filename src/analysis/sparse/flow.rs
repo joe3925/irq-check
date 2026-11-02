@@ -625,6 +625,9 @@ impl<'a, 'tcx> Solver<'a, 'tcx> {
     }
 
     pub(crate) fn begin_query(&mut self, limit: usize) {
+        if let Some((workers, divisor)) = self.cache_pool {
+            self.cache_limit = 1024 * 1024 * 1024 / workers.load(std::sync::atomic::Ordering::Relaxed).max(1) / divisor;
+        }
         self.impacts.stopped.clear();
         self.controls.stopped_conditions.retain(|key, _| key.generation == self.flow.generation);
         self.controls.stopped_bytes = self.controls.stopped_conditions.keys().map(|key|

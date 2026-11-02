@@ -17,7 +17,8 @@ static CONFIG: OnceLock<Result<Limits, String>> = OnceLock::new();
 
 pub fn configuration() -> Result<Limits, String> {
     CONFIG.get_or_init(|| {
-        let mut values = [10240usize, 7200, 100000, 4, 1000, 32, 256, 16, 256];
+        let available = std::thread::available_parallelism().map(usize::from).unwrap_or(1);
+        let mut values = [10240usize, 7200, 100000, available, 1000, 32, 256, 16, 256];
         for (index, name) in ["IRQ_CHECK_MEMORY_MIB", "IRQ_CHECK_TIMEOUT_SECONDS", "IRQ_CHECK_QUERY_STEPS", "IRQ_CHECK_WORKERS", "IRQ_CHECK_SCALAR_STEPS", "IRQ_CHECK_ALTERNATIVES", "IRQ_CHECK_CALL_DEPTH", "IRQ_CHECK_FUNCTION_SCRATCH_MIB", "IRQ_CHECK_QUERY_SCRATCH_MIB"].iter().enumerate() {
             match std::env::var(name) {
                 Ok(value) => {
@@ -37,7 +38,6 @@ pub fn configuration() -> Result<Limits, String> {
         if values[2].checked_mul(10).is_none() {
             return Err("IRQ_CHECK_QUERY_STEPS is too large".into());
         }
-        let available = std::thread::available_parallelism().map(usize::from).unwrap_or(1);
         Ok(Limits { memory_mib: values[0], timeout_seconds: values[1] as u64, query_steps: values[2], workers: values[3].min(available), scalar_steps: values[4], alternatives: values[5], call_depth: values[6], function_scratch_mib: values[7], query_scratch_mib: values[8] })
     }).clone()
 }

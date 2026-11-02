@@ -5,7 +5,7 @@
 
 //! The key component of our pointer analysis.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 use rustc_hir::def_id::DefId;
@@ -118,10 +118,102 @@ where
     /// Propogate pts data until the worklist is empty.
     pub fn solve_worklist(&mut self) {
         self.init_constraints();
+        let workers = crate::limits::configuration().expect("validated analysis limits").workers;
+        let mut parallel_batches = 0usize;
+        let mut parallel_edges = 0usize;
+        let mut parallel_destinations = 0usize;
         while !self.worklist.is_empty() {
             if !crate::limits::checkpoint() { return; }
-            let node_id = self.worklist.pop_front().unwrap();
-            self.process_node(node_id);
+            let wide_source = self.worklist.front().and_then(|node| self.pag.direct_out_edges.get(node))
+                .is_some_and(|edges| edges.len() >= 64);
+            if workers == 1 || self.acx.analysis_options.stack_filtering || self.worklist.len() < 64 && !wide_source {
+                let node_id = self.worklist.pop_front().unwrap();
+                self.process_node(node_id, None);
+                continue;
+            }
+            let mut seen = HashSet::new();
+            let mut deltas = Vec::new();
+            let mut bytes = 0usize;
+            while deltas.len() < workers.saturating_mul(64).min(2048) && bytes < 16 * 1024 * 1024 {
+                let Some(node) = self.worklist.pop_front() else { break; };
+                if !seen.insert(node) { continue; }
+                let Some(delta) = self.pt_data.get_diff_pts(node).filter(|delta| !delta.is_empty()).cloned() else { continue; };
+                bytes = bytes.saturating_add(delta.storage_bytes());
+                self.pt_data.flush(node);
+                deltas.push((node, delta));
+            }
+            if deltas.is_empty() { continue; }
+            let tcx = self.tcx();
+            let mut direct = Vec::new();
+            let mut remaining = vec![Vec::new(); deltas.len()];
+            for (source, &(node, _)) in deltas.iter().enumerate() {
+                if !crate::limits::checkpoint() { return; }
+                let edges = self.pag.direct_out_edges.get(&node).cloned().unwrap_or_default();
+                if edges.is_empty() { continue; }
+                let (_, source_type) = self.node_path_and_ty(node);
+                for edge in edges {
+                    let (_, destination) = self.pag.graph().edge_endpoints(edge).unwrap();
+                    let (_, destination_type) = self.node_path_and_ty(destination);
+                    if type_util::is_integer_carrier(tcx, source_type)
+                        || type_util::is_integer_carrier(tcx, destination_type)
+                        || type_util::get_dereferenced_type(source_type).is_trait()
+                            && !type_util::get_dereferenced_type(destination_type).is_trait()
+                    {
+                        remaining[source].push(edge);
+                    } else {
+                        direct.push((source, destination, edge, source_type, destination_type));
+                    }
+                }
+            }
+            let direct: Vec<_> = rustc_data_structures::sync::par_map(direct,
+                |(source, destination, edge, source_type, destination_type)| {
+                    (source, destination, edge, type_util::equivalent_ptr_types(tcx, source_type, destination_type))
+                });
+            let mut destinations = HashMap::<_, Vec<_>>::new();
+            let mut sources = HashSet::new();
+            for (source, destination, edge, compatible) in direct {
+                if compatible {
+                    sources.insert(source);
+                    destinations.entry(destination).or_default().push(source);
+                    parallel_edges += 1;
+                } else {
+                    remaining[source].push(edge);
+                }
+            }
+            for source in sources {
+                if !crate::limits::checkpoint() { return; }
+                for pointee in &deltas[source].1 {
+                    self.node_path_and_ty(pointee);
+                }
+            }
+            let jobs: Vec<_> = destinations.into_iter().map(|(destination, sources)| {
+                let pending = self.pt_data.diff_pts_map.remove(&destination).unwrap_or_else(PointsTo::new);
+                (destination, pending, sources)
+            }).collect();
+            parallel_batches += 1;
+            parallel_destinations += jobs.len();
+            let propagated = &self.pt_data.propa_pts_map;
+            let updates: Vec<_> = rustc_data_structures::sync::par_map(jobs, |(destination, mut pending, sources)| {
+                let mut incoming = PointsTo::new();
+                for source in sources {
+                    if !crate::limits::checkpoint() { break; }
+                    incoming.union(&deltas[source].1);
+                }
+                if let Some(done) = propagated.get(&destination) { incoming.subtract(done); }
+                let changed = pending.union(&incoming);
+                (destination, pending, changed)
+            });
+            for (destination, pending, changed) in updates {
+                self.pt_data.diff_pts_map.insert(destination, pending);
+                if changed { self.worklist.push_back(destination); }
+            }
+            for ((node, delta), remaining) in deltas.into_iter().zip(remaining) {
+                if !crate::limits::checkpoint() { return; }
+                self.process_node(node, Some((delta, remaining)));
+            }
+        }
+        if std::env::var_os("IRQ_CHECK_STATS").is_some() && parallel_batches != 0 {
+            eprintln!("irq-check: pointer propagation batches={parallel_batches} parallel_edges={parallel_edges} destinations={parallel_destinations} workers={workers}");
         }
     }
 
@@ -152,15 +244,16 @@ where
     }
 
     /// Start constraint solving.
-    fn process_node(&mut self, node_id: NodeId) {
-        let delta = self
-            .pt_data
-            .get_diff_pts(node_id)
-            .cloned()
-            .unwrap_or_else(PointsTo::new);
-        self.pt_data.flush(node_id);
-        self.current_delta = Some((node_id, delta));
-        self.handle_direct(node_id);
+    fn process_node(&mut self, node_id: NodeId, prepared: Option<(PointsTo<NodeId>, Vec<EdgeId>)>) {
+        if let Some((delta, remaining)) = prepared {
+            self.current_delta = Some((node_id, delta));
+            for edge in remaining { self.propagate(edge, true); }
+        } else {
+            let delta = self.pt_data.get_diff_pts(node_id).cloned().unwrap_or_else(PointsTo::new);
+            self.pt_data.flush(node_id);
+            self.current_delta = Some((node_id, delta));
+            self.handle_direct(node_id);
+        }
         self.handle_load_and_store(node_id);
         self.handle_gep(node_id);
         self.handle_cast(node_id);

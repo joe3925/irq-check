@@ -6,6 +6,7 @@ use irq_check_rupta::pts_set::points_to::PointsToSet;
 use rustc_middle::mir::Location;
 use rustc_middle::ty::{self, Instance, TyCtxt};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum PointerObject<'tcx> {
@@ -60,6 +61,7 @@ impl<'tcx> GlobalPointers<'tcx> {
         instances: &[Instance<'tcx>],
         roots: &[Instance<'tcx>],
     ) -> Self {
+        let started = std::time::Instant::now();
         let mut callable_instances: HashSet<_> = instances.iter().copied().collect();
         let mut backend = irq_check_rupta::pta::context_sensitive::ContextSensitivePTA::new(
             irq_check_rupta::mir::analysis_context::AnalysisContext::new(
@@ -238,6 +240,15 @@ impl<'tcx> GlobalPointers<'tcx> {
         backend.pre_analysis();
         backend.initialize();
         backend.propagate();
+        let backend_seconds = started.elapsed().as_secs_f64();
+        let coverage_started = std::time::Instant::now();
+        let mut coverage_phase = coverage_started;
+        let mut coverage_phases = Vec::new();
+        let mut mark_coverage = |name| {
+            let now = std::time::Instant::now();
+            coverage_phases.push((name, now.duration_since(coverage_phase).as_secs_f64()));
+            coverage_phase = now;
+        };
         loop {
         backend.pag.reset_edge_indexes(false);
         let mut scalar_writes = HashMap::<_, Vec<_>>::new();
@@ -645,6 +656,7 @@ impl<'tcx> GlobalPointers<'tcx> {
             let mut callback_returns = HashMap::<_, Vec<_>>::new();
             let mut write_addresses = HashSet::new();
             let mut call_receivers = HashSet::new();
+            mark_coverage("groups");
             let mut unknown_memory = !backend.acx.forbidden_externals.is_empty();
             let mut unknown_calls = !backend.acx.forbidden_externals.is_empty();
             let mut gap_functions = HashSet::new();
@@ -1178,6 +1190,7 @@ impl<'tcx> GlobalPointers<'tcx> {
                 if origins[value] == usize::MAX { origins[value] = from; }
                 queue.push((group, storage));
             };
+            mark_coverage("constraints");
             let mut opaque_callback = false;
             let mut exposed_functions = HashSet::new();
             loop {
@@ -1302,6 +1315,7 @@ impl<'tcx> GlobalPointers<'tcx> {
                     pending.push(next);
                 }
             }
+            mark_coverage("propagation");
             let mut covered_calls = HashSet::new();
             let mut context_coverage = HashSet::new();
             let mut uncovered_calls = HashSet::new();
@@ -1492,6 +1506,7 @@ impl<'tcx> GlobalPointers<'tcx> {
             }
             (covered_calls, context_coverage, uncertain_nodes, range_offsets)
         };
+        mark_coverage("calls");
         if !callbacks_to_analyze.is_empty() && irq_check_rupta::limits::checkpoint() {
             drop(covered_calls);
             drop(context_coverage);
@@ -1501,6 +1516,7 @@ impl<'tcx> GlobalPointers<'tcx> {
             backend.pag.reset_edge_indexes(true);
             backend.analyze_callbacks(callbacks_to_analyze);
             backend.propagate();
+            mark_coverage("callbacks");
             continue;
         }
         complete &= !uncertain_nodes.iter().any(|node| {
@@ -1658,6 +1674,7 @@ impl<'tcx> GlobalPointers<'tcx> {
             pointees.retain(|key, values| !uncertain.contains(key) && !values.is_empty());
             pointee_ranges.retain(|key, _| pointees.contains_key(key));
         }
+        mark_coverage("pointees");
         let pointer_bytes = backend.get_pt_data().storage_bytes();
         let (pag_nodes, _) = std::mem::replace(&mut backend.pag,
             irq_check_rupta::graph::pag::PAG::new()).graph.into_nodes_edges();
@@ -1734,6 +1751,7 @@ impl<'tcx> GlobalPointers<'tcx> {
             });
         }
         backend.pt_data = irq_check_rupta::pta::DiffPTDataTy::new();
+        mark_coverage("nodes");
         let mut pending: Vec<_> = instances
             .values()
             .chain(exported.values())
@@ -1743,124 +1761,134 @@ impl<'tcx> GlobalPointers<'tcx> {
         let mut callers = HashMap::<_, HashSet<_>>::new();
         let mut binding_dependent = HashSet::new();
         let mut diagnostic_dependent = HashSet::new();
-        while let Some(instance) = pending.pop() {
-            if !irq_check_rupta::limits::checkpoint() {
-                break;
-            }
-            if !visited.insert(instance)
-                || !trust.checks(instance.def_id())
-                || crate::forbidden(tcx, instance).is_some()
-                || crate::known_intrinsic(tcx, instance)
-                || tcx.is_foreign_item(instance.def_id())
-                || matches!(
-                    instance.def,
-                    ty::InstanceKind::Intrinsic(_)
-                        | ty::InstanceKind::LlvmIntrinsic(_)
-                        | ty::InstanceKind::Virtual(..)
-                )
-                || !irq_check_rupta::util::type_util::has_instance_mir(tcx, instance.def)
-            {
-                continue;
-            }
-            let index = match super::query::BodyIndex::build(tcx, trust, instance, true) {
-                Ok(index) => index,
-                Err(_) => {
-                    binding_dependent.insert(instance);
-                    continue;
+        while !pending.is_empty() && irq_check_rupta::limits::checkpoint() {
+            let tasks: Vec<_> = std::mem::take(&mut pending).into_iter().filter(|instance| visited.insert(*instance)).collect();
+            let results: Vec<_> = rustc_data_structures::sync::par_map(tasks, |instance| {
+                if !irq_check_rupta::limits::checkpoint() { return (instance, false, false, Vec::new()); }
+                if !trust.checks(instance.def_id())
+                    || crate::forbidden(tcx, instance).is_some()
+                    || crate::known_intrinsic(tcx, instance)
+                    || tcx.is_foreign_item(instance.def_id())
+                    || matches!(
+                        instance.def,
+                        ty::InstanceKind::Intrinsic(_)
+                            | ty::InstanceKind::LlvmIntrinsic(_)
+                            | ty::InstanceKind::Virtual(..)
+                    )
+                    || !irq_check_rupta::util::type_util::has_instance_mir(tcx, instance.def)
+                {
+                    return (instance, false, false, Vec::new());
                 }
-            };
-            if index.stops.iter().any(Option::is_some) || !index.assumptions.is_empty()
-                || index.reachable.iter().any(|&block| match &index.body.basic_blocks[block].terminator().kind {
-                    rustc_middle::mir::TerminatorKind::Goto { .. }
-                    | rustc_middle::mir::TerminatorKind::Return
-                    | rustc_middle::mir::TerminatorKind::Unreachable => false,
-                    rustc_middle::mir::TerminatorKind::Call { unwind, .. }
-                    | rustc_middle::mir::TerminatorKind::Drop { unwind, .. } =>
-                        matches!(unwind, rustc_middle::mir::UnwindAction::Cleanup(_)),
-                    rustc_middle::mir::TerminatorKind::TailCall { .. } => false,
-                    rustc_middle::mir::TerminatorKind::InlineAsm { targets, unwind, .. } =>
-                        targets.len() > 1 || matches!(unwind, rustc_middle::mir::UnwindAction::Cleanup(_)),
-                    _ => true,
-                })
-            {
-                diagnostic_dependent.insert(instance);
-            }
-            for location in index.calls {
-                use rustc_middle::mir::TerminatorKind;
-                let target = match &index.body.basic_blocks[location.block].terminator().kind {
-                    TerminatorKind::Call { func, .. } | TerminatorKind::TailCall { func, .. } => {
-                        let ty = instance.instantiate_mir_and_normalize_erasing_regions(
-                            tcx,
-                            ty::TypingEnv::fully_monomorphized(),
-                            ty::EarlyBinder::bind(tcx, func.ty(index.body, tcx)),
-                        );
-                        if let ty::FnDef(def, args) = *ty.kind() {
-                            Instance::try_resolve(
+                let index = match super::query::BodyIndex::build(tcx, trust, instance, true) {
+                    Ok(index) => index,
+                    Err(_) => {
+                        return (instance, true, false, Vec::new());
+                    }
+                };
+                let mut binding_dependent = false;
+                let mut diagnostic_dependent = false;
+                let mut targets = Vec::new();
+                if index.stops.iter().any(Option::is_some) || !index.assumptions.is_empty()
+                    || index.reachable.iter().any(|&block| match &index.body.basic_blocks[block].terminator().kind {
+                        rustc_middle::mir::TerminatorKind::Goto { .. }
+                        | rustc_middle::mir::TerminatorKind::Return
+                        | rustc_middle::mir::TerminatorKind::Unreachable => false,
+                        rustc_middle::mir::TerminatorKind::Call { unwind, .. }
+                        | rustc_middle::mir::TerminatorKind::Drop { unwind, .. } =>
+                            matches!(unwind, rustc_middle::mir::UnwindAction::Cleanup(_)),
+                        rustc_middle::mir::TerminatorKind::TailCall { .. } => false,
+                        rustc_middle::mir::TerminatorKind::InlineAsm { targets, unwind, .. } =>
+                            targets.len() > 1 || matches!(unwind, rustc_middle::mir::UnwindAction::Cleanup(_)),
+                        _ => true,
+                    })
+                {
+                    diagnostic_dependent = true;
+                }
+                for location in index.calls {
+                    use rustc_middle::mir::TerminatorKind;
+                    let target = match &index.body.basic_blocks[location.block].terminator().kind {
+                        TerminatorKind::Call { func, .. } | TerminatorKind::TailCall { func, .. } => {
+                            let ty = instance.instantiate_mir_and_normalize_erasing_regions(
                                 tcx,
                                 ty::TypingEnv::fully_monomorphized(),
-                                def,
-                                tcx.instantiate_bound_regions_with_erased(args),
-                            )
-                            .ok()
-                            .flatten()
-                        } else {
-                            None
+                                ty::EarlyBinder::bind(tcx, func.ty(index.body, tcx)),
+                            );
+                            if let ty::FnDef(def, args) = *ty.kind() {
+                                Instance::try_resolve(
+                                    tcx,
+                                    ty::TypingEnv::fully_monomorphized(),
+                                    def,
+                                    tcx.instantiate_bound_regions_with_erased(args),
+                                )
+                                .ok()
+                                .flatten()
+                            } else {
+                                None
+                            }
                         }
-                    }
-                    TerminatorKind::Drop { place, .. } => {
-                        let ty = instance.instantiate_mir_and_normalize_erasing_regions(
-                            tcx,
-                            ty::TypingEnv::fully_monomorphized(),
-                            ty::EarlyBinder::bind(tcx, place.ty(index.body, tcx).ty),
-                        );
-                        if matches!(ty.kind(), ty::Dynamic(..)) {
-                            None
-                        } else {
-                            Some(Instance::resolve_drop_glue(tcx, ty))
+                        TerminatorKind::Drop { place, .. } => {
+                            let ty = instance.instantiate_mir_and_normalize_erasing_regions(
+                                tcx,
+                                ty::TypingEnv::fully_monomorphized(),
+                                ty::EarlyBinder::bind(tcx, place.ty(index.body, tcx).ty),
+                            );
+                            if matches!(ty.kind(), ty::Dynamic(..)) {
+                                None
+                            } else {
+                                Some(Instance::resolve_drop_glue(tcx, ty))
+                            }
                         }
-                    }
-                    TerminatorKind::Assert { msg, .. } => {
-                        use rustc_attr_ir::lang_items::LangItem;
-                        let item = match &**msg {
-                            rustc_middle::mir::AssertKind::BoundsCheck { .. } => {
-                                LangItem::PanicBoundsCheck
-                            }
-                            rustc_middle::mir::AssertKind::MisalignedPointerDereference {
-                                ..
-                            } => LangItem::PanicMisalignedPointerDereference,
-                            rustc_middle::mir::AssertKind::NullPointerDereference => {
-                                LangItem::PanicNullPointerDereference
-                            }
-                            rustc_middle::mir::AssertKind::NullReferenceConstructed => {
-                                LangItem::PanicNullReferenceConstructed
-                            }
-                            rustc_middle::mir::AssertKind::InvalidEnumConstruction(_) => {
-                                LangItem::PanicInvalidEnumConstruction
-                            }
-                            other => other.panic_function(),
-                        };
-                        tcx.lang_items()
-                            .get(item)
-                            .map(|def| Instance::mono(tcx, def))
-                    }
-                    TerminatorKind::InlineAsm { .. } => continue,
-                    _ => None,
-                };
-                if let Some(mut target) =
-                    target.filter(|target| !matches!(target.def, ty::InstanceKind::Virtual(..)))
-                {
-                    if tcx.is_foreign_item(target.def_id())
-                        && trust.checks(target.def_id())
-                        && crate::forbidden(tcx, target).is_none()
+                        TerminatorKind::Assert { msg, .. } => {
+                            use rustc_attr_ir::lang_items::LangItem;
+                            let item = match &**msg {
+                                rustc_middle::mir::AssertKind::BoundsCheck { .. } => {
+                                    LangItem::PanicBoundsCheck
+                                }
+                                rustc_middle::mir::AssertKind::MisalignedPointerDereference {
+                                    ..
+                                } => LangItem::PanicMisalignedPointerDereference,
+                                rustc_middle::mir::AssertKind::NullPointerDereference => {
+                                    LangItem::PanicNullPointerDereference
+                                }
+                                rustc_middle::mir::AssertKind::NullReferenceConstructed => {
+                                    LangItem::PanicNullReferenceConstructed
+                                }
+                                rustc_middle::mir::AssertKind::InvalidEnumConstruction(_) => {
+                                    LangItem::PanicInvalidEnumConstruction
+                                }
+                                other => other.panic_function(),
+                            };
+                            tcx.lang_items()
+                                .get(item)
+                                .map(|def| Instance::mono(tcx, def))
+                        }
+                        TerminatorKind::InlineAsm { .. } => continue,
+                        _ => None,
+                    };
+                    if let Some(mut target) =
+                        target.filter(|target| !matches!(target.def, ty::InstanceKind::Virtual(..)))
                     {
-                        if let Some(linked) = exported.get(tcx.symbol_name(target).name) {
-                            target = *linked;
+                        if tcx.is_foreign_item(target.def_id())
+                            && trust.checks(target.def_id())
+                            && crate::forbidden(tcx, target).is_none()
+                        {
+                            if let Some(linked) = exported.get(tcx.symbol_name(target).name) {
+                                target = *linked;
+                            }
                         }
+                        targets.push(target);
+                    } else {
+                        binding_dependent = true;
                     }
+                }
+                (instance, binding_dependent, diagnostic_dependent, targets)
+            });
+            for (instance, binding, diagnostic, targets) in results {
+                if binding { binding_dependent.insert(instance); }
+                if diagnostic { diagnostic_dependent.insert(instance); }
+                for target in targets {
                     callers.entry(target).or_default().insert(instance);
                     pending.push(target);
-                } else {
-                    binding_dependent.insert(instance);
                 }
             }
         }
@@ -1929,6 +1957,9 @@ impl<'tcx> GlobalPointers<'tcx> {
             );
         }
         let binding_independent = visited.difference(&binding_dependent).copied().collect();
+        mark_coverage("functions");
+        let coverage_seconds = coverage_started.elapsed().as_secs_f64();
+        let summary_started = std::time::Instant::now();
         let mut safe = HashSet::new();
         let mut exclusions = HashSet::new();
         let mut pointer_calls = covered_calls.clone();
@@ -1936,7 +1967,6 @@ impl<'tcx> GlobalPointers<'tcx> {
         let mut context_calls = HashSet::new();
         let mut closed_trait_calls = HashMap::new();
         let mut closed_trait_types = HashMap::new();
-        let mut signature_candidates = HashMap::<_, HashSet<_>>::new();
         let mut rejected = HashSet::new();
         let mut safety_callers = HashMap::<_, HashSet<_>>::new();
         let summary_facts = PointerFacts {
@@ -1956,468 +1986,509 @@ impl<'tcx> GlobalPointers<'tcx> {
             pointees: HashMap::new(),
             pointee_ranges: HashMap::new(),
         };
-        let mut summary_solver = super::sparse::Solver::new(tcx, trust, &exported, &summary_facts);
-        summary_solver.cache_limit = 16 * 1024 * 1024;
         let mut summary_queries = 0usize;
         let mut summary_transfers = 0usize;
         let mut summary_gaps = Vec::new();
         let mut pending: Vec<_> = visited.iter().copied().collect();
-        while let Some(instance) = pending.pop() {
-            if !irq_check_rupta::limits::checkpoint() {
-                break;
-            }
-            if !safe.insert(instance) {
-                continue;
-            }
-            if crate::forbidden(tcx, instance).is_some() {
-                rejected.insert(instance);
-                continue;
-            }
-            if !trust.checks(instance.def_id())
-                || crate::known_intrinsic(tcx, instance)
-                || matches!(
-                    instance.def,
-                    ty::InstanceKind::Shim(ty::ShimKind::DropGlue(_, None))
-                )
-            {
-                continue;
-            }
-            if matches!(instance.def, ty::InstanceKind::Intrinsic(_)) {
-                if !super::LEAF_INTRINSICS.contains(&tcx.item_name(instance.def_id()).as_str()) {
-                    rejected.insert(instance);
-                }
-                if let Some(requirement) = ty::layout::ValidityRequirement::from_intrinsic(
-                    tcx.item_name(instance.def_id()),
-                ) {
-                    if !tcx
-                        .check_validity_requirement((
-                            requirement,
-                            ty::TypingEnv::fully_monomorphized()
-                                .as_query_input(instance.args.type_at(0)),
-                        ))
-                        .is_ok_and(|valid| valid)
+        while !pending.is_empty() && irq_check_rupta::limits::checkpoint() {
+            let mut tasks: Vec<_> = std::mem::take(&mut pending).into_iter().filter(|instance| safe.insert(*instance)).collect();
+            tasks.reverse();
+            if tasks.is_empty() { break; }
+            let next = AtomicUsize::new(0);
+            let workers = crate::worker_limit().min(tasks.len());
+            let initial_covered = &covered_calls;
+            let callable_instances = &callable_instances;
+            let results: Vec<_> = rustc_data_structures::sync::par_map(0..workers, |_| {
+                let mut exclusions = HashSet::new();
+                let mut rejected = HashSet::new();
+                let mut covered_calls = HashSet::new();
+                let mut pointer_calls = HashSet::new();
+                let mut context_calls = HashSet::new();
+                let mut safe_candidates = HashMap::new();
+                let mut closed_trait_calls = HashMap::new();
+                let mut closed_trait_types = HashMap::new();
+                let mut signature_candidates = HashMap::<_, HashSet<_>>::new();
+                let mut safety_callers = HashMap::<_, HashSet<_>>::new();
+                let mut pending = Vec::new();
+                let mut summary_gaps = Vec::new();
+                let mut summary_queries = 0usize;
+                let mut summary_transfers = 0usize;
+                let mut summary_solver = super::sparse::Solver::new(tcx, trust, &exported, &summary_facts);
+                summary_solver.cache_limit = (16 * 1024 * 1024).min(1024 * 1024 * 1024 / workers);
+                while irq_check_rupta::limits::checkpoint() {
+                    let Some(&instance) = tasks.get(next.fetch_add(1, Ordering::Relaxed)) else { break; };
+                    if crate::forbidden(tcx, instance).is_some() {
+                        rejected.insert(instance);
+                        continue;
+                    }
+                    if !trust.checks(instance.def_id())
+                        || crate::known_intrinsic(tcx, instance)
+                        || matches!(
+                            instance.def,
+                            ty::InstanceKind::Shim(ty::ShimKind::DropGlue(_, None))
+                        )
+                    {
+                        continue;
+                    }
+                    if matches!(instance.def, ty::InstanceKind::Intrinsic(_)) {
+                        if !super::LEAF_INTRINSICS.contains(&tcx.item_name(instance.def_id()).as_str()) {
+                            rejected.insert(instance);
+                        }
+                        if let Some(requirement) = ty::layout::ValidityRequirement::from_intrinsic(
+                            tcx.item_name(instance.def_id()),
+                        ) {
+                            if !tcx
+                                .check_validity_requirement((
+                                    requirement,
+                                    ty::TypingEnv::fully_monomorphized()
+                                        .as_query_input(instance.args.type_at(0)),
+                                ))
+                                .is_ok_and(|valid| valid)
+                            {
+                                rejected.insert(instance);
+                            }
+                        }
+                        continue;
+                    }
+                    if tcx.is_foreign_item(instance.def_id())
+                        || matches!(
+                            instance.def,
+                            ty::InstanceKind::LlvmIntrinsic(_) | ty::InstanceKind::Virtual(..)
+                        )
+                        || !irq_check_rupta::util::type_util::has_instance_mir(tcx, instance.def)
                     {
                         rejected.insert(instance);
+                        continue;
                     }
-                }
-                continue;
-            }
-            if tcx.is_foreign_item(instance.def_id())
-                || matches!(
-                    instance.def,
-                    ty::InstanceKind::LlvmIntrinsic(_) | ty::InstanceKind::Virtual(..)
-                )
-                || !irq_check_rupta::util::type_util::has_instance_mir(tcx, instance.def)
-            {
-                rejected.insert(instance);
-                continue;
-            }
-            let Ok(index) = super::query::BodyIndex::build(tcx, trust, instance, true) else {
-                rejected.insert(instance);
-                continue;
-            };
-            if index.stops.iter().any(Option::is_some) {
-                exclusions.insert(instance);
-            }
-            for location in index.calls {
-                let terminator = index.body.basic_blocks[location.block].terminator();
-                if matches!(terminator.kind, rustc_middle::mir::TerminatorKind::InlineAsm { .. })
-                    && [crate::trust::ScopeMark::Trusted, crate::trust::ScopeMark::AllowIncomplete].into_iter()
-                        .any(|mark| trust.allows(tcx, instance, index.body, terminator.source_info.scope, mark))
-                { rejected.insert(instance); continue; }
-                if let rustc_middle::mir::TerminatorKind::Call { func, .. }
-                    | rustc_middle::mir::TerminatorKind::TailCall { func, .. } =
-                    &index.body.basic_blocks[location.block].terminator().kind {
-                    let function = instance.instantiate_mir_and_normalize_erasing_regions(
-                        tcx, ty::TypingEnv::fully_monomorphized(),
-                        ty::EarlyBinder::bind(tcx, func.ty(index.body, tcx)));
-                    if let ty::FnDef(def, args) = *function.kind()
-                        && crate::context_method(tcx, def)
-                        && let Ok(Some(target)) = Instance::try_resolve(tcx,
-                            ty::TypingEnv::fully_monomorphized(), def,
-                            tcx.instantiate_bound_regions_with_erased(args))
-                        && matches!(target.def, ty::InstanceKind::Virtual(..))
-                        && crate::forbidden(tcx, target).is_none() {
-                        let method = tcx.opt_associated_item(def)
-                            .and_then(|item| item.trait_item_def_id()).unwrap_or(def);
-                        let implementations: Vec<_> = callable_instances.iter().copied().filter(|target|
-                            !matches!(target.def, ty::InstanceKind::Virtual(..))
-                                && tcx.opt_associated_item(target.def_id())
-                                    .and_then(|item| item.trait_item_def_id()) == Some(method)).collect();
-                        if !implementations.is_empty() && implementations.iter().all(|target|
-                            !trust.checks(target.def_id()) || roots.contains(target)) {
-                            context_calls.insert((instance, location));
-                            continue;
-                        }
+                    let Ok(index) = super::query::BodyIndex::build(tcx, trust, instance, true) else {
+                        rejected.insert(instance);
+                        continue;
+                    };
+                    if index.stops.iter().any(Option::is_some) {
+                        exclusions.insert(instance);
                     }
-                }
-                if !pointer_calls.contains(&(instance, location))
-                    && tcx.crate_types() == [rustc_structures::CrateType::Executable]
-                    && let rustc_middle::mir::TerminatorKind::Call { func, .. }
-                        | rustc_middle::mir::TerminatorKind::TailCall { func, .. } = &terminator.kind
-                {
-                    let function = instance.instantiate_mir_and_normalize_erasing_regions(
-                        tcx, ty::TypingEnv::fully_monomorphized(),
-                        ty::EarlyBinder::bind(tcx, func.ty(index.body, tcx)));
-                    if let ty::FnDef(def, args) = *function.kind()
-                        && tcx.generics_of(def).count() == 1
-                        && let Some(trait_id) = tcx.trait_of_assoc(def)
-                        && trait_id.is_local()
-                        && !tcx.trait_def(trait_id).has_auto_impl
-                        && Instance::try_resolve(tcx, ty::TypingEnv::fully_monomorphized(), def,
-                            tcx.instantiate_bound_regions_with_erased(args)).ok().flatten()
-                            .is_some_and(|target| matches!(target.def, ty::InstanceKind::Virtual(..)))
-                    {
-                        if !closed_trait_types.contains_key(&trait_id) {
-                            let mut concrete = HashSet::new();
-                            let mut complete = true;
-                            for implementation in tcx.all_impls(trait_id) {
-                                if !irq_check_rupta::limits::checkpoint() {
-                                    complete = false;
-                                    break;
-                                }
-                                let generics = tcx.generics_of(implementation);
-                                if generics.parent.is_some()
-                                    || tcx.impl_polarity(implementation) != ty::ImplPolarity::Positive
-                                {
-                                    complete = false;
-                                    break;
-                                }
-                                let predicates = tcx.clauses_of(implementation);
-                                let mut substitutions = vec![Vec::new()];
-                                for parameter in &generics.own_params {
-                                    let values = match parameter.kind {
-                                        ty::GenericParamDefKind::Lifetime => Some(vec![tcx.lifetimes.re_erased.into()]),
-                                        ty::GenericParamDefKind::Const { .. } => None,
-                                        ty::GenericParamDefKind::Type { .. } => {
-                                            let bounds: Vec<_> = predicates.clauses.iter().filter_map(|(clause, _)| {
-                                                let ty::ClauseKind::Trait(predicate) = clause.kind().skip_binder() else { return None; };
-                                                (predicate.polarity == ty::ClausePolarity::Positive
-                                                    && matches!(predicate.trait_ref.self_ty().kind(), ty::Param(param) if param.index == parameter.index))
-                                                    .then_some(predicate.trait_ref)
-                                            }).collect();
-                                            let sized = bounds.iter().any(|bound| Some(bound.def_id) == tcx.lang_items().sized_trait());
-                                            let mut finite = None;
-                                            if sized {
-                                                for bound in bounds.iter().filter(|bound| bound.def_id.is_local()
-                                                    && bound.args.len() == 1 && !tcx.trait_def(bound.def_id).has_auto_impl)
-                                                {
-                                                    let mut types = HashSet::new();
-                                                    let mut complete_bound = true;
-                                                    for implementation in tcx.all_impls(bound.def_id) {
-                                                        if !irq_check_rupta::limits::checkpoint()
-                                                            || tcx.generics_of(implementation).count() != 0
-                                                            || tcx.impl_polarity(implementation) != ty::ImplPolarity::Positive
-                                                        {
-                                                            complete_bound = false;
-                                                            break;
-                                                        }
-                                                        let Ok(concrete) = tcx.try_normalize_erasing_regions(
-                                                            ty::TypingEnv::fully_monomorphized(),
-                                                            tcx.type_of(implementation).instantiate_identity())
-                                                        else { complete_bound = false; break; };
-                                                        if concrete.is_sized(tcx, ty::TypingEnv::fully_monomorphized()) {
-                                                            types.insert(concrete.into());
-                                                        }
-                                                    }
-                                                    if complete_bound && !types.is_empty() {
-                                                        finite = Some(types.into_iter().collect::<Vec<_>>());
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                            finite
-                                        }
-                                    };
-                                    let Some(values) = values else { complete = false; break; };
-                                    if substitutions.len().saturating_mul(values.len())
-                                        > irq_check_rupta::limits::configuration().unwrap().alternatives
-                                    { complete = false; break; }
-                                    let mut expanded = Vec::new();
-                                    for substitution in &substitutions {
-                                        for value in &values {
-                                            let mut substitution = substitution.clone();
-                                            substitution.push(*value);
-                                            expanded.push(substitution);
-                                        }
-                                    }
-                                    substitutions = expanded;
-                                }
-                                if !complete { break; }
-                                for substitution in substitutions {
-                                    let Ok(concrete_type) = tcx.try_normalize_erasing_regions(
-                                        ty::TypingEnv::fully_monomorphized(),
-                                        tcx.type_of(implementation).instantiate(tcx, tcx.mk_args(&substitution)))
-                                    else { complete = false; break; };
-                                    concrete.insert(concrete_type);
-                                }
-                                if !complete { break; }
-                            }
-                            closed_trait_types.insert(trait_id, complete.then_some(concrete));
-                        }
-                        if let Some(Some(concrete)) = closed_trait_types.get(&trait_id) {
-                            let mut implementations = HashSet::new();
-                            let mut complete = true;
-                            for &concrete in concrete {
-                                let Some(target) = Instance::try_resolve(tcx,
-                                    ty::TypingEnv::fully_monomorphized(), def,
-                                    tcx.mk_args(&[concrete.into()])).ok().flatten()
-                                    .filter(|target| !matches!(target.def, ty::InstanceKind::Virtual(..)))
-                                else { complete = false; break; };
-                                implementations.insert(target);
-                            }
-                            if complete && !implementations.is_empty() {
-                                let singleton = implementations.len() == 1;
-                                let targets = safe_candidates.entry((instance, location)).or_default();
-                                targets.extend(implementations);
-                                covered_calls.insert((instance, location));
-                                if singleton && targets.len() == 1 { pointer_calls.insert((instance, location)); }
-                                closed_trait_calls.insert((instance, location), (trait_id, targets.clone()));
-                            }
-                        }
-                    }
-                }
-                if call_complete && !covered_calls.contains(&(instance, location)) {
-                    let mut fallback = HashSet::new();
-                    match &index.body.basic_blocks[location.block].terminator().kind {
-                        rustc_middle::mir::TerminatorKind::Call { func, .. }
-                        | rustc_middle::mir::TerminatorKind::TailCall { func, .. } => {
+                    for location in index.calls {
+                        let terminator = index.body.basic_blocks[location.block].terminator();
+                        if matches!(terminator.kind, rustc_middle::mir::TerminatorKind::InlineAsm { .. })
+                            && [crate::trust::ScopeMark::Trusted, crate::trust::ScopeMark::AllowIncomplete].into_iter()
+                                .any(|mark| trust.allows(tcx, instance, index.body, terminator.source_info.scope, mark))
+                        { rejected.insert(instance); continue; }
+                        if let rustc_middle::mir::TerminatorKind::Call { func, .. }
+                            | rustc_middle::mir::TerminatorKind::TailCall { func, .. } =
+                            &index.body.basic_blocks[location.block].terminator().kind {
                             let function = instance.instantiate_mir_and_normalize_erasing_regions(
-                                tcx,
-                                ty::TypingEnv::fully_monomorphized(),
-                                ty::EarlyBinder::bind(tcx, func.ty(index.body, tcx)),
-                            );
-                            if function.is_fn_ptr() {
-                                let signature = function.fn_sig(tcx);
-                                if !signature_candidates.contains_key(&signature) {
-                                    let mut targets = HashSet::new();
-                                    let extra = tcx.mk_type_list(&[]);
-                                    let caller_abi = tcx.fn_abi_of_fn_ptr(
-                                        ty::TypingEnv::fully_monomorphized()
-                                            .as_query_input((signature, extra)),
-                                    );
-                                    for &target in &callable_instances {
+                                tcx, ty::TypingEnv::fully_monomorphized(),
+                                ty::EarlyBinder::bind(tcx, func.ty(index.body, tcx)));
+                            if let ty::FnDef(def, args) = *function.kind()
+                                && crate::context_method(tcx, def)
+                                && let Ok(Some(target)) = Instance::try_resolve(tcx,
+                                    ty::TypingEnv::fully_monomorphized(), def,
+                                    tcx.instantiate_bound_regions_with_erased(args))
+                                && matches!(target.def, ty::InstanceKind::Virtual(..))
+                                && crate::forbidden(tcx, target).is_none() {
+                                let method = tcx.opt_associated_item(def)
+                                    .and_then(|item| item.trait_item_def_id()).unwrap_or(def);
+                                let implementations: Vec<_> = callable_instances.iter().copied().filter(|target|
+                                    !matches!(target.def, ty::InstanceKind::Virtual(..))
+                                        && tcx.opt_associated_item(target.def_id())
+                                            .and_then(|item| item.trait_item_def_id()) == Some(method)).collect();
+                                if !implementations.is_empty() && implementations.iter().all(|target|
+                                    !trust.checks(target.def_id()) || roots.contains(target)) {
+                                    context_calls.insert((instance, location));
+                                    continue;
+                                }
+                            }
+                        }
+                        if !(pointer_calls.contains(&(instance, location)) || initial_covered.contains(&(instance, location)))
+                            && tcx.crate_types() == [rustc_structures::CrateType::Executable]
+                            && let rustc_middle::mir::TerminatorKind::Call { func, .. }
+                                | rustc_middle::mir::TerminatorKind::TailCall { func, .. } = &terminator.kind
+                        {
+                            let function = instance.instantiate_mir_and_normalize_erasing_regions(
+                                tcx, ty::TypingEnv::fully_monomorphized(),
+                                ty::EarlyBinder::bind(tcx, func.ty(index.body, tcx)));
+                            if let ty::FnDef(def, args) = *function.kind()
+                                && tcx.generics_of(def).count() == 1
+                                && let Some(trait_id) = tcx.trait_of_assoc(def)
+                                && trait_id.is_local()
+                                && !tcx.trait_def(trait_id).has_auto_impl
+                                && Instance::try_resolve(tcx, ty::TypingEnv::fully_monomorphized(), def,
+                                    tcx.instantiate_bound_regions_with_erased(args)).ok().flatten()
+                                    .is_some_and(|target| matches!(target.def, ty::InstanceKind::Virtual(..)))
+                            {
+                                if !closed_trait_types.contains_key(&trait_id) {
+                                    let mut concrete = HashSet::new();
+                                    let mut complete = true;
+                                    for implementation in tcx.all_impls(trait_id) {
                                         if !irq_check_rupta::limits::checkpoint() {
+                                            complete = false;
                                             break;
                                         }
-                                        if !matches!(
-                                            target.def,
-                                            ty::InstanceKind::Item(_) | ty::InstanceKind::Shim(_)
-                                        ) {
-                                            continue;
+                                        let generics = tcx.generics_of(implementation);
+                                        if generics.parent.is_some()
+                                            || tcx.impl_polarity(implementation) != ty::ImplPolarity::Positive
+                                        {
+                                            complete = false;
+                                            break;
                                         }
-                                        if matches!(target.def, ty::InstanceKind::Item(_))
-                                            && !matches!(tcx.def_kind(target.def_id()), rustc_hir::def::DefKind::Fn | rustc_hir::def::DefKind::AssocFn | rustc_hir::def::DefKind::Closure | rustc_hir::def::DefKind::SyntheticCoroutineBody) { continue; }
-                                        let callee_abi = tcx.fn_abi_of_instance_no_deduced_attrs(
-                                            ty::TypingEnv::fully_monomorphized()
-                                                .as_query_input((target, extra)),
-                                        );
-                                        let compatible = match (caller_abi, callee_abi) {
-                                            (Ok(caller), Ok(callee)) => {
-                                                caller.conv == callee.conv
-                                                    && caller.c_variadic == callee.c_variadic
-                                                    && caller.args.len() == callee.args.len()
-                                                    && caller
-                                                        .args
-                                                        .iter()
-                                                        .zip(callee.args.iter())
-                                                        .all(|(source, destination)| {
-                                                            source.eq_abi(destination)
-                                                        })
-                                                    && (callee.ret.layout.ty.is_never()
-                                                        || caller.ret.eq_abi(&callee.ret))
+                                        let predicates = tcx.clauses_of(implementation);
+                                        let mut substitutions = vec![Vec::new()];
+                                        for parameter in &generics.own_params {
+                                            let values = match parameter.kind {
+                                                ty::GenericParamDefKind::Lifetime => Some(vec![tcx.lifetimes.re_erased.into()]),
+                                                ty::GenericParamDefKind::Const { .. } => None,
+                                                ty::GenericParamDefKind::Type { .. } => {
+                                                    let bounds: Vec<_> = predicates.clauses.iter().filter_map(|(clause, _)| {
+                                                        let ty::ClauseKind::Trait(predicate) = clause.kind().skip_binder() else { return None; };
+                                                        (predicate.polarity == ty::ClausePolarity::Positive
+                                                            && matches!(predicate.trait_ref.self_ty().kind(), ty::Param(param) if param.index == parameter.index))
+                                                            .then_some(predicate.trait_ref)
+                                                    }).collect();
+                                                    let sized = bounds.iter().any(|bound| Some(bound.def_id) == tcx.lang_items().sized_trait());
+                                                    let mut finite = None;
+                                                    if sized {
+                                                        for bound in bounds.iter().filter(|bound| bound.def_id.is_local()
+                                                            && bound.args.len() == 1 && !tcx.trait_def(bound.def_id).has_auto_impl)
+                                                        {
+                                                            let mut types = HashSet::new();
+                                                            let mut complete_bound = true;
+                                                            for implementation in tcx.all_impls(bound.def_id) {
+                                                                if !irq_check_rupta::limits::checkpoint()
+                                                                    || tcx.generics_of(implementation).count() != 0
+                                                                    || tcx.impl_polarity(implementation) != ty::ImplPolarity::Positive
+                                                                {
+                                                                    complete_bound = false;
+                                                                    break;
+                                                                }
+                                                                let Ok(concrete) = tcx.try_normalize_erasing_regions(
+                                                                    ty::TypingEnv::fully_monomorphized(),
+                                                                    tcx.type_of(implementation).instantiate_identity())
+                                                                else { complete_bound = false; break; };
+                                                                if concrete.is_sized(tcx, ty::TypingEnv::fully_monomorphized()) {
+                                                                    types.insert(concrete.into());
+                                                                }
+                                                            }
+                                                            if complete_bound && !types.is_empty() {
+                                                                finite = Some(types.into_iter().collect::<Vec<_>>());
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                    finite
+                                                }
+                                            };
+                                            let Some(values) = values else { complete = false; break; };
+                                            if substitutions.len().saturating_mul(values.len())
+                                                > irq_check_rupta::limits::configuration().unwrap().alternatives
+                                            { complete = false; break; }
+                                            let mut expanded = Vec::new();
+                                            for substitution in &substitutions {
+                                                for value in &values {
+                                                    let mut substitution = substitution.clone();
+                                                    substitution.push(*value);
+                                                    expanded.push(substitution);
+                                                }
                                             }
-                                            _ => true,
-                                        };
-                                        if compatible {
-                                            targets.insert(target);
+                                            substitutions = expanded;
+                                        }
+                                        if !complete { break; }
+                                        for substitution in substitutions {
+                                            let Ok(concrete_type) = tcx.try_normalize_erasing_regions(
+                                                ty::TypingEnv::fully_monomorphized(),
+                                                tcx.type_of(implementation).instantiate(tcx, tcx.mk_args(&substitution)))
+                                            else { complete = false; break; };
+                                            concrete.insert(concrete_type);
+                                        }
+                                        if !complete { break; }
+                                    }
+                                    closed_trait_types.insert(trait_id, complete.then_some(concrete));
+                                }
+                                if let Some(Some(concrete)) = closed_trait_types.get(&trait_id) {
+                                    let mut implementations = HashSet::new();
+                                    let mut complete = true;
+                                    for &concrete in concrete {
+                                        let Some(target) = Instance::try_resolve(tcx,
+                                            ty::TypingEnv::fully_monomorphized(), def,
+                                            tcx.mk_args(&[concrete.into()])).ok().flatten()
+                                            .filter(|target| !matches!(target.def, ty::InstanceKind::Virtual(..)))
+                                        else { complete = false; break; };
+                                        implementations.insert(target);
+                                    }
+                                    if complete && !implementations.is_empty() {
+                                        let singleton = implementations.len() == 1;
+                                        let targets = safe_candidates.entry((instance, location)).or_insert_with(|| candidates.get(&(instance, location)).cloned().unwrap_or_default());
+                                        targets.extend(implementations);
+                                        covered_calls.insert((instance, location));
+                                        if singleton && targets.len() == 1 { pointer_calls.insert((instance, location)); }
+                                        closed_trait_calls.insert((instance, location), (trait_id, targets.clone()));
+                                    }
+                                }
+                            }
+                        }
+                        if call_complete && !(covered_calls.contains(&(instance, location)) || initial_covered.contains(&(instance, location))) {
+                            let mut fallback = HashSet::new();
+                            match &index.body.basic_blocks[location.block].terminator().kind {
+                                rustc_middle::mir::TerminatorKind::Call { func, .. }
+                                | rustc_middle::mir::TerminatorKind::TailCall { func, .. } => {
+                                    let function = instance.instantiate_mir_and_normalize_erasing_regions(
+                                        tcx,
+                                        ty::TypingEnv::fully_monomorphized(),
+                                        ty::EarlyBinder::bind(tcx, func.ty(index.body, tcx)),
+                                    );
+                                    if function.is_fn_ptr() {
+                                        let signature = function.fn_sig(tcx);
+                                        if !signature_candidates.contains_key(&signature) {
+                                            let mut targets = HashSet::new();
+                                            let extra = tcx.mk_type_list(&[]);
+                                            let caller_abi = tcx.fn_abi_of_fn_ptr(
+                                                ty::TypingEnv::fully_monomorphized()
+                                                    .as_query_input((signature, extra)),
+                                            );
+                                            for &target in callable_instances {
+                                                if !irq_check_rupta::limits::checkpoint() {
+                                                    break;
+                                                }
+                                                if !matches!(
+                                                    target.def,
+                                                    ty::InstanceKind::Item(_) | ty::InstanceKind::Shim(_)
+                                                ) {
+                                                    continue;
+                                                }
+                                                if matches!(target.def, ty::InstanceKind::Item(_))
+                                                    && !matches!(tcx.def_kind(target.def_id()), rustc_hir::def::DefKind::Fn | rustc_hir::def::DefKind::AssocFn | rustc_hir::def::DefKind::Closure | rustc_hir::def::DefKind::SyntheticCoroutineBody) { continue; }
+                                                let callee_abi = tcx.fn_abi_of_instance_no_deduced_attrs(
+                                                    ty::TypingEnv::fully_monomorphized()
+                                                        .as_query_input((target, extra)),
+                                                );
+                                                let compatible = match (caller_abi, callee_abi) {
+                                                    (Ok(caller), Ok(callee)) => {
+                                                        caller.conv == callee.conv
+                                                            && caller.c_variadic == callee.c_variadic
+                                                            && caller.args.len() == callee.args.len()
+                                                            && caller
+                                                                .args
+                                                                .iter()
+                                                                .zip(callee.args.iter())
+                                                                .all(|(source, destination)| {
+                                                                    source.eq_abi(destination)
+                                                                })
+                                                            && (callee.ret.layout.ty.is_never()
+                                                                || caller.ret.eq_abi(&callee.ret))
+                                                    }
+                                                    _ => true,
+                                                };
+                                                if compatible {
+                                                    targets.insert(target);
+                                                }
+                                            }
+                                            signature_candidates.insert(signature, targets);
+                                        }
+                                        fallback.extend(signature_candidates[&signature].iter().copied());
+                                    } else if let ty::FnDef(def, args) = *function.kind() {
+                                        if Instance::try_resolve(
+                                            tcx,
+                                            ty::TypingEnv::fully_monomorphized(),
+                                            def,
+                                            tcx.instantiate_bound_regions_with_erased(args),
+                                        )
+                                        .ok()
+                                        .flatten()
+                                        .is_some_and(|target| {
+                                            matches!(target.def, ty::InstanceKind::Virtual(..))
+                                        }) {
+                                            let method = tcx
+                                                .opt_associated_item(def)
+                                                .and_then(|item| item.trait_item_def_id())
+                                                .unwrap_or(def);
+                                            if tcx.trait_of_assoc(def).is_some_and(|trait_id|
+                                                irq_check_rupta::util::type_util::is_fn_trait(tcx, trait_id)) {
+                                                fallback.extend(callable_instances.iter().copied().filter(|target|
+                                                    matches!(target.def, ty::InstanceKind::Shim(_))
+                                                    || matches!(target.def, ty::InstanceKind::Item(_))
+                                                        && matches!(tcx.def_kind(target.def_id()), rustc_hir::def::DefKind::Fn | rustc_hir::def::DefKind::AssocFn | rustc_hir::def::DefKind::Closure | rustc_hir::def::DefKind::SyntheticCoroutineBody)));
+                                            } else {
+                                                fallback.extend(callable_instances.iter().copied().filter(
+                                                    |target| {
+                                                        !matches!(target.def, ty::InstanceKind::Virtual(..))
+                                                            && tcx
+                                                                .opt_associated_item(target.def_id())
+                                                                .and_then(|item| item.trait_item_def_id())
+                                                                .unwrap_or(target.def_id())
+                                                                == method
+                                                    },
+                                                ));
+                                            }
                                         }
                                     }
-                                    signature_candidates.insert(signature, targets);
                                 }
-                                fallback.extend(signature_candidates[&signature].iter().copied());
-                            } else if let ty::FnDef(def, args) = *function.kind() {
-                                if Instance::try_resolve(
-                                    tcx,
-                                    ty::TypingEnv::fully_monomorphized(),
-                                    def,
-                                    tcx.instantiate_bound_regions_with_erased(args),
-                                )
-                                .ok()
-                                .flatten()
-                                .is_some_and(|target| {
-                                    matches!(target.def, ty::InstanceKind::Virtual(..))
-                                }) {
-                                    let method = tcx
-                                        .opt_associated_item(def)
-                                        .and_then(|item| item.trait_item_def_id())
-                                        .unwrap_or(def);
-                                    if backend.acx.is_std_ops_fntrait_call(def) {
-                                        fallback.extend(callable_instances.iter().copied().filter(|target|
-                                            matches!(target.def, ty::InstanceKind::Shim(_))
-                                            || matches!(target.def, ty::InstanceKind::Item(_))
-                                                && matches!(tcx.def_kind(target.def_id()), rustc_hir::def::DefKind::Fn | rustc_hir::def::DefKind::AssocFn | rustc_hir::def::DefKind::Closure | rustc_hir::def::DefKind::SyntheticCoroutineBody)));
-                                    } else {
+                                rustc_middle::mir::TerminatorKind::Drop { place, .. } => {
+                                    let ty = instance.instantiate_mir_and_normalize_erasing_regions(
+                                        tcx,
+                                        ty::TypingEnv::fully_monomorphized(),
+                                        ty::EarlyBinder::bind(tcx, place.ty(index.body, tcx).ty),
+                                    );
+                                    if matches!(ty.kind(), ty::Dynamic(..)) {
                                         fallback.extend(callable_instances.iter().copied().filter(
                                             |target| {
-                                                !matches!(target.def, ty::InstanceKind::Virtual(..))
-                                                    && tcx
-                                                        .opt_associated_item(target.def_id())
-                                                        .and_then(|item| item.trait_item_def_id())
-                                                        .unwrap_or(target.def_id())
-                                                        == method
+                                                matches!(
+                                                    target.def,
+                                                    ty::InstanceKind::Shim(ty::ShimKind::DropGlue(..))
+                                                )
                                             },
                                         ));
                                     }
                                 }
+                                _ => {}
+                            }
+                            if !fallback.is_empty() {
+                                safe_candidates
+                                    .entry((instance, location))
+                                    .or_insert_with(|| candidates.get(&(instance, location)).cloned().unwrap_or_default())
+                                    .extend(fallback);
+                                covered_calls.insert((instance, location));
                             }
                         }
-                        rustc_middle::mir::TerminatorKind::Drop { place, .. } => {
-                            let ty = instance.instantiate_mir_and_normalize_erasing_regions(
-                                tcx,
-                                ty::TypingEnv::fully_monomorphized(),
-                                ty::EarlyBinder::bind(tcx, place.ty(index.body, tcx).ty),
-                            );
-                            if matches!(ty.kind(), ty::Dynamic(..)) {
-                                fallback.extend(callable_instances.iter().copied().filter(
-                                    |target| {
-                                        matches!(
-                                            target.def,
-                                            ty::InstanceKind::Shim(ty::ShimKind::DropGlue(..))
-                                        )
-                                    },
-                                ));
-                            }
-                        }
-                        _ => {}
-                    }
-                    if !fallback.is_empty() {
-                        safe_candidates
-                            .entry((instance, location))
-                            .or_default()
-                            .extend(fallback);
-                        covered_calls.insert((instance, location));
-                    }
-                }
-                let targets = safe_candidates.get(&(instance, location));
-                let direct = match &index.body.basic_blocks[location.block].terminator().kind {
-                    rustc_middle::mir::TerminatorKind::Call { func, .. }
-                    | rustc_middle::mir::TerminatorKind::TailCall { func, .. } => {
-                        let function = instance.instantiate_mir_and_normalize_erasing_regions(
-                            tcx,
-                            ty::TypingEnv::fully_monomorphized(),
-                            ty::EarlyBinder::bind(tcx, func.ty(index.body, tcx)),
-                        );
-                        if let ty::FnDef(def, args) = *function.kind() {
-                            Instance::try_resolve(
-                                tcx,
-                                ty::TypingEnv::fully_monomorphized(),
-                                def,
-                                tcx.instantiate_bound_regions_with_erased(args),
-                            )
-                            .ok()
-                            .flatten()
-                            .filter(|target| !matches!(target.def, ty::InstanceKind::Virtual(..)))
-                        } else {
-                            None
-                        }
-                    }
-                    rustc_middle::mir::TerminatorKind::Drop { place, .. } => {
-                        let ty = instance.instantiate_mir_and_normalize_erasing_regions(
-                            tcx,
-                            ty::TypingEnv::fully_monomorphized(),
-                            ty::EarlyBinder::bind(tcx, place.ty(index.body, tcx).ty),
-                        );
-                        (!matches!(ty.kind(), ty::Dynamic(..)))
-                            .then(|| Instance::resolve_drop_glue(tcx, ty))
-                    }
-                    rustc_middle::mir::TerminatorKind::Assert { msg, .. } => {
-                        use rustc_attr_ir::lang_items::LangItem;
-                        let item = match &**msg {
-                            rustc_middle::mir::AssertKind::BoundsCheck { .. } => {
-                                LangItem::PanicBoundsCheck
-                            }
-                            rustc_middle::mir::AssertKind::MisalignedPointerDereference {
-                                ..
-                            } => LangItem::PanicMisalignedPointerDereference,
-                            rustc_middle::mir::AssertKind::NullPointerDereference => {
-                                LangItem::PanicNullPointerDereference
-                            }
-                            rustc_middle::mir::AssertKind::NullReferenceConstructed => {
-                                LangItem::PanicNullReferenceConstructed
-                            }
-                            rustc_middle::mir::AssertKind::InvalidEnumConstruction(_) => {
-                                LangItem::PanicInvalidEnumConstruction
-                            }
-                            other => other.panic_function(),
-                        };
-                        tcx.lang_items()
-                            .get(item)
-                            .map(|def| Instance::mono(tcx, def))
-                    }
-                    _ => None,
-                };
-                if let Some(mut target) = direct {
-                    if tcx.is_foreign_item(target.def_id())
-                        && crate::forbidden(tcx, target).is_none()
-                        && trust.checks(target.def_id())
-                    {
-                        if let Some(&linked) = exported.get(tcx.symbol_name(target).name) {
-                            target = linked;
-                        }
-                    }
-                    safety_callers.entry(target).or_default().insert(instance);
-                    pending.push(target);
-                } else if covered_calls.contains(&(instance, location))
-                    && targets.is_some_and(|targets| !targets.is_empty())
-                {
-                    for &target in targets.unwrap() {
-                        safety_callers.entry(target).or_default().insert(instance);
-                        pending.push(target);
-                    }
-                } else {
-                    let frame = summary_solver.frame(super::sparse::Frame {
-                        instance,
-                        caller: None,
-                        irq: true,
-                        unknown_entry: true,
-                    });
-                    summary_solver.begin_query(4096);
-                    summary_solver.index_choices.clear();
-                    summary_solver.split_index = None;
-                    let point = super::sparse::Point { frame, location };
-                    let mut values = summary_solver.targets(point);
-                    if !values.as_ref().is_ok_and(|values| !values.is_empty()
-                        && values.iter().all(|value| matches!(value.value, super::sparse::Value::Function(_))))
-                        && values != Err(super::query::QueryStop::ProcessLimit)
-                    {
-                        if let Ok(targets) = summary_solver.conservative_targets(point, 4096) {
-                            values = Ok(targets.into_iter().map(|target| super::sparse::Alternative {
-                                value: super::sparse::Value::Function(target), guards: Vec::new(),
-                            }).collect());
-                        }
-                    }
-                    summary_queries += 1;
-                    summary_transfers += summary_solver.budget.steps;
-                    let detail = format!("{instance} at {location:?}: {values:?}");
-                    if let Ok(values) = values {
-                        if !values.is_empty()
-                            && values.iter().all(|value| {
-                                matches!(value.value, super::sparse::Value::Function(_))
-                            })
-                        {
-                            for value in values {
-                                if let super::sparse::Value::Function(target) = value.value {
-                                    safety_callers.entry(target).or_default().insert(instance);
-                                    pending.push(target);
+                        let targets = safe_candidates.get(&(instance, location)).or_else(|| candidates.get(&(instance, location)));
+                        let direct = match &index.body.basic_blocks[location.block].terminator().kind {
+                            rustc_middle::mir::TerminatorKind::Call { func, .. }
+                            | rustc_middle::mir::TerminatorKind::TailCall { func, .. } => {
+                                let function = instance.instantiate_mir_and_normalize_erasing_regions(
+                                    tcx,
+                                    ty::TypingEnv::fully_monomorphized(),
+                                    ty::EarlyBinder::bind(tcx, func.ty(index.body, tcx)),
+                                );
+                                if let ty::FnDef(def, args) = *function.kind() {
+                                    Instance::try_resolve(
+                                        tcx,
+                                        ty::TypingEnv::fully_monomorphized(),
+                                        def,
+                                        tcx.instantiate_bound_regions_with_erased(args),
+                                    )
+                                    .ok()
+                                    .flatten()
+                                    .filter(|target| !matches!(target.def, ty::InstanceKind::Virtual(..)))
+                                } else {
+                                    None
                                 }
                             }
-                            continue;
+                            rustc_middle::mir::TerminatorKind::Drop { place, .. } => {
+                                let ty = instance.instantiate_mir_and_normalize_erasing_regions(
+                                    tcx,
+                                    ty::TypingEnv::fully_monomorphized(),
+                                    ty::EarlyBinder::bind(tcx, place.ty(index.body, tcx).ty),
+                                );
+                                (!matches!(ty.kind(), ty::Dynamic(..)))
+                                    .then(|| Instance::resolve_drop_glue(tcx, ty))
+                            }
+                            rustc_middle::mir::TerminatorKind::Assert { msg, .. } => {
+                                use rustc_attr_ir::lang_items::LangItem;
+                                let item = match &**msg {
+                                    rustc_middle::mir::AssertKind::BoundsCheck { .. } => {
+                                        LangItem::PanicBoundsCheck
+                                    }
+                                    rustc_middle::mir::AssertKind::MisalignedPointerDereference {
+                                        ..
+                                    } => LangItem::PanicMisalignedPointerDereference,
+                                    rustc_middle::mir::AssertKind::NullPointerDereference => {
+                                        LangItem::PanicNullPointerDereference
+                                    }
+                                    rustc_middle::mir::AssertKind::NullReferenceConstructed => {
+                                        LangItem::PanicNullReferenceConstructed
+                                    }
+                                    rustc_middle::mir::AssertKind::InvalidEnumConstruction(_) => {
+                                        LangItem::PanicInvalidEnumConstruction
+                                    }
+                                    other => other.panic_function(),
+                                };
+                                tcx.lang_items()
+                                    .get(item)
+                                    .map(|def| Instance::mono(tcx, def))
+                            }
+                            _ => None,
+                        };
+                        if let Some(mut target) = direct {
+                            if tcx.is_foreign_item(target.def_id())
+                                && crate::forbidden(tcx, target).is_none()
+                                && trust.checks(target.def_id())
+                            {
+                                if let Some(&linked) = exported.get(tcx.symbol_name(target).name) {
+                                    target = linked;
+                                }
+                            }
+                            safety_callers.entry(target).or_default().insert(instance);
+                            pending.push(target);
+                        } else if (covered_calls.contains(&(instance, location)) || initial_covered.contains(&(instance, location)))
+                            && targets.is_some_and(|targets| !targets.is_empty())
+                        {
+                            for &target in targets.unwrap() {
+                                safety_callers.entry(target).or_default().insert(instance);
+                                pending.push(target);
+                            }
+                        } else {
+                            let frame = summary_solver.frame(super::sparse::Frame {
+                                instance,
+                                caller: None,
+                                irq: true,
+                                unknown_entry: true,
+                            });
+                            summary_solver.begin_query(4096);
+                            summary_solver.index_choices.clear();
+                            summary_solver.split_index = None;
+                            let point = super::sparse::Point { frame, location };
+                            let mut values = summary_solver.targets(point);
+                            if !values.as_ref().is_ok_and(|values| !values.is_empty()
+                                && values.iter().all(|value| matches!(value.value, super::sparse::Value::Function(_))))
+                                && values != Err(super::query::QueryStop::ProcessLimit)
+                            {
+                                if let Ok(targets) = summary_solver.conservative_targets(point, 4096) {
+                                    values = Ok(targets.into_iter().map(|target| super::sparse::Alternative {
+                                        value: super::sparse::Value::Function(target), guards: Vec::new(),
+                                    }).collect());
+                                }
+                            }
+                            summary_queries += 1;
+                            summary_transfers += summary_solver.budget.steps;
+                            let detail = format!("{instance} at {location:?}: {values:?}");
+                            if let Ok(values) = values {
+                                if !values.is_empty()
+                                    && values.iter().all(|value| {
+                                        matches!(value.value, super::sparse::Value::Function(_))
+                                    })
+                                {
+                                    for value in values {
+                                        if let super::sparse::Value::Function(target) = value.value {
+                                            safety_callers.entry(target).or_default().insert(instance);
+                                            pending.push(target);
+                                        }
+                                    }
+                                    continue;
+                                }
+                            }
+                            summary_gaps.push(detail);
+                            rejected.insert(instance);
                         }
                     }
-                    summary_gaps.push(detail);
-                    rejected.insert(instance);
                 }
+                (exclusions, rejected, covered_calls, pointer_calls, context_calls, safe_candidates,
+                    closed_trait_calls, closed_trait_types, safety_callers, pending, summary_gaps,
+                    summary_queries, summary_transfers)
+            });
+            for (local_exclusions, local_rejected, local_covered, local_pointers, local_contexts,
+                local_candidates, local_traits, local_types, local_callers, targets, gaps, queries, transfers) in results
+            {
+                exclusions.extend(local_exclusions);
+                rejected.extend(local_rejected);
+                covered_calls.extend(local_covered);
+                pointer_calls.extend(local_pointers);
+                context_calls.extend(local_contexts);
+                safe_candidates.extend(local_candidates);
+                closed_trait_calls.extend(local_traits);
+                closed_trait_types.extend(local_types);
+                for (target, callers) in local_callers { safety_callers.entry(target).or_default().extend(callers); }
+                pending.extend(targets);
+                summary_gaps.extend(gaps);
+                summary_queries += queries;
+                summary_transfers += transfers;
             }
         }
         let mut pending: Vec<_> = rejected.iter().copied().collect();
@@ -2442,7 +2513,6 @@ impl<'tcx> GlobalPointers<'tcx> {
                 if exclusions.insert(caller) { pending.push(caller); }
             }
         }
-        drop(summary_solver);
         let mut instance_contexts = HashMap::<_, Vec<_>>::new();
         let mut context_nodes = HashMap::new();
         for (function, node) in &backend.call_graph.func_nodes {
@@ -2584,6 +2654,8 @@ impl<'tcx> GlobalPointers<'tcx> {
             pointee_ranges.clear();
         }
         if crate::reporting::configuration().stats {
+            for (section, seconds) in coverage_phases { eprintln!("irq-check: coverage timing section={section} seconds={seconds:.3}"); }
+            eprintln!("irq-check: global timing backend_seconds={backend_seconds:.3} coverage_seconds={coverage_seconds:.3} summary_seconds={:.3}", summary_started.elapsed().as_secs_f64());
             eprintln!(
                 "irq-check: pointer coverage complete={complete} call_complete={call_complete} unresolved_sites={unresolved_sites} safe_summaries={} alias_summaries={} alias_ranges={}",
                 safe.len(),

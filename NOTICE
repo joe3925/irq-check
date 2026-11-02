@@ -4,6 +4,14 @@ Copyright (c) 2026 Boden
 irq-check is licensed under the GNU General Public License, version 3 only.
 See LICENSE for the full terms.
 
+Original contributions whose copyright is owned by Boden are also available
+under the Apache License, Version 2.0. See LICENSE-APACHE. This additional
+grant includes original scenario code. It does not apply to Rupta, MIRAI,
+or code owned by other contributors.
+
+The combined irq-check program remains under GPL-3.0-only. Existing GPL and
+MIT grants remain in effect.
+
 vendor/rupta contains the Rupta library source.
 Copyright (c) 2024 Wei Li. GNU GPL version 3. See LICENSE.
 Source: https://github.com/rustanlys/rupta
